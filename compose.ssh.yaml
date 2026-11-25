@@ -1,0 +1,26 @@
+services:
+  shomei:
+    depends_on:
+      ssh-fixture:
+        condition: service_healthy
+    networks: [default, ssh-test]
+
+  ssh-fixture:
+    build: ./fixtures/ssh
+    networks: [ssh-test]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /run/sshd:mode=0755
+    volumes:
+      - ./local/ssh/host_key:/fixture/host_key:ro
+      - ./local/ssh/authorized_keys:/fixture/authorized_keys:ro
+    healthcheck:
+      test: [CMD-SHELL, 'ssh-keyscan -T 2 -t ed25519 -p 2222 127.0.0.1 >/dev/null 2>&1']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+networks:
+  ssh-test:
+    internal: true

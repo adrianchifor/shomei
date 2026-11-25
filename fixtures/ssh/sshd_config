@@ -1,0 +1,11 @@
+Port 2222
+HostKey /run/sshd/host_key
+PidFile /run/sshd/sshd.pid
+AuthorizedKeysFile /run/sshd/authorized_keys
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers ubuntu
+DisableForwarding yes
+UsePAM no

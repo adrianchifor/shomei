@@ -1,4 +1,3 @@
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, PublicKeyData, SigningKey, SubjectPublicKeyInfo,
@@ -6,162 +5,169 @@ use rcgen::{
 use serde_cbor_2::Value::{self, Array, Bytes, Integer, Map, Text};
 use serde_json::json;
 
+use super::identity::IdentitySetup;
 use super::*;
 
 const ORIGIN: &str = "https://shomei.example:8443";
 const RP: &str = "shomei.example";
-const TOKEN: &str = "0123456789abcdef0123456789abcdef";
-const SECOND_TOKEN: &str = "fedcba9876543210fedcba9876543210";
 
 #[test]
-fn verifies_attestation_and_consumes_challenges() {
-    let dir = tempfile::tempdir().unwrap();
-    let token = dir.path().join("token");
-    fs::write(&token, TOKEN).unwrap();
+fn requires_genuine_attestation_and_binds_the_identity_to_account_and_origin() {
+    let fixture = Fixture::new();
     let origin = Url::parse(ORIGIN).unwrap();
-    let peers = Limits {
+    let key = p256();
+    let (options, setup) =
+        IdentitySetup::prepare(&origin, "operator", YubikeyPolicy::new().unwrap()).unwrap();
+    let untrusted = fixture.registration(&origin, &options, &key);
+    assert!(setup.finish(untrusted).is_err());
+
+    let (options, setup) = IdentitySetup::prepare(&origin, "operator", fixture.policy()).unwrap();
+    assert!(
+        setup
+            .finish(registration(&origin, &options, &key, fixture.model, None))
+            .is_err()
+    );
+
+    let (options, setup) = IdentitySetup::prepare(&origin, "operator", fixture.policy()).unwrap();
+    let wrong_model = registration(
+        &origin,
+        &options,
+        &key,
+        Uuid::nil(),
+        Some((&fixture.leaf, &fixture.attestation_key)),
+    );
+    assert!(setup.finish(wrong_model).is_err());
+
+    let record = fixture.provision(&origin, "operator", &key);
+    let webauthn = build_webauthn(&origin).unwrap();
+    let policy = fixture.policy();
+    record.verify_for(&origin, &webauthn, &policy).unwrap();
+    let mut modified = serde_json::to_value(&record).unwrap();
+    modified["account"] = json!("other");
+    let modified: StaticIdentity = serde_json::from_value(modified).unwrap();
+    assert!(modified.verify_for(&origin, &webauthn, &policy).is_err());
+    let alternate = Url::parse("https://shomei.example:9443").unwrap();
+    let alternate_webauthn = build_webauthn(&alternate).unwrap();
+    let mut modified = serde_json::to_value(&record).unwrap();
+    modified["origin"] = json!(alternate);
+    let modified: StaticIdentity = serde_json::from_value(modified).unwrap();
+    assert!(
+        modified
+            .verify_for(&alternate, &alternate_webauthn, &policy)
+            .is_err()
+    );
+}
+
+#[test]
+fn reloads_identities_and_consumes_single_use_challenges() {
+    let fixture = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let allowlist = dir.path().join("identities.json");
+    fs::write(&allowlist, "[]").unwrap();
+    let origin = Url::parse(ORIGIN).unwrap();
+    let limits = Limits {
         pending_per_ip: 8,
         ..Limits::default()
     };
     let peer = "127.0.0.1".parse().unwrap();
-    let tokens = dir.path().join("tokens.toml");
-    fs::write(&tokens, format!("alice = {SECOND_TOKEN:?}")).unwrap();
-    let mut auth = Auth::new(&origin, dir.path(), Some(&token), Some(&tokens), &peers).unwrap();
-    let root_key = p256();
-    let mut params = certificate("Fixture CA");
-    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-    let root = params.self_signed(&root_key).unwrap();
-    let root_issuer = Issuer::new(params, root_key);
-    let issuer_key = p256();
-    let mut params = certificate("Fixture FIDO CA");
-    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-    let intermediate = params.signed_by(&issuer_key, &root_issuer).unwrap();
-    let issuer = Issuer::new(params, issuer_key);
-    let attestation_key = p256();
-    let leaf = certificate("Fixture")
-        .signed_by(&attestation_key, &issuer)
-        .unwrap();
-    let signing_key = p256();
-    let model = Uuid::parse_str(YUBIKEY_5_MODELS[0]).unwrap();
+    let auth = Auth::load(&origin, dir.path(), &allowlist, &limits, fixture.policy()).unwrap();
+    let mut epoch = auth.subscribe_generation();
+    assert!(!auth.reload().unwrap());
+    assert!(auth.start_login(None, Grant::Http, peer).is_err());
 
-    assert!(auth.start_enroll(None, Some("wrong-token"), peer).is_err());
-    let challenge = auth.start_enroll(None, Some(TOKEN), peer).unwrap();
-    let unsigned = registration(&challenge, &signing_key, model, None);
-    assert!(auth.finish_enroll(Some(TOKEN), unsigned).is_err());
-    let challenge = auth.start_enroll(None, Some(TOKEN), peer).unwrap();
-    let untrusted = registration(
-        &challenge,
-        &signing_key,
-        model,
-        Some((&leaf, &attestation_key)),
-    );
-    assert!(auth.finish_enroll(Some(TOKEN), untrusted).is_err());
-
-    let mut roots = AttestationCaListBuilder::new();
-    roots
-        .insert_device_der(root.der(), model, "Test key".into(), Default::default())
-        .unwrap();
-    auth.yubikeys = YubikeyPolicy {
-        roots: roots.build(),
-        paths: vec![AttestationPath {
-            issuer: intermediate.der().clone(),
-            intermediates: vec![intermediate.der().clone()],
-        }],
-    };
-    let challenge = auth.start_enroll(None, Some(TOKEN), peer).unwrap();
-    let wrong_model = registration(
-        &challenge,
-        &signing_key,
-        Uuid::nil(),
-        Some((&leaf, &attestation_key)),
-    );
-    assert!(auth.finish_enroll(Some(TOKEN), wrong_model).is_err());
-    let challenge = auth.start_enroll(None, Some(TOKEN), peer).unwrap();
-    let approved = registration(
-        &challenge,
-        &signing_key,
-        model,
-        Some((&leaf, &attestation_key)),
-    );
-    auth.finish_enroll(Some(TOKEN), approved).unwrap();
-    assert!(auth.start_enroll(None, Some(TOKEN), peer).is_err());
+    let operator = p256();
+    let alice = p256();
+    let operator_record = fixture.provision(&origin, "operator", &operator);
+    let alice_record = fixture.provision(&origin, "alice", &alice);
+    write_records(&allowlist, &[&operator_record]);
+    assert!(auth.reload().unwrap());
+    assert_eq!(auth.generation(), 0);
 
     let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
     assert!(
-        auth.finish_login(assertion(&challenge, &signing_key, 0x01, 1))
+        auth.finish_login(assertion(&challenge, &operator, 0x01, 1))
             .is_err()
     );
     assert!(
-        auth.finish_login(assertion(&challenge, &signing_key, 0x05, 1))
+        auth.finish_login(assertion(&challenge, &operator, 0x05, 1))
             .is_err()
     );
+    let previous = auth.start_login(None, Grant::Http, peer).unwrap();
     let tcp_key = p256();
     let public_key = SubjectPublicKeyInfo::from_der(&tcp_key.subject_public_key_info()).unwrap();
-    let older = auth.start_login(None, Grant::Http, peer).unwrap();
     let challenge = auth
         .start_login(None, Grant::Tcp(public_key), peer)
         .unwrap();
-    let Grant::Tcp(granted_key) = auth
-        .finish_login(assertion(&challenge, &signing_key, 0x05, 2))
+    let (Grant::Tcp(granted), 0) = auth
+        .finish_login(assertion(&challenge, &operator, 0x05, 2))
         .unwrap()
     else {
         panic!("expected TCP grant");
     };
-    assert_eq!(granted_key.der_bytes(), tcp_key.der_bytes());
+    assert_eq!(granted.der_bytes(), tcp_key.der_bytes());
     assert!(
-        auth.finish_login(assertion(&challenge, &signing_key, 0x05, 3))
+        auth.finish_login(assertion(&previous, &operator, 0x05, 1))
             .is_err()
     );
-    assert!(
-        auth.finish_login(assertion(&older, &signing_key, 0x05, 1))
-            .is_err()
-    );
-    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
-    assert!(matches!(
-        auth.finish_login(assertion(&challenge, &signing_key, 0x05, 3)),
-        Ok(Grant::Http)
-    ));
-    let saved: AttestedPasskey =
-        serde_json::from_reader(File::open(&auth.accounts[DEFAULT_ACCOUNT].file).unwrap()).unwrap();
-    assert_eq!(Credential::from(saved).counter, 3);
 
-    let alice_key = p256();
-    assert!(auth.start_enroll(Some("alice"), Some(TOKEN), peer).is_err());
-    let challenge = auth
-        .start_enroll(Some("alice"), Some(SECOND_TOKEN), peer)
-        .unwrap();
-    let approved = registration(
-        &challenge,
-        &alice_key,
-        model,
-        Some((&leaf, &attestation_key)),
-    );
-    auth.finish_enroll(Some(SECOND_TOKEN), approved).unwrap();
+    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    write_records(&allowlist, &[&operator_record, &alice_record]);
+    assert!(auth.reload().unwrap());
+    assert_eq!(auth.generation(), 0);
+    assert!(matches!(
+        auth.finish_login(assertion(&challenge, &operator, 0x05, 3)),
+        Ok((Grant::Http, 0))
+    ));
+    assert!(!epoch.has_changed().unwrap());
+    assert!(!auth.reload().unwrap());
+
+    let mut unsigned = serde_json::to_value(&alice_record).unwrap();
+    unsigned["account"] = json!("renamed");
+    fs::write(&allowlist, json!([unsigned]).to_string()).unwrap();
+    assert!(auth.reload().is_err());
+    assert!(!auth.reload().unwrap());
+    assert_eq!(auth.generation(), 0);
     let challenge = auth.start_login(Some("alice"), Grant::Http, peer).unwrap();
     assert!(matches!(
-        auth.finish_login(assertion(&challenge, &alice_key, 0x05, 1)),
-        Ok(Grant::Http)
+        auth.finish_login(assertion(&challenge, &alice, 0x05, 1)),
+        Ok((Grant::Http, 0))
     ));
-    assert!(auth.accounts["alice"].file.is_file());
 
     let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
-    let mut response = assertion(&challenge, &signing_key, 0x05, 4);
+    write_records(&allowlist, &[&alice_record]);
+    assert!(auth.reload().unwrap());
+    assert_eq!(*epoch.borrow_and_update(), 1);
+    assert!(
+        auth.finish_login(assertion(&challenge, &operator, 0x05, 4))
+            .is_err()
+    );
+    assert!(auth.start_login(None, Grant::Http, peer).is_err());
+
+    write_records(&allowlist, &[&alice_record, &operator_record]);
+    assert!(auth.reload().unwrap());
+    assert_eq!(auth.generation(), 1);
+    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    assert!(
+        auth.finish_login(assertion(&challenge, &operator, 0x05, 3))
+            .is_err()
+    );
+
+    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    let mut response = assertion(&challenge, &operator, 0x05, 4);
     let client = json!({"type": "webauthn.get", "origin": ORIGIN, "crossOrigin": true,
         "challenge": B64.encode(&challenge.options.public_key.challenge)});
     let client = serde_json::to_vec(&client).unwrap();
-    response.credential.response.signature = sign(&signing_key, &auth_data(0x05, 4), &client);
+    response.credential.response.signature = sign(&operator, &auth_data(RP, 0x05, 4), &client);
     response.credential.response.client_data_json = client;
     assert!(auth.finish_login(response).is_err());
 
     let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
     assert!(
-        auth.finish_login(assertion(&challenge, &signing_key, 0x15, 4))
+        auth.finish_login(assertion(&challenge, &operator, 0x15, 4))
             .is_err()
     );
 
-    for _ in 0..peers.pending_per_ip {
+    for _ in 0..limits.pending_per_ip {
         auth.start_login(None, Grant::Http, peer).unwrap();
     }
     assert_eq!(
@@ -172,13 +178,96 @@ fn verifies_attestation_and_consumes_challenges() {
         .unwrap();
 }
 
+struct Fixture {
+    root: Certificate,
+    intermediate: Certificate,
+    leaf: Certificate,
+    attestation_key: KeyPair,
+    model: Uuid,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let root_key = p256();
+        let mut params = certificate("Fixture CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let root = params.self_signed(&root_key).unwrap();
+        let root_issuer = Issuer::new(params, root_key);
+        let issuer_key = p256();
+        let mut params = certificate("Fixture FIDO CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let intermediate = params.signed_by(&issuer_key, &root_issuer).unwrap();
+        let issuer = Issuer::new(params, issuer_key);
+        let attestation_key = p256();
+        let leaf = certificate("Fixture")
+            .signed_by(&attestation_key, &issuer)
+            .unwrap();
+        let model = Uuid::parse_str(YUBIKEY_5_MODELS[0]).unwrap();
+        Self {
+            root,
+            intermediate,
+            leaf,
+            attestation_key,
+            model,
+        }
+    }
+
+    fn policy(&self) -> YubikeyPolicy {
+        let mut roots = AttestationCaListBuilder::new();
+        roots
+            .insert_device_der(
+                self.root.der(),
+                self.model,
+                "Test key".into(),
+                Default::default(),
+            )
+            .unwrap();
+        YubikeyPolicy {
+            roots: roots.build(),
+            paths: vec![AttestationPath {
+                issuer: self.intermediate.der().clone(),
+                intermediates: vec![self.intermediate.der().clone()],
+            }],
+        }
+    }
+
+    fn registration(
+        &self,
+        origin: &Url,
+        options: &CreationChallengeResponse,
+        key: &KeyPair,
+    ) -> RegisterPublicKeyCredential {
+        registration(
+            origin,
+            options,
+            key,
+            self.model,
+            Some((&self.leaf, &self.attestation_key)),
+        )
+    }
+
+    fn provision(&self, origin: &Url, name: &str, key: &KeyPair) -> StaticIdentity {
+        let (options, setup) = IdentitySetup::prepare(origin, name, self.policy()).unwrap();
+        setup
+            .finish(self.registration(origin, &options, key))
+            .unwrap()
+    }
+}
+
+fn write_records(path: &Path, records: &[&StaticIdentity]) {
+    fs::write(path, serde_json::to_vec(records).unwrap()).unwrap();
+}
+
 fn registration(
-    challenge: &Challenge<CreationChallengeResponse>,
+    origin: &Url,
+    challenge: &CreationChallengeResponse,
     key: &KeyPair,
     model: Uuid,
     attestation: Option<(&Certificate, &KeyPair)>,
-) -> SignedChallenge<RegisterPublicKeyCredential> {
-    let client = client_data(&challenge.options.public_key.challenge, "webauthn.create");
+) -> RegisterPublicKeyCredential {
+    let client = client_data(origin, &challenge.public_key.challenge, "webauthn.create");
     let public_key = key.der_bytes();
     let id = hash(public_key);
     let cose = Map([
@@ -189,7 +278,7 @@ fn registration(
         (Integer(-3), Bytes(public_key[33..].to_vec())),
     ]
     .into());
-    let mut data = auth_data(0x45, 0);
+    let mut data = auth_data(origin.domain().unwrap(), 0x45, 0);
     data.extend_from_slice(model.as_bytes());
     data.extend_from_slice(&(id.len() as u16).to_be_bytes());
     data.extend_from_slice(&id);
@@ -211,17 +300,45 @@ fn registration(
         ("authData", Bytes(data)),
         ("attStmt", statement),
     ]);
-    SignedChallenge {
-        challenge_id: challenge.challenge_id,
-        credential: serde_json::from_value(json!({
-            "id": B64.encode(id), "rawId": B64.encode(id), "type": "public-key",
-            "response": {
-                "clientDataJSON": B64.encode(client),
-                "attestationObject": B64.encode(serde_cbor_2::to_vec(&object).unwrap()),
-            },
-        }))
-        .unwrap(),
+    serde_json::from_value(json!({
+        "id": B64.encode(id), "rawId": B64.encode(id), "type": "public-key",
+        "response": {
+            "clientDataJSON": B64.encode(client),
+            "attestationObject": B64.encode(serde_cbor_2::to_vec(&object).unwrap()),
+        },
+    }))
+    .unwrap()
+}
+
+pub(crate) struct TestSigner {
+    origin: Url,
+    key: KeyPair,
+}
+
+impl TestSigner {
+    pub(crate) fn sign(&self, challenge: &[u8], counter: u32) -> PublicKeyCredential {
+        assertion_at(&self.origin, challenge, &self.key, 0x05, counter)
     }
+}
+
+pub(crate) fn test_auth(
+    origin: &Url,
+    state_dir: &Path,
+    identities_file: &Path,
+    limits: &Limits,
+) -> (Auth, TestSigner) {
+    let fixture = Fixture::new();
+    let key = p256();
+    let record = fixture.provision(origin, "operator", &key);
+    write_records(identities_file, &[&record]);
+    let auth = Auth::load(origin, state_dir, identities_file, limits, fixture.policy()).unwrap();
+    (
+        auth,
+        TestSigner {
+            origin: origin.clone(),
+            key,
+        },
+    )
 }
 
 fn assertion(
@@ -230,21 +347,37 @@ fn assertion(
     flags: u8,
     counter: u32,
 ) -> SignedChallenge<PublicKeyCredential> {
-    let client = client_data(&challenge.options.public_key.challenge, "webauthn.get");
-    let data = auth_data(flags, counter);
-    let id = hash(key.der_bytes());
     SignedChallenge {
         challenge_id: challenge.challenge_id,
-        credential: serde_json::from_value(json!({
-            "id": B64.encode(id), "rawId": B64.encode(id), "type": "public-key",
-            "response": {
-                "clientDataJSON": B64.encode(&client),
-                "authenticatorData": B64.encode(&data),
-                "signature": B64.encode(sign(key, &data, &client)),
-            },
-        }))
-        .unwrap(),
+        credential: assertion_at(
+            &Url::parse(ORIGIN).unwrap(),
+            &challenge.options.public_key.challenge,
+            key,
+            flags,
+            counter,
+        ),
     }
+}
+
+fn assertion_at(
+    origin: &Url,
+    challenge: &[u8],
+    key: &KeyPair,
+    flags: u8,
+    counter: u32,
+) -> PublicKeyCredential {
+    let client = client_data(origin, challenge, "webauthn.get");
+    let data = auth_data(origin.domain().unwrap(), flags, counter);
+    let id = hash(key.der_bytes());
+    serde_json::from_value(json!({
+        "id": B64.encode(id), "rawId": B64.encode(id), "type": "public-key",
+        "response": {
+            "clientDataJSON": B64.encode(&client),
+            "authenticatorData": B64.encode(&data),
+            "signature": B64.encode(sign(key, &data, &client)),
+        },
+    }))
+    .unwrap()
 }
 
 fn object<const N: usize>(pairs: [(&str, Value); N]) -> Value {
@@ -254,14 +387,14 @@ fn object<const N: usize>(pairs: [(&str, Value); N]) -> Value {
         .collect())
 }
 
-fn client_data(challenge: &[u8], kind: &str) -> Vec<u8> {
-    serde_json::to_vec(&json!({"type": kind, "origin": ORIGIN, "challenge": B64.encode(challenge)}))
+fn client_data(origin: &Url, challenge: &[u8], kind: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({"type": kind, "origin": origin.origin().ascii_serialization(), "challenge": B64.encode(challenge)}))
         .unwrap()
 }
 
-fn auth_data(flags: u8, counter: u32) -> Vec<u8> {
+fn auth_data(rp: &str, flags: u8, counter: u32) -> Vec<u8> {
     [
-        hash(RP.as_bytes()).as_slice(),
+        hash(rp.as_bytes()).as_slice(),
         &[flags],
         &counter.to_be_bytes(),
     ]

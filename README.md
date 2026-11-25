@@ -1,67 +1,62 @@
 # Shomei
 
-Rust authentication proxy for YubiKey 5 Series accounts with one credential per account. Enrollment requires an allowlisted model and a FIDO attestation chain issued under Yubico Attestation Root 1, used since firmware 5.7.4. Sign-in requires a one-time ES256 WebAuthn assertion with user verification and presence. Replace older enrollments before upgrading. [Yubico attestation certificates](https://developers.yubico.com/U2F/Attestation_and_Metadata/) · [Yubico firmware advisory](https://www.yubico.com/support/security-advisories/ysa-2024-03/) · [YubiKey model IDs](https://support.yubico.com/s/article/YubiKey-hardware-FIDO2-AAGUIDs)
+Rust authentication proxy and CLI for supported YubiKey 5 Series keys with firmware 5.7.4 or later. A YubiKey PIN and touch unlock HTTP requests or short-lived mTLS access to a fixed TCP upstream. [Yubico attestation guidance](https://developers.yubico.com/U2F/Attestation_and_Metadata/)
 
-## Run
+## Run locally
 
-Run as an unprivileged user. Create a trusted `localhost` certificate and configure your upstreams in `local/config/shomei.toml`. [mkcert](https://github.com/FiloSottile/mkcert)
+Build with Rust 1.95 or newer. Linux builds need `pkg-config`, `libudev-dev`, and `libclang-dev`. Linux release binaries need `libudev.so.1`. [mkcert](https://github.com/FiloSottile/mkcert)
 
 ```sh
+cargo build --locked --release
+export PATH="$PWD/target/release:$PATH"
+export SHOMEI_PROXY=https://localhost:8443
 umask 077
 mkdir -p local/config local/state
 cp shomei.example.toml local/config/shomei.toml
 mkcert -install
 mkcert -cert-file local/config/tls.pem -key-file local/config/tls-key.pem localhost
-openssl rand -hex 32 > local/config/enrollment-token
+export SHOMEI_CA_FILE="$(mkcert -CAROOT)/rootCA.pem"
+shomei init --account operator --identity-file local/operator.json
+shomei get-id --identity-file local/operator.json | jq -s . > local/config/identities.json
 SHOMEI_UID=$(id -u) SHOMEI_GID=$(id -g) docker compose up --build
 ```
 
-Open `https://localhost:8443/_shomei/enroll` in a current Chromium browser. Enter the enrollment token, select your YubiKey, enter its FIDO2 PIN, and touch it. Then open `https://localhost:8443/` to sign in and reach the HTTP upstream. The token is only usable before enrollment. Configure either relay or both in the TOML file.
+Set `http_upstream` and `[tcp].upstream` in the config. Either relay can be omitted. For a native gateway, set local TLS and state paths and run `shomei serve path/to/shomei.toml`.
 
-For a native run, set the example’s TLS and state paths to local files, point the upstreams at their native addresses, and run `cargo run --locked --release -- path/to/shomei.toml` with Rust 1.95+.
+The allowlist is a JSON array of public identity records from `get-id`. Each record binds one account to one HTTPS origin and an attested YubiKey credential. Replace the allowlist file atomically to add or remove identities. The gateway reloads it within about a second and keeps the last valid file if an update fails. Additions preserve grants. Removing or replacing a credential invalidates existing sessions and closes active TCP relays. Replace old enrollment-token settings with `identities_file` when upgrading.
 
-For named accounts, set `enrollment_tokens_file` to a TOML file mapping lowercase account names to independent tokens generated with `openssl rand -hex 32`. Enter the account name at enrollment and sign-in, or pass `--account` to the CLI. The legacy token file and `credential.json` belong to `operator`. Restrict filesystem access to the configuration and state directories.
+## Browser and API
 
-## CLI
+Open the protected URL and select **Use YubiKey**. The account defaults to `operator`. Enroll keys locally with `shomei init`, optionally with `--set-pin` for a key without a FIDO2 PIN.
 
-Use Python 3.10+ and connect the enrolled USB YubiKey. Pass `--ca-file` when Python needs a local CA. With a publicly trusted server certificate, omit it.
-
-```sh
-python3 -m venv .venv
-.venv/bin/pip install --require-hashes -r requirements-cli.txt
-CA="$(mkcert -CAROOT)/rootCA.pem"
-.venv/bin/python cli.py --ca-file "$CA" https://localhost:8443 http local/cookies.txt
-curl --cacert "$CA" --cookie local/cookies.txt https://localhost:8443/
-```
-
-For TCP, use OpenSSL 3 to generate a client key and CSR. Shomei ties the CSR to the WebAuthn challenge and returns a client certificate. The client keeps the private key.
+For a deployment endpoint, send a one-use assertion with the request itself. Keep the upstream private so deployments pass through Shomei.
 
 ```sh
-openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-  -subj /CN=shomei -keyout local/client.key -out local/client.csr
-.venv/bin/python cli.py --ca-file "$CA" https://localhost:8443 tcp local/client.csr local/client.pem
-openssl s_client -quiet -connect localhost:9443 -servername localhost \
-  -verify_hostname localhost -verify_return_error -CAfile "$CA" \
-  -cert local/client.pem -key local/client.key
+curl --fail-with-body --cacert "$SHOMEI_CA_FILE" -c local/session.txt \
+  -H "Authorization: Shomei $(shomei sign)" -X POST "$SHOMEI_PROXY/deploy"
+curl --fail-with-body --cacert "$SHOMEI_CA_FILE" -b local/session.txt \
+  "$SHOMEI_PROXY/status"
 ```
 
-## API
+Pass `--proxy`, `--account`, or `--ca-file` as needed. With public TLS certificates, use the system client defaults and omit the local CA options. The assertion and Shomei cookie are stripped before forwarding.
 
-All routes below accept JSON under `/_shomei/api`.
+## SSH with Compose
 
-| POST | Body | Response |
-| --- | --- | --- |
-| `/enroll/start` | Optional `account` | `challenge_id` and `publicKey` creation options |
-| `/enroll/finish` | `challenge_id` and the WebAuthn registration `credential` | `204` |
-| `/auth/start` | Optional `account`, plus `client_csr_pem` for TCP | `challenge_id` and `publicKey` request options |
-| `/auth/finish` | `challenge_id` and the WebAuthn assertion `credential` | HTTP session cookie or `certificate_pem`, plus `expires_at` in Unix seconds |
+Set `upstream = "ssh-fixture:2222"` and `ssh_host = "deploy"` in `[tcp]`. The gateway only dials its configured upstream. OpenSSH still checks the destination’s host key and authenticates the SSH user.
 
-Both enrollment requests require `Authorization: Bearer <enrollment-token>`. Omitting `account` selects `operator`. Each challenge lasts two minutes and can be used once. The HTTP cookie uses ChaCha20-Poly1305 and is `Secure` and `HttpOnly`. TCP client keys and CSR signatures use P-256 and SHA-256. Both listeners and upstream HTTPS use TLS 1.3. TCP closes active relays at certificate expiry.
+```sh
+sh fixtures/ssh/setup.sh ~/.ssh/id_ed25519.pub
+SHOMEI_UID=$(id -u) SHOMEI_GID=$(id -g) \
+  docker compose -f compose.yaml -f compose.ssh.yaml up --build
+shomei ssh --proxy "$SHOMEI_PROXY" \
+  --ssh-arg=-o --ssh-arg="UserKnownHostsFile=$PWD/local/ssh/known_hosts" \
+  --ssh-arg=-o --ssh-arg=StrictHostKeyChecking=yes ubuntu@deploy -- id -un
+```
 
-## Capacity
+The smoke command should print `ubuntu`. The backend stays on a private Compose network. A `tls://localhost:9443` proxy URL also works. Pass `--auth-url` if the HTTPS listener uses a port other than 8443.
 
-The default limits are 4,096 connections per listener, 512 concurrent handshakes per listener, and 8,192 in-flight HTTP requests. `[limits]` controls capacity and challenge quotas. Challenge quotas group clients by source IPv4 address or IPv6 /64. Size the descriptor limit for both proxy legs and idle upstream connections. For a four-worker loopback load test, run `cargo test --locked --release relay_load -- --ignored --nocapture`.
+## Expiry and releases
 
-Shomei runs as a single instance. Restarting clears grants and preserves enrolled credentials. Keep upstreams private and trust the HTTP app served on the sign-in origin. The TCP upstream is plain TCP. HTTPS supports HTTP/1.1 and HTTP/2. Upgrades are disabled.
+Set `session_ttl_seconds` for HTTP cookies and `[tcp].cert_ttl_seconds` for mTLS grants. Defaults are 600 and 300 seconds. Active SSH connections close when their certificate expires. Restarting the gateway clears all grants. `[limits]` sets connection and challenge capacity. Run the loopback benchmark with `cargo test --locked --release relay_load -- --ignored --nocapture`.
 
-The lockfile uses the upstream `crypto-glue` RSA 0.10 compatibility fix until it is available in a published release. [Upstream change](https://github.com/kanidm/crypto-glue/pull/49)
+Pushed tags build and publish SHA-256 checksums and binaries for Linux amd64, Linux arm64, and macOS arm64. The build uses the upstream RSA 0.10 compatibility fix. [Release workflow](.github/workflows/release.yml) · [Upstream dependency fix](https://github.com/kanidm/crypto-glue/pull/49)

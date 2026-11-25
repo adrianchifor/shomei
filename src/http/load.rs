@@ -51,16 +51,15 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
     let listener = listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let origin = format!("https://localhost:{}", addr.port());
-    let token = dir.join("token");
-    std::fs::write(&token, "2afb18754686de93bc41fb0be433826c").unwrap();
+    let identities_file = dir.join("identities.json");
+    std::fs::write(&identities_file, "[]").unwrap();
     let config = Config {
         origin: origin.parse().unwrap(),
         https_bind: addr,
         tls_cert: dir.join("cert.pem"),
         tls_key: dir.join("key.pem"),
         state_dir: dir.into(),
-        enrollment_token_file: Some(token),
-        enrollment_tokens_file: None,
+        identities_file,
         http_upstream: Some(upstream_name.parse().unwrap()),
         session_ttl_seconds: 600,
         tcp: None,
@@ -93,7 +92,7 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
     for _ in 0..CLIENTS {
         let opening = opening.clone();
         let connector = connector.clone();
-        let (cookie, _) = state.sessions.issue().unwrap();
+        let (cookie, _) = state.sessions.issue(state.auth.generation()).unwrap();
         let cookie =
             HeaderValue::from_str(cookie.to_str().unwrap().split_once(';').unwrap().0).unwrap();
         let uri = uri.clone();
@@ -169,6 +168,7 @@ async fn tcp_load(identity: &Identity, roots: RootCertStore) {
     let addr = listener.local_addr().unwrap();
     let issuer = Issuer::new().unwrap();
     let handshakes = Arc::new(Semaphore::new(512));
+    let (_generation, allowed) = tokio::sync::watch::channel(0);
     let tls = identity.server(Some(&issuer)).unwrap();
     let gateway = tokio::spawn(crate::serve(listener, 4096, move |socket, _| {
         tls::relay(
@@ -176,12 +176,13 @@ async fn tcp_load(identity: &Identity, roots: RootCertStore) {
             tls.clone(),
             upstream_addr.clone(),
             handshakes.clone(),
+            allowed.clone(),
         )
     }));
 
     let client_key = KeyPair::generate().unwrap();
     let public = SubjectPublicKeyInfo::from_der(&client_key.subject_public_key_info()).unwrap();
-    let cert = issuer.issue(&public, 300).unwrap();
+    let cert = issuer.issue(&public, 300, 0).unwrap();
     let cert = CertificateDer::from_pem_slice(cert.certificate_pem.as_bytes()).unwrap();
     let private = PrivatePkcs8KeyDer::from(client_key.serialize_der()).into();
     let config = ClientConfig::builder()

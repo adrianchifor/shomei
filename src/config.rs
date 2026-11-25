@@ -17,8 +17,7 @@ pub struct Config {
     pub tls_cert: PathBuf,
     pub tls_key: PathBuf,
     pub state_dir: PathBuf,
-    pub enrollment_token_file: Option<PathBuf>,
-    pub enrollment_tokens_file: Option<PathBuf>,
+    pub identities_file: PathBuf,
     pub http_upstream: Option<Url>,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
@@ -59,6 +58,8 @@ pub struct TcpConfig {
     #[serde(default = "tcp_bind")]
     pub bind: SocketAddr,
     pub upstream: String,
+    pub ssh_host: Option<String>,
+    pub public_port: Option<u16>,
     #[serde(default = "tcp_ttl")]
     pub cert_ttl_seconds: u64,
 }
@@ -67,16 +68,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path).context("read config")?;
         let config: Self = toml::from_str(&contents).context("parse config")?;
-        ensure!(
-            config.origin.scheme() == "https"
-                && config.origin.domain().is_some()
-                && config.origin.username().is_empty()
-                && config.origin.password().is_none()
-                && config.origin.path() == "/"
-                && config.origin.query().is_none()
-                && config.origin.fragment().is_none(),
-            "origin must be an HTTPS origin with a DNS name"
-        );
+        validate_origin(&config.origin)?;
         ensure!(
             config.http_upstream.is_some() || config.tcp.is_some(),
             "configure an upstream"
@@ -123,12 +115,41 @@ impl Config {
                 "TCP upstream must have a host and port"
             );
             ensure!(
-                (1..=300).contains(&tcp.cert_ttl_seconds),
-                "TCP certificate TTL must be 1 to 300 seconds"
+                (1..=86_400).contains(&tcp.cert_ttl_seconds),
+                "TCP certificate TTL must be 1 to 86400 seconds"
             );
+            ensure!(
+                tcp.public_port.unwrap_or(tcp.bind.port()) != 0,
+                "TCP public port must be nonzero"
+            );
+            if let Some(host) = &tcp.ssh_host {
+                ensure!(
+                    host.parse::<std::net::IpAddr>().is_ok()
+                        || (!host.is_empty()
+                            && host.len() <= 253
+                            && !host.starts_with('-')
+                            && host.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'.' | b'-' | b'_'))),
+                    "invalid TCP SSH host alias"
+                );
+            }
         }
         Ok(config)
     }
+}
+
+pub fn validate_origin(origin: &Url) -> Result<()> {
+    ensure!(
+        origin.scheme() == "https"
+            && origin.domain().is_some()
+            && origin.username().is_empty()
+            && origin.password().is_none()
+            && origin.path() == "/"
+            && origin.query().is_none()
+            && origin.fragment().is_none(),
+        "origin must be an HTTPS origin with a DNS name"
+    );
+    Ok(())
 }
 
 fn https_bind() -> SocketAddr {

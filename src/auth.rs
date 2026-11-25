@@ -1,9 +1,17 @@
+mod identity;
+
+pub use identity::{StaticIdentity, prepare_identity};
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
+    io::{Read, Write},
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -13,23 +21,25 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use crypto_glue::traits::EncodeDer;
 use rcgen::SubjectPublicKeyInfo;
 use ring::digest::{SHA256, digest};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use serde::{Deserialize, Serialize};
 use serde_cbor_2::Value;
-use subtle::ConstantTimeEq;
+use tokio::sync::watch;
 use webauthn_rs::prelude::*;
 use x509_parser::{oid_registry::*, parse_x509_certificate};
 
-use crate::config::Limits;
+use crate::config::{Limits, validate_origin};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_ACCOUNT: &str = "operator";
 const ES256: i64 = -7;
+const MAX_IDENTITIES_BYTES: u64 = 64 * 1024 * 1024;
 const UNAUTHORIZED: ApiError = ApiError(StatusCode::UNAUTHORIZED, "YubiKey verification failed");
-const NOT_ENROLLED: ApiError = ApiError(StatusCode::CONFLICT, "enroll a YubiKey first");
+const NOT_ALLOWED: ApiError = ApiError(StatusCode::FORBIDDEN, "YubiKey account is not allowed");
 
 #[derive(Debug)]
 pub struct ApiError(pub StatusCode, pub &'static str);
@@ -51,28 +61,37 @@ impl IntoResponse for ApiError {
 }
 
 pub struct Auth {
+    origin: Url,
     webauthn: Webauthn,
     yubikeys: YubikeyPolicy,
-    accounts: HashMap<String, Arc<Account>>,
-    credential_ids: Mutex<HashSet<Vec<u8>>>,
+    identities_file: PathBuf,
+    counters_dir: PathBuf,
+    accounts: RwLock<HashMap<String, Arc<Account>>>,
+    last_digest: Mutex<[u8; 32]>,
+    generation: AtomicU64,
+    changes: watch::Sender<u64>,
     challenges: Mutex<Challenges>,
     _lock: File,
 }
 
 struct Account {
-    file: PathBuf,
-    token: Option<[u8; 32]>,
-    credential: Mutex<Option<StoredCredential>>,
-}
-
-struct StoredCredential {
     key: AttestedPasskey,
-    counter: u32,
+    digest: [u8; 32],
+    counter_file: PathBuf,
+    counter: Mutex<u32>,
 }
 
-enum Pending {
-    Enroll(Arc<Account>, AttestedPasskeyRegistration),
-    Login(Arc<Account>, AttestedPasskeyAuthentication, Grant),
+struct VerifiedIdentity {
+    name: String,
+    key: AttestedPasskey,
+    fingerprint: [u8; 32],
+}
+
+struct Pending {
+    account: Arc<Account>,
+    authentication: AttestedPasskeyAuthentication,
+    grant: Grant,
+    generation: u64,
 }
 
 pub enum Grant {
@@ -98,16 +117,26 @@ impl Auth {
     pub fn new(
         origin: &Url,
         state_dir: &Path,
-        token_file: Option<&Path>,
-        tokens_file: Option<&Path>,
+        identities_file: &Path,
         limits: &Limits,
     ) -> Result<Self> {
-        let webauthn =
-            WebauthnBuilder::new(origin.domain().context("missing WebAuthn RP ID")?, origin)?
-                .rp_name("Shomei")
-                .timeout(CHALLENGE_TTL)
-                .build()?;
-        let yubikeys = YubikeyPolicy::new()?;
+        Self::load(
+            origin,
+            state_dir,
+            identities_file,
+            limits,
+            YubikeyPolicy::new()?,
+        )
+    }
+
+    fn load(
+        origin: &Url,
+        state_dir: &Path,
+        identities_file: &Path,
+        limits: &Limits,
+        yubikeys: YubikeyPolicy,
+    ) -> Result<Self> {
+        let webauthn = build_webauthn(origin)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -116,109 +145,127 @@ impl Auth {
             .open(state_dir.join(".lock"))
             .context("open state lock")?;
         lock.try_lock().context("lock state directory")?;
-        let accounts = read_accounts(state_dir, token_file, tokens_file, &yubikeys)?;
-        let mut ids = HashSet::new();
-        for account in accounts.values() {
-            if let Some(stored) = account
-                .credential
-                .lock()
-                .expect("new account lock")
-                .as_ref()
-            {
-                ensure!(
-                    ids.insert(stored.key.cred_id().clone()),
-                    "duplicate enrolled credential"
-                );
-            }
-        }
-        let challenges = Mutex::new(Challenges::new(limits));
-        Ok(Self {
+        let counters_dir = state_dir.join("counters");
+        fs::create_dir_all(&counters_dir).context("create counter directory")?;
+        let (changes, _) = watch::channel(0);
+        let mut auth = Self {
+            origin: origin.clone(),
             webauthn,
             yubikeys,
-            accounts,
-            credential_ids: Mutex::new(ids),
-            challenges,
+            identities_file: identities_file.into(),
+            counters_dir,
+            accounts: RwLock::new(HashMap::new()),
+            last_digest: Mutex::new([0; 32]),
+            generation: AtomicU64::new(0),
+            changes,
+            challenges: Mutex::new(Challenges::new(limits)),
             _lock: lock,
-        })
-    }
-
-    pub fn start_enroll(
-        &self,
-        name: Option<&str>,
-        bearer: Option<&str>,
-        peer: IpAddr,
-    ) -> Result<Challenge<CreationChallengeResponse>, ApiError> {
-        let (name, account) = self.account(name)?;
-        account.check_token(bearer)?;
-        if account.lock()?.is_some() {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "a YubiKey is already enrolled",
-            ));
-        }
-        self.check_challenge_capacity(peer)?;
-        let (mut options, registration) = self
-            .webauthn
-            .start_attested_passkey_registration(
-                Uuid::new_v4(),
-                name,
-                name,
-                None,
-                self.yubikeys.roots.clone(),
-                Some(AuthenticatorAttachment::CrossPlatform),
-            )
-            .map_err(ApiError::internal)?;
-        options
-            .public_key
-            .pub_key_cred_params
-            .retain(|option| option.alg == ES256);
-        let challenge_id =
-            lock(&self.challenges)?.insert(peer, Pending::Enroll(account.clone(), registration))?;
-        Ok(Challenge {
-            challenge_id,
-            options,
-        })
-    }
-
-    pub fn finish_enroll(
-        &self,
-        bearer: Option<&str>,
-        mut signed: SignedChallenge<RegisterPublicKeyCredential>,
-    ) -> Result<(), ApiError> {
-        let Pending::Enroll(account, registration) =
-            lock(&self.challenges)?.take(signed.challenge_id)?
-        else {
-            return Err(UNAUTHORIZED);
         };
-        account.check_token(bearer)?;
-        let denied = ApiError(StatusCode::UNAUTHORIZED, "YubiKey attestation failed");
-        self.yubikeys
-            .complete_chain(&mut signed.credential)
-            .map_err(|_| ApiError(denied.0, denied.1))?;
-        let key = self
-            .webauthn
-            .finish_attested_passkey_registration(&signed.credential, &registration)
-            .map_err(|_| ApiError(denied.0, denied.1))?;
-        self.yubikeys.verify(&key).map_err(|_| denied)?;
-        let mut credential = account.lock()?;
-        if credential.is_some() {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "a YubiKey is already enrolled",
-            ));
+        let bytes = read_identities(identities_file)?;
+        let verified = auth.verify_identities(&bytes)?;
+        auth.accounts = RwLock::new(auth.load_accounts(verified, &HashMap::new())?);
+        auth.last_digest = Mutex::new(sha256(&bytes));
+        Ok(auth)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn subscribe_generation(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    pub fn reload(&self) -> Result<bool> {
+        let mut last = self
+            .last_digest
+            .lock()
+            .map_err(|_| anyhow::anyhow!("identity reload lock poisoned"))?;
+        let bytes = read_identities(&self.identities_file)?;
+        let checksum = sha256(&bytes);
+        if checksum == *last {
+            return Ok(false);
         }
-        let id = key.cred_id().clone();
-        if !lock(&self.credential_ids)?.insert(id.clone()) {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "credential is already enrolled",
-            ));
+        let verified = self
+            .verify_identities(&bytes)
+            .inspect_err(|_| *last = checksum)?;
+        let previous = self
+            .accounts
+            .read()
+            .map_err(|_| anyhow::anyhow!("identity table poisoned"))?
+            .clone();
+        let next = self.load_accounts(verified, &previous)?;
+        let revoked = previous.iter().any(|(name, account)| {
+            next.get(name)
+                .is_none_or(|retained| !Arc::ptr_eq(account, retained))
+        });
+        let changed = revoked || previous.len() != next.len();
+        if changed {
+            let mut accounts = self
+                .accounts
+                .write()
+                .map_err(|_| anyhow::anyhow!("identity table poisoned"))?;
+            *accounts = next;
+            if revoked {
+                let generation = self.generation.fetch_add(1, Ordering::Release) + 1;
+                self.changes.send_replace(generation);
+            }
         }
-        let result = account.save(&mut credential, StoredCredential::new(key));
-        if result.is_err() && credential.is_none() {
-            lock(&self.credential_ids)?.remove(&id);
+        *last = checksum;
+        Ok(changed)
+    }
+
+    fn verify_identities(&self, contents: &[u8]) -> Result<Vec<VerifiedIdentity>> {
+        let records: Vec<StaticIdentity> =
+            serde_json::from_slice(contents).context("parse identities JSON array")?;
+        let mut names = HashSet::new();
+        let mut credential_ids = HashSet::new();
+        let mut verified = Vec::with_capacity(records.len());
+        for record in records {
+            ensure!(
+                names.insert(record.account.clone()),
+                "duplicate identity account"
+            );
+            let key = record
+                .verify_for(&self.origin, &self.webauthn, &self.yubikeys)
+                .with_context(|| format!("verify YubiKey identity for {:?}", record.account))?;
+            ensure!(
+                credential_ids.insert(key.cred_id().clone()),
+                "duplicate YubiKey credential ID"
+            );
+            let public_key = Credential::from(key.clone()).cred;
+            let fingerprint = sha256(&serde_json::to_vec(&(key.cred_id(), public_key))?);
+            verified.push(VerifiedIdentity {
+                name: record.account,
+                key,
+                fingerprint,
+            });
         }
-        result
+        Ok(verified)
+    }
+
+    fn load_accounts(
+        &self,
+        verified: Vec<VerifiedIdentity>,
+        previous: &HashMap<String, Arc<Account>>,
+    ) -> Result<HashMap<String, Arc<Account>>> {
+        let mut accounts = HashMap::with_capacity(verified.len());
+        for VerifiedIdentity {
+            name,
+            key,
+            fingerprint,
+        } in verified
+        {
+            let account = match previous
+                .get(&name)
+                .filter(|account| account.digest == fingerprint)
+            {
+                Some(account) => account.clone(),
+                None => Arc::new(Account::load(&self.counters_dir, key, fingerprint)?),
+            };
+            accounts.insert(name, account);
+        }
+        Ok(accounts)
     }
 
     pub fn check_challenge_capacity(&self, peer: IpAddr) -> Result<(), ApiError> {
@@ -231,14 +278,33 @@ impl Auth {
         grant: Grant,
         peer: IpAddr,
     ) -> Result<Challenge<RequestChallengeResponse>, ApiError> {
-        let (_, account) = self.account(name)?;
-        let credential = account.lock()?.as_ref().ok_or(NOT_ENROLLED)?.key.clone();
+        let name = name.unwrap_or(DEFAULT_ACCOUNT);
+        if !valid_account_name(name) {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "invalid account name"));
+        }
+        let (account, generation) = {
+            let accounts = self
+                .accounts
+                .read()
+                .map_err(|_| ApiError::internal("identity table poisoned"))?;
+            (
+                accounts.get(name).ok_or(NOT_ALLOWED)?.clone(),
+                self.generation(),
+            )
+        };
         let (options, authentication) = self
             .webauthn
-            .start_attested_passkey_authentication(&[credential])
+            .start_attested_passkey_authentication(std::slice::from_ref(&account.key))
             .map_err(ApiError::internal)?;
-        let challenge_id = lock(&self.challenges)?
-            .insert(peer, Pending::Login(account.clone(), authentication, grant))?;
+        let challenge_id = lock(&self.challenges)?.insert(
+            peer,
+            Pending {
+                account,
+                authentication,
+                grant,
+                generation,
+            },
+        )?;
         Ok(Challenge {
             challenge_id,
             options,
@@ -248,12 +314,16 @@ impl Auth {
     pub fn finish_login(
         &self,
         signed: SignedChallenge<PublicKeyCredential>,
-    ) -> Result<Grant, ApiError> {
-        let Pending::Login(account, authentication, grant) =
-            lock(&self.challenges)?.take(signed.challenge_id)?
-        else {
+    ) -> Result<(Grant, u64), ApiError> {
+        let Pending {
+            account,
+            authentication,
+            grant,
+            generation,
+        } = lock(&self.challenges)?.take(signed.challenge_id)?;
+        if self.generation() != generation {
             return Err(UNAUTHORIZED);
-        };
+        }
         let context: ClientContext =
             serde_json::from_slice(&signed.credential.response.client_data_json)
                 .map_err(|_| UNAUTHORIZED)?;
@@ -267,28 +337,15 @@ impl Auth {
         if !result.user_verified() || result.backup_eligible() || result.backup_state() {
             return Err(UNAUTHORIZED);
         }
-        let mut credential = account.lock()?;
-        let stored = credential.as_ref().ok_or(UNAUTHORIZED)?;
-        let counter = result.counter();
-        if (counter != 0 || stored.counter != 0) && counter <= stored.counter {
+        let _accounts = self
+            .accounts
+            .read()
+            .map_err(|_| ApiError::internal("identity table poisoned"))?;
+        if self.generation() != generation {
             return Err(UNAUTHORIZED);
         }
-        let mut key = stored.key.clone();
-        if key.update_credential(&result).ok_or(UNAUTHORIZED)? {
-            account.save(&mut credential, StoredCredential { key, counter })?;
-        }
-        Ok(grant)
-    }
-
-    fn account<'a>(
-        &'a self,
-        name: Option<&'a str>,
-    ) -> Result<(&'a str, &'a Arc<Account>), ApiError> {
-        let name = name.unwrap_or(DEFAULT_ACCOUNT);
-        if !valid_account_name(name) {
-            return Err(ApiError(StatusCode::BAD_REQUEST, "invalid account name"));
-        }
-        Ok((name, self.accounts.get(name).ok_or(NOT_ENROLLED)?))
+        account.update_counter(result.counter())?;
+        Ok((grant, generation))
     }
 }
 
@@ -300,48 +357,61 @@ struct ClientContext {
     top_origin: Option<String>,
 }
 
-impl StoredCredential {
-    fn new(key: AttestedPasskey) -> Self {
-        let counter = Credential::from(key.clone()).counter;
-        Self { key, counter }
-    }
-}
-
 impl Account {
-    fn lock(&self) -> Result<MutexGuard<'_, Option<StoredCredential>>, ApiError> {
-        lock(&self.credential)
+    fn load(directory: &Path, key: AttestedPasskey, digest: [u8; 32]) -> Result<Self> {
+        let counter_file = directory.join(B64.encode(digest));
+        let initial = Credential::from(key.clone()).counter;
+        let counter = match fs::read_to_string(&counter_file) {
+            Ok(stored) => stored
+                .trim()
+                .parse::<u32>()
+                .context("parse YubiKey counter")?
+                .max(initial),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => initial,
+            Err(error) => return Err(error).context("read YubiKey counter"),
+        };
+        Ok(Self {
+            key,
+            digest,
+            counter_file,
+            counter: Mutex::new(counter),
+        })
     }
 
-    fn check_token(&self, bearer: Option<&str>) -> Result<(), ApiError> {
-        if let (Some(token), Some(bearer)) = (self.token, bearer)
-            && bool::from(token.ct_eq(&token_digest(bearer)))
-        {
+    fn update_counter(&self, counter: u32) -> Result<(), ApiError> {
+        let mut current = lock(&self.counter)?;
+        if counter == 0 && *current == 0 {
             return Ok(());
         }
-        Err(ApiError(
-            StatusCode::UNAUTHORIZED,
-            "invalid enrollment token",
-        ))
-    }
-
-    fn save(
-        &self,
-        credential: &mut Option<StoredCredential>,
-        stored: StoredCredential,
-    ) -> Result<(), ApiError> {
-        let save = || -> Result<()> {
-            let path = self.file.parent().context("missing state directory")?;
+        if counter <= *current {
+            return Err(UNAUTHORIZED);
+        }
+        let mut save = || -> Result<()> {
+            let path = self
+                .counter_file
+                .parent()
+                .context("missing counter directory")?;
             let dir = File::open(path)?;
             let mut file = tempfile::NamedTempFile::new_in(path)?;
-            serde_json::to_writer(file.as_file_mut(), &stored.key)?;
+            write!(file, "{counter}")?;
             file.as_file().sync_all()?;
-            file.persist(&self.file)?;
-            *credential = Some(stored);
+            file.persist(&self.counter_file)?;
+            *current = counter;
             dir.sync_all()?;
             Ok(())
         };
         save().map_err(ApiError::internal)
     }
+}
+
+fn build_webauthn(origin: &Url) -> Result<Webauthn> {
+    validate_origin(origin)?;
+    Ok(
+        WebauthnBuilder::new(origin.domain().context("missing WebAuthn RP ID")?, origin)?
+            .rp_name("Shomei")
+            .timeout(CHALLENGE_TTL)
+            .build()?,
+    )
 }
 
 fn valid_account_name(name: &str) -> bool {
@@ -352,107 +422,29 @@ fn valid_account_name(name: &str) -> bool {
         })
 }
 
-fn token_digest(token: &str) -> [u8; 32] {
-    digest(&SHA256, token.as_bytes())
+pub fn provisioning_model(model: Uuid) -> bool {
+    YUBIKEY_5_MODELS.contains(&model.to_string().as_str())
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    digest(&SHA256, bytes)
         .as_ref()
         .try_into()
         .expect("SHA-256 has 32 bytes")
 }
 
-fn read_accounts(
-    state_dir: &Path,
-    token_file: Option<&Path>,
-    tokens_file: Option<&Path>,
-    yubikeys: &YubikeyPolicy,
-) -> Result<HashMap<String, Arc<Account>>> {
-    let named_dir = state_dir.join("accounts");
-    fs::create_dir_all(&named_dir).context("create account directory")?;
-    let mut tokens: HashMap<String, String> = match tokens_file {
-        Some(path) => toml::from_str(&fs::read_to_string(path).context("read enrollment tokens")?)
-            .context("parse enrollment tokens")?,
-        None => HashMap::new(),
-    };
-    if let Some(path) = token_file {
-        match fs::read_to_string(path) {
-            Ok(token) => ensure!(
-                tokens.insert(DEFAULT_ACCOUNT.into(), token).is_none(),
-                "duplicate operator enrollment token"
-            ),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    && state_dir.join("credential.json").is_file() => {}
-            Err(error) => return Err(error).context("read enrollment token"),
-        }
-    }
-    let mut accounts = HashMap::new();
-    let mut digests = HashSet::new();
-    let mut names: HashSet<String> = tokens.keys().cloned().collect();
-    if state_dir.join("credential.json").is_file() {
-        names.insert(DEFAULT_ACCOUNT.into());
-    }
-    for entry in fs::read_dir(&named_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "json")
-        {
-            let name = path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .context("invalid account file")?;
-            ensure!(
-                name != DEFAULT_ACCOUNT,
-                "operator credential belongs in the state directory"
-            );
-            names.insert(name.to_string());
-        }
-    }
-    for name in names {
-        ensure!(valid_account_name(&name), "invalid account name: {name}");
-        let file = if name == DEFAULT_ACCOUNT {
-            state_dir.join("credential.json")
-        } else {
-            named_dir.join(format!("{name}.json"))
-        };
-        let credential = match File::open(&file) {
-            Ok(file) => {
-                let key = serde_json::from_reader(file).context("read stored credential")?;
-                yubikeys
-                    .verify(&key)
-                    .with_context(|| format!("validate stored YubiKey for {name}"))?;
-                Some(StoredCredential::new(key))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).context("open stored credential"),
-        };
-        let token = tokens
-            .get(&name)
-            .map(|token| -> Result<_> {
-                let token = token.trim();
-                ensure!(
-                    token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_graphic()),
-                    "invalid enrollment token for {name}"
-                );
-                let digest = token_digest(token);
-                ensure!(digests.insert(digest), "duplicate enrollment token");
-                Ok(digest)
-            })
-            .transpose()?;
-        accounts.insert(
-            name,
-            Arc::new(Account {
-                file,
-                token,
-                credential: Mutex::new(credential),
-            }),
-        );
-    }
+fn read_identities(path: &Path) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    File::open(path)
+        .context("open identities file")?
+        .take(MAX_IDENTITIES_BYTES + 1)
+        .read_to_end(&mut data)
+        .context("read identities file")?;
     ensure!(
-        !accounts.is_empty(),
-        "configure an enrollment token or restore enrolled credentials"
+        data.len() as u64 <= MAX_IDENTITIES_BYTES,
+        "identities file exceeds size limit"
     );
-    Ok(accounts)
+    Ok(data)
 }
 
 struct Challenges {
@@ -699,4 +691,4 @@ const YUBIKEY_5_MODELS: &[&str] = &[
 ];
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

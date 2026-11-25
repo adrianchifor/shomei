@@ -20,7 +20,7 @@ use time::OffsetDateTime;
 use tokio::{
     io::{AsyncWriteExt, copy_bidirectional},
     net::TcpStream,
-    sync::Semaphore,
+    sync::{Semaphore, watch},
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
@@ -30,6 +30,8 @@ use x509_parser::{
 };
 
 use crate::accept_tls;
+
+const CLIENT_NAME: &str = "Shomei TCP Client ";
 
 pub struct Identity {
     certs: Vec<CertificateDer<'static>>,
@@ -95,14 +97,19 @@ impl Issuer {
         Ok(Self { signer, cert })
     }
 
-    pub fn issue(&self, public_key: &SubjectPublicKeyInfo, ttl: u64) -> Result<ClientCertificate> {
+    pub fn issue(
+        &self,
+        public_key: &SubjectPublicKeyInfo,
+        ttl: u64,
+        generation: u64,
+    ) -> Result<ClientCertificate> {
         ensure!(
             public_key.algorithm() == &PKCS_ECDSA_P256_SHA256,
             "client key must use P-256"
         );
         let now = unix_seconds()?;
         let expires_at = now + ttl;
-        let mut params = named_certificate("Shomei TCP Client");
+        let mut params = named_certificate(&format!("{CLIENT_NAME}{generation}"));
         let serial = ring::rand::generate::<[u8; 16]>(&ring::rand::SystemRandom::new())
             .map_err(|_| anyhow::anyhow!("cannot generate certificate serial number"))?
             .expose();
@@ -155,6 +162,7 @@ pub async fn relay(
     tls: TlsAcceptor,
     upstream: Arc<str>,
     handshakes: Arc<Semaphore>,
+    mut allowed_generation: watch::Receiver<u64>,
 ) {
     let Some(mut downstream) = accept_tls(socket, tls, &handshakes).await else {
         return;
@@ -167,32 +175,42 @@ pub async fn relay(
     else {
         return;
     };
-    let Ok(lifetime) = remaining_lifetime(cert) else {
+    let Ok((generation, lifetime)) = client_grant(cert) else {
         return;
     };
-    let result = timeout(lifetime, async {
-        if let Ok(Ok(mut upstream)) = timeout(
-            Duration::from_secs(5),
-            TcpStream::connect(upstream.as_ref()),
-        )
-        .await
-        {
-            let _ = upstream.set_nodelay(true);
-            let _ = copy_bidirectional(&mut downstream, &mut upstream).await;
-        }
-    })
-    .await;
-    if result.is_err() {
+    if *allowed_generation.borrow_and_update() != generation {
+        return;
+    }
+    let stop = tokio::select! {
+        biased;
+        _ = allowed_generation.wait_for(|allowed| *allowed != generation) => true,
+        result = timeout(lifetime, async {
+            if let Ok(Ok(mut upstream)) = timeout(Duration::from_secs(5), TcpStream::connect(upstream.as_ref())).await {
+                let _ = upstream.set_nodelay(true);
+                let _ = copy_bidirectional(&mut downstream, &mut upstream).await;
+            }
+        }) => result.is_err(),
+    };
+    if stop {
         let _ = timeout(Duration::from_millis(250), downstream.shutdown()).await;
     }
 }
 
-fn remaining_lifetime(cert: &CertificateDer<'_>) -> Result<Duration> {
+fn client_grant(cert: &CertificateDer<'_>) -> Result<(u64, Duration)> {
     let (_, cert) = parse_x509_certificate(cert.as_ref())
         .map_err(|_| anyhow::anyhow!("invalid client certificate"))?;
+    let generation = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .context("missing client grant")?
+        .as_str()?
+        .strip_prefix(CLIENT_NAME)
+        .context("invalid client grant")?
+        .parse()?;
     let expires_at =
         UNIX_EPOCH + Duration::from_secs(cert.validity().not_after.timestamp().try_into()?);
-    Ok(expires_at.duration_since(SystemTime::now())?)
+    Ok((generation, expires_at.duration_since(SystemTime::now())?))
 }
 
 #[cfg(test)]

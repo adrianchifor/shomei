@@ -4,14 +4,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Shomei</title>
 <link rel="stylesheet" href="/_shomei/auth.css">
-<script src="/_shomei/auth.js" defer></script>
+<script type="module" src="/_shomei/auth.js"></script>
 <main>
   <h1>Sign in with your YubiKey</h1>
   <form>
-    <label>Account <input id="account" type="text" autocomplete="username" placeholder="operator" maxlength="64"></label>
-    <label hidden>Enrollment token <input id="enrollment-token" type="password" autocomplete="off"></label>
-    <button type="submit">Use YubiKey</button>
+    <label>Account <input id="account" type="text" autocomplete="username" autocapitalize="none" placeholder="operator" maxlength="64"></label>
+    <button type="submit" disabled aria-describedby="status">Use YubiKey</button>
   </form>
-  <p id="status" role="status"></p>
+  <p id="status" role="status">Preparing sign-in…</p>
+  <noscript>Enable JavaScript to sign in with your YubiKey.</noscript>
 </main>
 </html>

@@ -1,0 +1,110 @@
+name: Build and release
+
+on:
+  push:
+    tags: ['**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: '1.100.0'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: shomei-linux-amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: shomei-linux-arm64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: shomei-macos-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Linux tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libudev-dev linux-libc-dev pkg-config
+      - name: Install Rust
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            release-${{ matrix.target }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Test and build
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          cargo "+$RUST_TOOLCHAIN" test --release --locked --target "$TARGET"
+          cargo "+$RUST_TOOLCHAIN" build --release --locked --target "$TARGET"
+          mkdir -p dist
+          cp "target/$TARGET/release/shomei" "dist/$ASSET"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: shomei-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          assets=(shomei-linux-amd64 shomei-linux-arm64 shomei-macos-arm64)
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+          done
+          sha256sum "${assets[@]}" > SHA256SUMS
+          if draft=$(gh release view --json isDraft --jq .isDraft -- "$RELEASE_TAG" 2>/dev/null); then
+            if [[ "$draft" == false ]]; then
+              exit 0
+            fi
+          else
+            gh release create --verify-tag --draft --title "$RELEASE_TAG" --notes "$RELEASE_TAG" -- "$RELEASE_TAG"
+          fi
+          gh release upload --clobber -- "$RELEASE_TAG" "${assets[@]}" SHA256SUMS
+          gh release edit --draft=false --latest -- "$RELEASE_TAG"

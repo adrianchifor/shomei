@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Extension, Json, Router,
     body::{Body, Bytes},
@@ -17,6 +17,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body::Frame;
 use http_body_util::BodyExt;
 use hyper::{
@@ -38,7 +39,7 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 use url::Position;
-use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
+use webauthn_rs::prelude::PublicKeyCredential;
 
 use crate::{
     accept_tls,
@@ -52,14 +53,21 @@ const PREFIX: &str = "/_shomei";
 const NO_STORE: HeaderValue = HeaderValue::from_static("private, no-store");
 
 pub struct App {
-    auth: Auth,
+    auth: Arc<Auth>,
     origin: String,
     host: HeaderValue,
     sessions: Sessions,
     upstream: Option<HttpUpstream>,
-    tcp: Option<(Issuer, u64)>,
+    tcp: Option<TcpAccess>,
     auth_workers: Arc<Semaphore>,
     http_requests: Arc<Semaphore>,
+}
+
+struct TcpAccess {
+    issuer: Issuer,
+    ttl: u64,
+    endpoint: String,
+    ssh_host: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -70,11 +78,23 @@ struct HttpUpstream {
     client: Client<HttpsConnector<HttpConnector>, Body>,
 }
 
-pub fn app(config: Config, issuer: Option<Issuer>) -> Result<Router> {
-    Ok(routes(state(config, issuer)?))
+pub fn app(config: Config, issuer: Option<Issuer>) -> Result<(Router, Arc<Auth>)> {
+    let state = state(config, issuer)?;
+    let auth = state.auth.clone();
+    Ok((routes(state), auth))
 }
 
 fn state(config: Config, issuer: Option<Issuer>) -> Result<Arc<App>> {
+    let auth = Auth::new(
+        &config.origin,
+        &config.state_dir,
+        &config.identities_file,
+        &config.limits,
+    )?;
+    state_with_auth(config, issuer, auth)
+}
+
+fn state_with_auth(config: Config, issuer: Option<Issuer>, auth: Auth) -> Result<Arc<App>> {
     let upstream = config
         .http_upstream
         .map(|origin| -> Result<_> {
@@ -102,19 +122,20 @@ fn state(config: Config, issuer: Option<Issuer>) -> Result<Arc<App>> {
         })
         .transpose()?;
     let host = HeaderValue::from_str(&config.origin[Position::BeforeHost..Position::AfterPort])?;
+    let hostname = config.origin.domain().context("missing proxy hostname")?;
+    let tcp = issuer.zip(config.tcp).map(|(issuer, tcp)| TcpAccess {
+        issuer,
+        ttl: tcp.cert_ttl_seconds,
+        endpoint: format!("{hostname}:{}", tcp.public_port.unwrap_or(tcp.bind.port())),
+        ssh_host: tcp.ssh_host,
+    });
     Ok(Arc::new(App {
-        auth: Auth::new(
-            &config.origin,
-            &config.state_dir,
-            config.enrollment_token_file.as_deref(),
-            config.enrollment_tokens_file.as_deref(),
-            &config.limits,
-        )?,
+        auth: Arc::new(auth),
         origin: config.origin.origin().ascii_serialization(),
         host,
         sessions: Sessions::new(config.session_ttl_seconds)?,
         upstream,
-        tcp: issuer.zip(config.tcp.map(|tcp| tcp.cert_ttl_seconds)),
+        tcp,
         auth_workers: Arc::new(Semaphore::new(config.limits.auth_workers)),
         http_requests: Arc::new(Semaphore::new(config.limits.http_requests)),
     }))
@@ -123,11 +144,8 @@ fn state(config: Config, issuer: Option<Issuer>) -> Result<Arc<App>> {
 fn routes(state: Arc<App>) -> Router {
     let reserved = Router::new()
         .route("/login", get(page))
-        .route("/enroll", get(page))
         .route("/auth.js", get(script))
         .route("/auth.css", get(styles))
-        .route("/api/enroll/start", post(enroll_start))
-        .route("/api/enroll/finish", post(enroll_finish))
         .route("/api/auth/start", post(login_start))
         .route("/api/auth/finish", post(login_finish))
         .fallback(|| async { StatusCode::NOT_FOUND })
@@ -263,17 +281,6 @@ async fn styles() -> impl IntoResponse {
     )
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
-    let (scheme, token) = headers.get(AUTHORIZATION)?.to_str().ok()?.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then_some(token)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AccountRequest {
-    account: Option<String>,
-}
-
 async fn auth_work<T: Send + 'static>(
     app: Arc<App>,
     operation: impl FnOnce(&App) -> Result<T, ApiError> + Send + 'static,
@@ -292,39 +299,12 @@ async fn auth_work<T: Send + 'static>(
     .map_err(ApiError::internal)?
 }
 
-async fn enroll_start(
-    State(app): State<Arc<App>>,
-    Extension(Peer(peer)): Extension<Peer>,
-    headers: HeaderMap,
-    Json(body): Json<AccountRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    auth_work(app, move |app| {
-        Ok(Json(app.auth.start_enroll(
-            body.account.as_deref(),
-            bearer(&headers),
-            peer,
-        )?))
-    })
-    .await
-}
-
-async fn enroll_finish(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    Json(body): Json<SignedChallenge<RegisterPublicKeyCredential>>,
-) -> Result<StatusCode, ApiError> {
-    auth_work(app, move |app| {
-        app.auth.finish_enroll(bearer(&headers), body)?;
-        Ok(StatusCode::NO_CONTENT)
-    })
-    .await
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoginStart {
     client_csr_pem: Option<String>,
     account: Option<String>,
+    tcp_target: Option<String>,
 }
 
 async fn login_start(
@@ -334,19 +314,39 @@ async fn login_start(
 ) -> Result<impl IntoResponse, ApiError> {
     auth_work(app, move |app| {
         app.auth.check_challenge_capacity(peer)?;
-        let grant = match body.client_csr_pem {
-            Some(_csr) if app.tcp.is_none() => {
-                return Err(ApiError(StatusCode::BAD_REQUEST, "TCP relay is disabled"));
-            }
-            Some(csr) => Grant::Tcp(
-                csr_key(&csr)
-                    .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid P-256 client CSR"))?,
-            ),
-            None if app.upstream.is_none() => {
-                return Err(ApiError(StatusCode::BAD_REQUEST, "HTTP relay is disabled"));
-            }
-            None => Grant::Http,
-        };
+        let grant =
+            match body.client_csr_pem {
+                Some(csr) => {
+                    let tcp = app
+                        .tcp
+                        .as_ref()
+                        .ok_or(ApiError(StatusCode::BAD_REQUEST, "TCP relay is disabled"))?;
+                    if let Some(host) = body.tcp_target
+                        && !tcp
+                            .ssh_host
+                            .as_deref()
+                            .is_some_and(|allowed| allowed.eq_ignore_ascii_case(&host))
+                    {
+                        return Err(ApiError(
+                            StatusCode::FORBIDDEN,
+                            "SSH host is not allowed by this proxy",
+                        ));
+                    }
+                    Grant::Tcp(csr_key(&csr).map_err(|_| {
+                        ApiError(StatusCode::BAD_REQUEST, "invalid P-256 client CSR")
+                    })?)
+                }
+                None if body.tcp_target.is_some() => {
+                    return Err(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "TCP target requires a client CSR",
+                    ));
+                }
+                None if app.upstream.is_none() => {
+                    return Err(ApiError(StatusCode::BAD_REQUEST, "HTTP relay is disabled"));
+                }
+                None => Grant::Http,
+            };
         Ok(Json(app.auth.start_login(
             body.account.as_deref(),
             grant,
@@ -360,24 +360,69 @@ async fn login_finish(
     State(app): State<Arc<App>>,
     Json(body): Json<SignedChallenge<PublicKeyCredential>>,
 ) -> Result<Response, ApiError> {
-    auth_work(app, move |app| match app.auth.finish_login(body)? {
-        Grant::Http => {
-            let (cookie, expires_at) = app.sessions.issue().map_err(ApiError::internal)?;
-            Ok((
-                [(SET_COOKIE, cookie)],
-                Json(serde_json::json!({ "expires_at": expires_at })),
-            )
+    auth_work(app, move |app| {
+        let (grant, generation) = app.auth.finish_login(body)?;
+        check_generation(app, generation)?;
+        match grant {
+            Grant::Http => {
+                let (cookie, expires_at) =
+                    app.sessions.issue(generation).map_err(ApiError::internal)?;
+                Ok((
+                    [(SET_COOKIE, cookie)],
+                    Json(serde_json::json!({ "expires_at": expires_at })),
+                )
+                    .into_response())
+            }
+            Grant::Tcp(key) => {
+                let tcp = app
+                    .tcp
+                    .as_ref()
+                    .ok_or_else(|| ApiError::internal("missing TCP issuer"))?;
+                let certificate = tcp
+                    .issuer
+                    .issue(&key, tcp.ttl, generation)
+                    .map_err(ApiError::internal)?;
+                Ok(Json(serde_json::json!({
+                    "certificate_pem": certificate.certificate_pem,
+                    "expires_at": certificate.expires_at,
+                    "tcp_endpoint": tcp.endpoint,
+                }))
                 .into_response())
-        }
-        Grant::Tcp(key) => {
-            let (issuer, ttl) = app
-                .tcp
-                .as_ref()
-                .ok_or_else(|| ApiError::internal("missing TCP issuer"))?;
-            Ok(Json(issuer.issue(&key, *ttl).map_err(ApiError::internal)?).into_response())
+            }
         }
     })
     .await
+}
+
+fn check_generation(app: &App, generation: u64) -> Result<(), ApiError> {
+    if app.auth.generation() == generation {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "YubiKey permissions changed",
+        ))
+    }
+}
+
+fn signed_header(
+    headers: &HeaderMap,
+) -> Result<Option<SignedChallenge<PublicKeyCredential>>, ApiError> {
+    let entries = headers.get_all(AUTHORIZATION);
+    for value in entries.iter().filter_map(|value| value.to_str().ok()) {
+        let (scheme, token) = value.split_once(' ').unwrap_or((value, ""));
+        if scheme.eq_ignore_ascii_case("shomei") {
+            let invalid = || ApiError(StatusCode::UNAUTHORIZED, "invalid Shomei authorization");
+            if entries.iter().count() != 1 || token.is_empty() || token.len() > 8192 {
+                return Err(invalid());
+            }
+            let body = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
+            return serde_json::from_slice(&body)
+                .map(Some)
+                .map_err(|_| invalid());
+        }
+    }
+    Ok(None)
 }
 
 async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response {
@@ -387,7 +432,15 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
     if request.method() == Method::CONNECT || request.headers().contains_key(UPGRADE) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    if !app.sessions.verify(request.headers()) {
+    let signed = match signed_header(request.headers()) {
+        Ok(signed) => signed,
+        Err(error) => return error.into_response(),
+    };
+    if signed.is_none()
+        && !app
+            .sessions
+            .verify(request.headers(), app.auth.generation())
+    {
         let mut response = if wants_login(&request) {
             let target = request
                 .uri()
@@ -408,6 +461,33 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
     }
     let Ok(permit) = app.http_requests.clone().try_acquire_owned() else {
         return ApiError(StatusCode::SERVICE_UNAVAILABLE, "HTTP relay busy").into_response();
+    };
+    let session = if let Some(signed) = signed {
+        let result = auth_work(app.clone(), move |app| {
+            let (grant, generation) = app.auth.finish_login(signed)?;
+            if !matches!(grant, Grant::Http) {
+                return Err(ApiError(
+                    StatusCode::UNAUTHORIZED,
+                    "HTTP authorization required",
+                ));
+            }
+            check_generation(app, generation)?;
+            let (cookie, _) = app.sessions.issue(generation).map_err(ApiError::internal)?;
+            Ok((cookie, generation))
+        })
+        .await;
+        match result {
+            Ok((cookie, generation)) => {
+                if let Err(error) = check_generation(&app, generation) {
+                    return error.into_response();
+                }
+                request.headers_mut().remove(AUTHORIZATION);
+                Some(cookie)
+            }
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        None
     };
     let mut parts = upstream.origin.clone().into_parts();
     parts.path_and_query = request.uri().path_and_query().cloned();
@@ -449,6 +529,9 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
         return StatusCode::BAD_GATEWAY.into_response();
     }
     filter_cookies(response.headers_mut(), SET_COOKIE);
+    if let Some(session) = session {
+        response.headers_mut().append(SET_COOKIE, session);
+    }
     response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
     response
 }

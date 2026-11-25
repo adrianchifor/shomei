@@ -1,4 +1,5 @@
 mod auth;
+mod cli;
 mod config;
 mod http;
 mod session;
@@ -12,7 +13,7 @@ use tokio::{
     net::{TcpListener, TcpSocket, TcpStream},
     signal::unix::{SignalKind, signal},
     sync::Semaphore,
-    time::{sleep, timeout},
+    time::{MissedTickBehavior, interval, sleep, timeout},
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
@@ -20,9 +21,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let path = std::env::args_os()
-        .nth(1)
-        .unwrap_or_else(|| "shomei.toml".into());
+    let Some(path) = cli::run().await? else {
+        return Ok(());
+    };
     let config = Config::load(path.as_ref())?;
     let identity = Identity::load(&config.tls_cert, &config.tls_key)?;
     let issuer = config
@@ -46,7 +47,9 @@ async fn main() -> Result<()> {
     let tcp_max = config.limits.tcp_connections;
     let handshakes = config.limits.tls_handshakes;
     let https_handshakes = Arc::new(Semaphore::new(handshakes));
-    let app = http::app(config, issuer)?;
+    let (app, auth) = http::app(config, issuer)?;
+    let generation = auth.subscribe_generation();
+    let reloader = tokio::spawn(reload_identities(auth));
     let mut terminate = signal(SignalKind::terminate())?;
     eprintln!("HTTPS listening on {}", https.local_addr()?);
     if let Some((listener, _, _)) = &tcp {
@@ -58,12 +61,39 @@ async fn main() -> Result<()> {
         result = async {
             let Some((listener, tls, upstream)) = tcp else { return future::pending().await };
             let handshakes = Arc::new(Semaphore::new(handshakes));
-            serve(listener, tcp_max, move |socket, _| tls::relay(socket, tls.clone(), upstream.clone(), handshakes.clone())).await
+            serve(listener, tcp_max, move |socket, _| tls::relay(socket, tls.clone(), upstream.clone(), handshakes.clone(), generation.clone())).await
         } => result?,
         result = tokio::signal::ctrl_c() => result?,
         _ = terminate.recv() => {},
     }
+    reloader.abort();
     Ok(())
+}
+
+async fn reload_identities(auth: Arc<auth::Auth>) {
+    let mut timer = interval(Duration::from_secs(1));
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    timer.tick().await;
+    let mut last_error = None;
+    loop {
+        timer.tick().await;
+        let auth = auth.clone();
+        let result = tokio::task::spawn_blocking(move || auth.reload()).await;
+        let error = match result {
+            Ok(Ok(true)) => {
+                eprintln!("Reloaded YubiKey identities");
+                last_error = None;
+                continue;
+            }
+            Ok(Ok(false)) => continue,
+            Ok(Err(error)) => format!("{error:#}"),
+            Err(error) => error.to_string(),
+        };
+        if last_error.as_ref() != Some(&error) {
+            eprintln!("Identity reload failed, keeping the last valid file: {error}");
+            last_error = Some(error);
+        }
+    }
 }
 
 fn listen(addr: SocketAddr) -> io::Result<TcpListener> {

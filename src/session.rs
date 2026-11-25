@@ -15,10 +15,10 @@ use zeroize::Zeroizing;
 use crate::tls::unix_seconds;
 
 const COOKIE_NAME: &str = "__Host-shomei";
-const DOMAIN: &[u8] = b"shomei-http-session-v1";
-const TOKEN_LEN: usize = 48;
+const DOMAIN: &[u8] = b"shomei-http-session-v2";
+const TOKEN_LEN: usize = 59;
 const NONCE_LEN: usize = 12;
-const PAYLOAD_LEN: usize = 8;
+const PAYLOAD_LEN: usize = 16;
 const RAW_LEN: usize = NONCE_LEN + PAYLOAD_LEN + aead::MAX_TAG_LEN;
 
 pub struct Sessions {
@@ -46,7 +46,7 @@ impl Sessions {
         })
     }
 
-    pub fn issue(&self) -> Result<(HeaderValue, u64)> {
+    pub fn issue(&self, generation: u64) -> Result<(HeaderValue, u64)> {
         let expires = self.now() + self.ttl;
         let sequence = self
             .sequence
@@ -56,7 +56,9 @@ impl Sessions {
             .map_err(|_| anyhow!("session nonce range exhausted"))?;
         let mut nonce = [0; NONCE_LEN];
         nonce[4..].copy_from_slice(&sequence.to_be_bytes());
-        let mut payload = expires.to_be_bytes();
+        let mut payload = [0; PAYLOAD_LEN];
+        payload[..8].copy_from_slice(&expires.to_be_bytes());
+        payload[8..].copy_from_slice(&generation.to_be_bytes());
         let tag = self
             .key
             .seal_in_place_separate_tag(
@@ -79,7 +81,7 @@ impl Sessions {
         Ok((HeaderValue::from_str(&cookie)?, expires))
     }
 
-    pub fn verify(&self, headers: &HeaderMap) -> bool {
+    pub fn verify(&self, headers: &HeaderMap, generation: u64) -> bool {
         let mut tokens = headers
             .get_all(COOKIE)
             .iter()
@@ -91,11 +93,13 @@ impl Sessions {
         };
         tokens.next().is_none()
             && self
-                .expires_at(token)
-                .is_some_and(|expires| self.now() < expires)
+                .claims(token)
+                .is_some_and(|(expires, issued_generation)| {
+                    issued_generation == generation && self.now() < expires
+                })
     }
 
-    fn expires_at(&self, token: &str) -> Option<u64> {
+    fn claims(&self, token: &str) -> Option<(u64, u64)> {
         if token.len() != TOKEN_LEN {
             return None;
         }
@@ -109,7 +113,11 @@ impl Sessions {
             .key
             .open_in_place(nonce, Aad::from(DOMAIN), payload)
             .ok()?;
-        Some(u64::from_be_bytes(plaintext.try_into().ok()?))
+        let (expires, generation) = plaintext.split_at(8);
+        Some((
+            u64::from_be_bytes(expires.try_into().ok()?),
+            u64::from_be_bytes(generation.try_into().ok()?),
+        ))
     }
 
     fn now(&self) -> u64 {

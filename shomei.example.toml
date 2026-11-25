@@ -3,13 +3,14 @@ https_bind = "0.0.0.0:8443"
 tls_cert = "/etc/shomei/tls.pem"
 tls_key = "/etc/shomei/tls-key.pem"
 state_dir = "/var/lib/shomei"
-enrollment_token_file = "/etc/shomei/enrollment-token"
+identities_file = "/etc/shomei/identities.json"
 http_upstream = "http://host.docker.internal:8080"
 session_ttl_seconds = 600
 
 [tcp]
 bind = "0.0.0.0:9443"
 upstream = "host.docker.internal:9000"
+public_port = 9443
 cert_ttl_seconds = 300
 
 [limits]
