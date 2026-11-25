@@ -44,7 +44,7 @@ use webauthn_rs::prelude::PublicKeyCredential;
 use crate::{
     accept_tls,
     auth::{ApiError, Auth, Grant, SignedChallenge},
-    config::Config,
+    config::{BrowserAction, Config},
     session::{Sessions, session_value},
     tls::{Issuer, csr_key},
 };
@@ -58,6 +58,7 @@ pub struct App {
     host: HeaderValue,
     sessions: Sessions,
     upstream: Option<HttpUpstream>,
+    browser_action: Option<BrowserAction>,
     tcp: Option<TcpAccess>,
     auth_workers: Arc<Semaphore>,
     http_requests: Arc<Semaphore>,
@@ -135,6 +136,7 @@ fn state_with_auth(config: Config, issuer: Option<Issuer>, auth: Auth) -> Result
         host,
         sessions: Sessions::new(config.session_ttl_seconds)?,
         upstream,
+        browser_action: config.browser_action,
         tcp,
         auth_workers: Arc::new(Semaphore::new(config.limits.auth_workers)),
         http_requests: Arc::new(Semaphore::new(config.limits.http_requests)),
@@ -144,10 +146,12 @@ fn state_with_auth(config: Config, issuer: Option<Issuer>, auth: Auth) -> Result
 fn routes(state: Arc<App>) -> Router {
     let reserved = Router::new()
         .route("/login", get(page))
+        .route("/action", get(action_page))
         .route("/auth.js", get(script))
         .route("/auth.css", get(styles))
         .route("/api/auth/start", post(login_start))
         .route("/api/auth/finish", post(login_finish))
+        .route("/api/action", get(action_details))
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), protect_auth));
@@ -265,6 +269,18 @@ async fn protect_auth(State(app): State<Arc<App>>, request: Request, next: Next)
 
 async fn page() -> Html<&'static str> {
     Html(include_str!("../assets/auth.html"))
+}
+
+async fn action_page(State(app): State<Arc<App>>) -> Result<Html<&'static str>, StatusCode> {
+    app.browser_action.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Html(include_str!("../assets/action.html")))
+}
+
+async fn action_details(State(app): State<Arc<App>>) -> Result<Json<BrowserAction>, StatusCode> {
+    app.browser_action
+        .clone()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn script() -> impl IntoResponse {
@@ -436,6 +452,21 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
         Ok(signed) => signed,
         Err(error) => return error.into_response(),
     };
+    if app.browser_action.is_some()
+        && signed.is_none()
+        && !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        )
+    {
+        let mut response = ApiError(
+            StatusCode::UNAUTHORIZED,
+            "a fresh YubiKey approval is required",
+        )
+        .into_response();
+        response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
+        return response;
+    }
     if signed.is_none()
         && !app
             .sessions

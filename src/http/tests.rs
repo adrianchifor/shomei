@@ -11,7 +11,7 @@ use crate::{
 };
 
 #[tokio::test]
-async fn forwards_one_signed_request_and_reuses_its_cookie_until_revocation() {
+async fn approves_one_deploy_and_allows_only_reads_with_its_cookie() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let identities_file = dir.path().join("identities.json");
@@ -27,6 +27,10 @@ async fn forwards_one_signed_request_and_reuses_its_cookie_until_revocation() {
                 .parse()
                 .unwrap(),
         ),
+        browser_action: Some(BrowserAction {
+            path: "/deploy".into(),
+            label: "Deploy service".into(),
+        }),
         session_ttl_seconds: 60,
         tcp: Some(TcpConfig {
             bind: "127.0.0.1:9443".parse().unwrap(),
@@ -47,8 +51,11 @@ async fn forwards_one_signed_request_and_reuses_its_cookie_until_revocation() {
     let router = routes(state.clone());
     let server = tokio::spawn(async move {
         let upstream_app = Router::new().fallback(|request: Request| async move {
-            assert_eq!(request.method(), Method::POST);
-            assert_eq!(request.uri(), "/deploy?q=1");
+            match *request.method() {
+                Method::POST => assert_eq!(request.uri(), "/deploy?q=1"),
+                Method::GET => assert_eq!(request.uri(), "/status"),
+                _ => panic!("unexpected upstream request"),
+            }
             assert_eq!(request.headers()[COOKIE], "app=123");
             assert_eq!(request.headers()["x-forwarded-proto"], "https");
             assert_eq!(request.headers()["x-forwarded-host"], "localhost:8443");
@@ -97,6 +104,22 @@ async fn forwards_one_signed_request_and_reuses_its_cookie_until_revocation() {
     )
     .await;
     assert_eq!(external.status(), StatusCode::FORBIDDEN);
+
+    let page = send(
+        &router,
+        request("/_shomei/action").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let details = send(
+        &router,
+        request("/_shomei/api/action").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        json_body(details).await,
+        json!({"label": "Deploy service", "path": "/deploy"})
+    );
 
     let start = send(&router, post_json("/_shomei/api/auth/start", json!({}))).await;
     assert_eq!(start.status(), StatusCode::OK);
@@ -154,6 +177,15 @@ async fn forwards_one_signed_request_and_reuses_its_cookie_until_revocation() {
     )
     .await;
     assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    let cookie_only = send(
+        &router,
+        deploy()
+            .header(COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(cookie_only.status(), StatusCode::UNAUTHORIZED);
     let bad_framing = send(
         &router,
         request("/deploy")
@@ -165,10 +197,10 @@ async fn forwards_one_signed_request_and_reuses_its_cookie_until_revocation() {
     .await;
     assert_eq!(bad_framing.status(), StatusCode::BAD_REQUEST);
     let reuse = || {
-        deploy()
+        request("/status")
             .header(COOKIE, format!("app=123; {cookie}"))
             .header(AUTHORIZATION, "Bearer app")
-            .body(Body::from("hello"))
+            .body(Body::empty())
             .unwrap()
     };
     assert_eq!(send(&router, reuse()).await.status(), StatusCode::OK);

@@ -2,6 +2,8 @@ const form = document.querySelector("form");
 const account = form.querySelector("#account");
 const button = form.querySelector("button");
 const notice = document.querySelector("#status");
+const isAction = form.hasAttribute("data-action");
+let action;
 let prepared;
 let revision = 0;
 let inputTimer;
@@ -13,9 +15,23 @@ async function post(path, body) {
     body: JSON.stringify(body),
     redirect: "error",
   });
-  if (response.ok) return response.json();
+  return resultOf(response);
+}
+
+async function resultOf(response) {
+  if (response.ok) return response.json().catch(() => ({}));
   const result = await response.json().catch(() => ({}));
   throw new Error(result.error || `Request failed (${response.status}).`);
+}
+
+async function approve(signed) {
+  const authorization = encode(new TextEncoder().encode(JSON.stringify(signed)));
+  const response = await fetch(action.path, {
+    method: "POST",
+    headers: { Authorization: `Shomei ${authorization}`, Accept: "application/json" },
+    redirect: "error",
+  });
+  return resultOf(response);
 }
 
 function decode(value) {
@@ -54,6 +70,10 @@ async function prepare(message = "") {
   }
   notice.textContent = message || "Preparing sign-in…";
   try {
+    if (isAction && !action) {
+      action = await resultOf(await fetch("/_shomei/api/action", { redirect: "error" }));
+      button.textContent = action.label;
+    }
     const name = account.value.trim();
     const { challenge_id, publicKey } = await post("start", name ? { account: name } : {});
     if (current !== revision) return;
@@ -99,7 +119,7 @@ form.addEventListener("submit", async (event) => {
   if (!prepared) return;
   const { challenge_id, loadedAt, publicKey } = prepared;
   if (Date.now() - loadedAt > 105_000) {
-    await prepare("Sign-in refreshed. Select Use YubiKey again.");
+    await prepare(`Challenge refreshed. Select ${button.textContent} again.`);
     return;
   }
   prepared = undefined;
@@ -109,12 +129,20 @@ form.addEventListener("submit", async (event) => {
   try {
     const credential = await navigator.credentials.get({ publicKey });
     if (!credential) throw new Error("YubiKey sign-in canceled.");
-    await post("finish", { challenge_id, credential: assertion(credential) });
-    location.assign(destination());
+    const signed = { challenge_id, credential: assertion(credential) };
+    if (isAction) {
+      notice.textContent = "Verifying YubiKey approval…";
+      const result = await approve(signed);
+      account.disabled = false;
+      await prepare(result.message || "Request approved.");
+    } else {
+      await post("finish", signed);
+      location.assign(destination());
+    }
   } catch (error) {
     account.disabled = false;
     const message = error.name === "NotAllowedError"
-      ? "YubiKey prompt canceled or timed out. Select Use YubiKey to try again."
+      ? `YubiKey prompt canceled or timed out. Select ${button.textContent} to try again.`
       : error.message;
     await prepare(message);
   }

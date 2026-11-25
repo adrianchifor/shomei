@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[derive(Deserialize)]
@@ -19,11 +19,19 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub identities_file: PathBuf,
     pub http_upstream: Option<Url>,
+    pub browser_action: Option<BrowserAction>,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
     pub tcp: Option<TcpConfig>,
     #[serde(default)]
     pub limits: Limits,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserAction {
+    pub path: String,
+    pub label: String,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +111,27 @@ impl Config {
                     && upstream.query().is_none()
                     && upstream.fragment().is_none(),
                 "HTTP upstream must be an HTTP or HTTPS origin"
+            );
+        }
+        if let Some(action) = &config.browser_action {
+            ensure!(
+                config.http_upstream.is_some(),
+                "browser action requires an HTTP upstream"
+            );
+            ensure!(
+                action.path.starts_with('/')
+                    && !action.path.starts_with("/_shomei")
+                    && action.path.len() <= 1024
+                    && action.path.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                        || matches!(byte, b'/' | b'.' | b'-' | b'_'))
+                    && action.path[1..]
+                        .split('/')
+                        .all(|segment| !matches!(segment, "" | "." | "..")),
+                "browser action requires an unambiguous upstream path"
+            );
+            ensure!(
+                !action.label.trim().is_empty() && action.label.len() <= 120,
+                "invalid browser action label"
             );
         }
         if let Some(tcp) = &config.tcp {

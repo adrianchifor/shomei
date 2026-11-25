@@ -1,0 +1,33 @@
+name: shomei-deploy
+
+services:
+  shomei:
+    build: .
+    user: "${SHOMEI_UID:-10001}:${SHOMEI_GID:-10001}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./fixtures/deploy/shomei.toml:/etc/shomei/shomei.toml:ro
+      - ./local/config:/run/shomei:ro
+      - ./local/deploy-state:/var/lib/shomei
+
+  deploy-api:
+    image: python:3.14-slim-trixie@sha256:22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b
+    network_mode: "service:shomei"
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 32
+    command: ["python", "-Bu", "/app/deploy.py"]
+    volumes:
+      - ./fixtures/deploy/deploy.py:/app/deploy.py:ro
+    healthcheck:
+      test: [CMD, python, -B, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/status', timeout=2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 5

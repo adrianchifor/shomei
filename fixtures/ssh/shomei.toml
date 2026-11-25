@@ -1,0 +1,11 @@
+origin = "https://localhost:8443"
+tls_cert = "/run/shomei/tls.pem"
+tls_key = "/run/shomei/tls-key.pem"
+identities_file = "/run/shomei/identities.json"
+state_dir = "/var/lib/shomei"
+
+[tcp]
+upstream = "127.0.0.1:2222"
+ssh_host = "deploy"
+public_port = 9443
+cert_ttl_seconds = 300

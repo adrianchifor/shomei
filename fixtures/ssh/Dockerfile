@@ -1,7 +1,8 @@
-FROM debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0
+FROM ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-server \
     && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_* \
-    && useradd --create-home --shell /bin/sh --password '-' ubuntu
+    && (id ubuntu >/dev/null 2>&1 || useradd --create-home --shell /bin/sh ubuntu) \
+    && usermod --password '-' ubuntu
 COPY sshd_config /etc/ssh/sshd_config
 COPY entrypoint.sh /usr/local/bin/start-ssh-fixture
 EXPOSE 2222

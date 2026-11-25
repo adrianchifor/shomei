@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shomei approval</title>
+<link rel="stylesheet" href="/_shomei/auth.css">
+<script type="module" src="/_shomei/auth.js"></script>
+<main>
+  <h1>Approve with your YubiKey</h1>
+  <form data-action>
+    <label>Account <input id="account" type="text" autocomplete="username" autocapitalize="none" placeholder="operator" maxlength="64"></label>
+    <button type="submit" disabled aria-describedby="status">Approve request</button>
+  </form>
+  <p id="status" role="status">Preparing approval…</p>
+  <noscript>Enable JavaScript to approve the request with your YubiKey.</noscript>
+</main>
+</html>

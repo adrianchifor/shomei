@@ -1,4 +1,5 @@
 Port 2222
+ListenAddress 127.0.0.1
 HostKey /run/sshd/host_key
 PidFile /run/sshd/sshd.pid
 AuthorizedKeysFile /run/sshd/authorized_keys
