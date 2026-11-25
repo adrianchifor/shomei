@@ -1,0 +1,27 @@
+:root {
+  color-scheme: light dark;
+  font: 1rem/1.5 system-ui, sans-serif;
+}
+
+main {
+  max-width: 26rem;
+  margin: 15vh auto;
+  padding: 0 1rem;
+}
+
+h1 {
+  font-size: 1.75rem;
+  line-height: 1.2;
+}
+
+input, button {
+  font: inherit;
+  padding: .55rem .75rem;
+}
+
+input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: .35rem 0 1rem;
+}
