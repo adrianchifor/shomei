@@ -1,12 +1,16 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Request, State},
     http::{
-        HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version,
         header::{self, *},
     },
     middleware::{self, Next},
@@ -15,21 +19,29 @@ use axum::{
 };
 use http_body::Frame;
 use http_body_util::BodyExt;
-use hyper::server::conn::http1;
+use hyper::{
+    body::Incoming,
+    service::{Service, service_fn},
+};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto,
     service::TowerToHyperService,
 };
 use serde::Deserialize;
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    net::TcpStream,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::timeout,
+};
 use tokio_rustls::TlsAcceptor;
 use url::Position;
 use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 use crate::{
-    HANDSHAKE_TIMEOUT,
+    accept_tls,
     auth::{ApiError, Auth, Grant, SignedChallenge},
     config::Config,
     session::{Sessions, session_value},
@@ -46,7 +58,12 @@ pub struct App {
     sessions: Sessions,
     upstream: Option<HttpUpstream>,
     tcp: Option<(Issuer, u64)>,
+    auth_workers: Arc<Semaphore>,
+    http_requests: Arc<Semaphore>,
 }
+
+#[derive(Clone, Copy)]
+struct Peer(IpAddr);
 
 struct HttpUpstream {
     origin: Uri,
@@ -64,14 +81,19 @@ fn state(config: Config, issuer: Option<Issuer>) -> Result<Arc<App>> {
             let mut transport = HttpConnector::new();
             transport.enforce_http(false);
             transport.set_connect_timeout(Some(Duration::from_secs(5)));
+            transport.set_nodelay(true);
             let connector = HttpsConnectorBuilder::new()
                 .with_webpki_roots()
                 .https_or_http()
                 .enable_http1()
+                .enable_http2()
                 .wrap_connector(transport);
             let client = Client::builder(TokioExecutor::new())
                 .pool_timer(TokioTimer::new())
-                .pool_max_idle_per_host(16)
+                .pool_idle_timeout(Duration::from_secs(30))
+                .pool_max_idle_per_host(config.limits.http_requests.min(4096))
+                .http1_max_buf_size(32 * 1024)
+                .http2_max_header_list_size(32 * 1024)
                 .build(connector);
             Ok(HttpUpstream {
                 origin: origin.as_str().parse()?,
@@ -85,12 +107,16 @@ fn state(config: Config, issuer: Option<Issuer>) -> Result<Arc<App>> {
             &config.origin,
             &config.state_dir,
             config.enrollment_token_file.as_deref(),
+            config.enrollment_tokens_file.as_deref(),
+            &config.limits,
         )?,
         origin: config.origin.origin().ascii_serialization(),
         host,
         sessions: Sessions::new(config.session_ttl_seconds)?,
         upstream,
         tcp: issuer.zip(config.tcp.map(|tcp| tcp.cert_ttl_seconds)),
+        auth_workers: Arc::new(Semaphore::new(config.limits.auth_workers)),
+        http_requests: Arc::new(Semaphore::new(config.limits.http_requests)),
     }))
 }
 
@@ -114,32 +140,78 @@ fn routes(state: Arc<App>) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(socket: TcpStream, tls: TlsAcceptor, app: Router) {
-    let Ok(Ok(stream)) = timeout(HANDSHAKE_TIMEOUT, tls.accept(socket)).await else {
+pub async fn serve(
+    socket: TcpStream,
+    peer: SocketAddr,
+    tls: TlsAcceptor,
+    app: Router,
+    handshakes: Arc<Semaphore>,
+) {
+    let Some(stream) = accept_tls(socket, tls, &handshakes).await else {
         return;
     };
-    let _ = http1::Builder::new()
+    let app = TowerToHyperService::new(app);
+    let peer = match peer.ip().to_canonical() {
+        IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))),
+        ip => ip,
+    };
+    let service = service_fn(move |mut request: hyper::Request<Incoming>| {
+        request.extensions_mut().insert(Peer(peer));
+        app.call(request)
+    });
+    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = if stream.get_ref().1.alpn_protocol() == Some(b"h2") {
+        builder.http2_only()
+    } else {
+        builder.http1_only()
+    };
+    builder
+        .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(Duration::from_secs(10))
-        .max_buf_size(32 * 1024)
-        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(app))
+        .max_buf_size(32 * 1024);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(64)
+        .max_pending_accept_reset_streams(64)
+        .max_header_list_size(32 * 1024)
+        .max_send_buf_size(64 * 1024)
+        .keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10));
+    let _ = builder
+        .serve_connection(TokioIo::new(stream), service)
         .await;
 }
 
 async fn check_host(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
     let mut hosts = request.headers().get_all(HOST).iter();
-    let same_host = hosts.next().is_some_and(|host| {
-        host.as_bytes().eq_ignore_ascii_case(app.host.as_bytes())
-            || (!app.host.as_bytes().contains(&b':')
-                && host
-                    .as_bytes()
-                    .strip_suffix(b":443")
-                    .is_some_and(|host| host.eq_ignore_ascii_case(app.host.as_bytes())))
-    });
-    if !same_host || hosts.next().is_some() || request.uri().authority().is_some() {
+    let host = hosts.next();
+    let same_host = match request.version() {
+        Version::HTTP_2 => {
+            request.uri().scheme_str() == Some("https")
+                && request.uri().authority().is_some_and(|authority| {
+                    matches_host(authority.as_str().as_bytes(), app.host.as_bytes())
+                })
+                && host.is_none_or(|host| matches_host(host.as_bytes(), app.host.as_bytes()))
+        }
+        _ => {
+            request.uri().authority().is_none()
+                && host.is_some_and(|host| matches_host(host.as_bytes(), app.host.as_bytes()))
+        }
+    };
+    if !same_host || hosts.next().is_some() {
         return StatusCode::MISDIRECTED_REQUEST.into_response();
     }
     next.run(request).await
+}
+
+fn matches_host(host: &[u8], expected: &[u8]) -> bool {
+    host.eq_ignore_ascii_case(expected)
+        || (!expected.contains(&b':')
+            && host
+                .strip_suffix(b":443")
+                .is_some_and(|host| host.eq_ignore_ascii_case(expected)))
 }
 
 async fn protect_auth(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
@@ -198,14 +270,42 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Empty {}
+struct AccountRequest {
+    account: Option<String>,
+}
+
+async fn auth_work<T: Send + 'static>(
+    app: Arc<App>,
+    operation: impl FnOnce(&App) -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let permit = app.auth_workers.clone().try_acquire_owned().map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication service busy",
+        )
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(&app)
+    })
+    .await
+    .map_err(ApiError::internal)?
+}
 
 async fn enroll_start(
     State(app): State<Arc<App>>,
+    Extension(Peer(peer)): Extension<Peer>,
     headers: HeaderMap,
-    Json(_): Json<Empty>,
+    Json(body): Json<AccountRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    Ok(Json(app.auth.start_enroll(bearer(&headers))?))
+    auth_work(app, move |app| {
+        Ok(Json(app.auth.start_enroll(
+            body.account.as_deref(),
+            bearer(&headers),
+            peer,
+        )?))
+    })
+    .await
 }
 
 async fn enroll_finish(
@@ -213,41 +313,54 @@ async fn enroll_finish(
     headers: HeaderMap,
     Json(body): Json<SignedChallenge<RegisterPublicKeyCredential>>,
 ) -> Result<StatusCode, ApiError> {
-    app.auth.finish_enroll(bearer(&headers), body)?;
-    Ok(StatusCode::NO_CONTENT)
+    auth_work(app, move |app| {
+        app.auth.finish_enroll(bearer(&headers), body)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoginStart {
     client_csr_pem: Option<String>,
+    account: Option<String>,
 }
 
 async fn login_start(
     State(app): State<Arc<App>>,
+    Extension(Peer(peer)): Extension<Peer>,
     Json(body): Json<LoginStart>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let grant = match body.client_csr_pem {
-        Some(_csr) if app.tcp.is_none() => {
-            return Err(ApiError(StatusCode::BAD_REQUEST, "TCP relay is disabled"));
-        }
-        Some(csr) => Grant::Tcp(
-            csr_key(&csr)
-                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid P-256 client CSR"))?,
-        ),
-        None if app.upstream.is_none() => {
-            return Err(ApiError(StatusCode::BAD_REQUEST, "HTTP relay is disabled"));
-        }
-        None => Grant::Http,
-    };
-    Ok(Json(app.auth.start_login(grant)?))
+    auth_work(app, move |app| {
+        app.auth.check_challenge_capacity(peer)?;
+        let grant = match body.client_csr_pem {
+            Some(_csr) if app.tcp.is_none() => {
+                return Err(ApiError(StatusCode::BAD_REQUEST, "TCP relay is disabled"));
+            }
+            Some(csr) => Grant::Tcp(
+                csr_key(&csr)
+                    .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid P-256 client CSR"))?,
+            ),
+            None if app.upstream.is_none() => {
+                return Err(ApiError(StatusCode::BAD_REQUEST, "HTTP relay is disabled"));
+            }
+            None => Grant::Http,
+        };
+        Ok(Json(app.auth.start_login(
+            body.account.as_deref(),
+            grant,
+            peer,
+        )?))
+    })
+    .await
 }
 
 async fn login_finish(
     State(app): State<Arc<App>>,
     Json(body): Json<SignedChallenge<PublicKeyCredential>>,
 ) -> Result<Response, ApiError> {
-    match app.auth.finish_login(body)? {
+    auth_work(app, move |app| match app.auth.finish_login(body)? {
         Grant::Http => {
             let (cookie, expires_at) = app.sessions.issue().map_err(ApiError::internal)?;
             Ok((
@@ -263,7 +376,8 @@ async fn login_finish(
                 .ok_or_else(|| ApiError::internal("missing TCP issuer"))?;
             Ok(Json(issuer.issue(&key, *ttl).map_err(ApiError::internal)?).into_response())
         }
-    }
+    })
+    .await
 }
 
 async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response {
@@ -289,6 +403,12 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
         response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
         return response;
     }
+    if strip_hop_headers(request.headers_mut()).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Ok(permit) = app.http_requests.clone().try_acquire_owned() else {
+        return ApiError(StatusCode::SERVICE_UNAVAILABLE, "HTTP relay busy").into_response();
+    };
     let mut parts = upstream.origin.clone().into_parts();
     parts.path_and_query = request.uri().path_and_query().cloned();
     let Ok(uri) = Uri::from_parts(parts) else {
@@ -297,7 +417,6 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
     *request.uri_mut() = uri;
     *request.version_mut() = axum::http::Version::HTTP_11;
     let headers = request.headers_mut();
-    strip_hop_headers(headers);
     headers.remove(HOST);
     headers.remove("forwarded");
     headers.remove("x-real-ip");
@@ -313,20 +432,22 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
     headers.insert("x-forwarded-host", app.host.clone());
     filter_cookies(headers, COOKIE);
 
-    let request = request.map(without_trailers);
+    let request = request.map(|body| relay_body(body, None));
     let mut response =
         match timeout(Duration::from_secs(30), upstream.client.request(request)).await {
             Ok(Ok(response)) if response.status() == StatusCode::SWITCHING_PROTOCOLS => {
                 StatusCode::BAD_GATEWAY.into_response()
             }
-            Ok(Ok(response)) => response.map(|body| without_trailers(Body::new(body))),
+            Ok(Ok(response)) => response.map(|body| relay_body(Body::new(body), Some(permit))),
             Ok(Err(error)) => {
                 eprintln!("HTTP upstream request failed: {error}");
                 StatusCode::BAD_GATEWAY.into_response()
             }
             Err(_) => StatusCode::GATEWAY_TIMEOUT.into_response(),
         };
-    strip_hop_headers(response.headers_mut());
+    if strip_hop_headers(response.headers_mut()).is_err() {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
     filter_cookies(response.headers_mut(), SET_COOKIE);
     response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
     response
@@ -349,14 +470,23 @@ fn wants_login(request: &Request) -> bool {
             })
 }
 
-fn strip_hop_headers(headers: &mut HeaderMap) {
-    let nominated: Vec<_> = headers
-        .get_all(CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|value| HeaderName::from_bytes(value.trim().as_bytes()).ok())
-        .collect();
+fn strip_hop_headers(headers: &mut HeaderMap) -> Result<(), ()> {
+    let mut nominated = Vec::new();
+    for value in headers.get_all(CONNECTION) {
+        for token in value
+            .to_str()
+            .map_err(|_| ())?
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let name = HeaderName::from_bytes(token.as_bytes()).map_err(|_| ())?;
+            if [HOST, CONTENT_LENGTH, TRANSFER_ENCODING].contains(&name) {
+                return Err(());
+            }
+            nominated.push(name);
+        }
+    }
     for name in nominated {
         headers.remove(name);
     }
@@ -373,6 +503,7 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
     ] {
         headers.remove(name);
     }
+    Ok(())
 }
 
 fn filter_cookies(headers: &mut HeaderMap, name: HeaderName) {
@@ -402,8 +533,9 @@ fn filter_cookies(headers: &mut HeaderMap, name: HeaderName) {
     }
 }
 
-fn without_trailers(body: Body) -> Body {
-    Body::new(body.map_frame(|frame| {
+fn relay_body(body: Body, permit: Option<OwnedSemaphorePermit>) -> Body {
+    Body::new(body.map_frame(move |frame| {
+        let _permit = &permit;
         if frame.is_trailers() {
             Frame::data(Bytes::new())
         } else {
@@ -414,3 +546,6 @@ fn without_trailers(body: Body) -> Body {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod load;

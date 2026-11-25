@@ -1,4 +1,4 @@
-use openssl::x509::extension::SubjectAlternativeName;
+use rcgen::{PKCS_ECDSA_P384_SHA384, generate_simple_self_signed};
 use rustls::{
     ClientConfig,
     pki_types::{PrivatePkcs8KeyDer, ServerName},
@@ -14,7 +14,7 @@ use super::*;
 #[tokio::test]
 async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = upstream.local_addr().unwrap().to_string();
+    let upstream_addr: Arc<str> = upstream.local_addr().unwrap().to_string().into();
     let echo = tokio::spawn(async move {
         let (mut socket, _) = upstream.accept().await.unwrap();
         let mut message = [0; 4];
@@ -29,9 +29,15 @@ async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
     let mut roots = RootCertStore::empty();
     roots.add(identity.certs[0].clone()).unwrap();
     let tls = identity.server(Some(&issuer)).unwrap();
+    let handshakes = Arc::new(Semaphore::new(32));
     let gateway = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
-            tokio::spawn(relay(socket, tls.clone(), upstream_addr.clone()));
+            tokio::spawn(relay(
+                socket,
+                tls.clone(),
+                upstream_addr.clone(),
+                handshakes.clone(),
+            ));
         }
     });
     let builder = || ClientConfig::builder().with_root_certificates(roots.clone());
@@ -50,19 +56,27 @@ async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
         );
     }
 
-    let client_key = p256();
-    let mut req = X509Req::builder().unwrap();
-    req.set_pubkey(&client_key).unwrap();
-    req.sign(&client_key, MessageDigest::sha256()).unwrap();
-    let csr = String::from_utf8(req.build().to_pem().unwrap()).unwrap();
-    let key = csr_key(&csr).unwrap();
+    let client_key = KeyPair::generate().unwrap();
+    let req = named_certificate("Fixture Client")
+        .serialize_request(&client_key)
+        .unwrap();
+    let key = csr_key(&req.pem().unwrap()).unwrap();
+    let wrong_curve = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap();
+    let wrong_csr = named_certificate("Fixture Client")
+        .serialize_request(&wrong_curve)
+        .unwrap();
+    assert!(csr_key(&wrong_csr.pem().unwrap()).is_err());
     let granted = issuer.issue(&key, 3).unwrap();
-    let cert = X509::from_pem(granted.certificate_pem.as_bytes()).unwrap();
-    assert!(cert.public_key().unwrap().public_eq(&client_key));
-    let chain = vec![CertificateDer::from(cert.to_der().unwrap())];
+    let cert = CertificateDer::from_pem_slice(granted.certificate_pem.as_bytes()).unwrap();
+    let (_, parsed) = parse_x509_certificate(cert.as_ref()).unwrap();
+    assert_eq!(
+        parsed.public_key().raw,
+        client_key.subject_public_key_info()
+    );
+    let chain = vec![cert];
     assert!(
         builder()
-            .with_client_auth_cert(chain.clone(), private_key(&p256()))
+            .with_client_auth_cert(chain.clone(), private_key(&KeyPair::generate().unwrap()))
             .is_err()
     );
     let mut verified = connect(
@@ -88,38 +102,14 @@ async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
     gateway.abort();
 }
 
-fn server_identity() -> Identity {
-    let key = p256();
-    let mut name = X509Name::builder().unwrap();
-    name.append_entry_by_text("CN", "localhost").unwrap();
-    let name = name.build();
-    let mut cert = X509::builder().unwrap();
-    cert.set_version(2).unwrap();
-    cert.set_serial_number(&serial_number().unwrap()).unwrap();
-    cert.set_subject_name(&name).unwrap();
-    cert.set_issuer_name(&name).unwrap();
-    cert.set_pubkey(&key).unwrap();
-    cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
-        .unwrap();
-    cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
-        .unwrap();
-    let name = SubjectAlternativeName::new()
-        .dns("localhost")
-        .build(&cert.x509v3_context(None, None))
-        .unwrap();
-    cert.append_extension(name).unwrap();
-    cert.sign(&key, MessageDigest::sha256()).unwrap();
+pub(crate) fn server_identity() -> Identity {
+    let signed = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     Identity {
-        certs: vec![CertificateDer::from(cert.build().to_der().unwrap())],
-        key: private_key(&key),
+        certs: vec![signed.cert.der().clone()],
+        key: private_key(&signed.signing_key),
     }
 }
 
-fn private_key(key: &PKey<Private>) -> PrivateKeyDer<'static> {
-    PrivatePkcs8KeyDer::from(key.private_key_to_pkcs8().unwrap()).into()
-}
-
-fn p256() -> PKey<Private> {
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-    PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap()
+fn private_key(key: &KeyPair) -> PrivateKeyDer<'static> {
+    PrivatePkcs8KeyDer::from(key.serialize_der()).into()
 }

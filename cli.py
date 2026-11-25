@@ -79,6 +79,7 @@ def write_output(path, write):
 def main():
     parser = argparse.ArgumentParser(description="Sign in to Shomei with a USB YubiKey.")
     parser.add_argument("--ca-file", help="PEM CA for the proxy server")
+    parser.add_argument("--account", help="enrolled account name (default: operator)")
     parser.add_argument("origin", type=https_origin)
     modes = parser.add_subparsers(dest="mode", required=True)
     modes.add_parser("http").add_argument("cookie_jar", type=Path)
@@ -88,9 +89,12 @@ def main():
     args = parser.parse_args()
 
     context = ssl.create_default_context(cafile=args.ca_file)
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
     cookies = MozillaCookieJar()
     opener = build_opener(HTTPSHandler(context=context), HTTPCookieProcessor(cookies), NoRedirect())
     body = {} if args.mode == "http" else {"client_csr_pem": args.csr.read_text()}
+    if args.account:
+        body["account"] = args.account
     start = post(opener, args.origin, "start", body)
     credential = sign(args.origin, start["publicKey"])
     grant = post(opener, args.origin, "finish", {"challenge_id": start["challenge_id"], "credential": credential})

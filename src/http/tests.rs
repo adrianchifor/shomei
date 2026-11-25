@@ -18,6 +18,7 @@ async fn gates_http_and_preserves_upstream_requests() {
             tls_key: "unused".into(),
             state_dir: dir.path().into(),
             enrollment_token_file: Some(token),
+            enrollment_tokens_file: None,
             http_upstream: Some(
                 format!("http://{}", upstream.local_addr().unwrap())
                     .parse()
@@ -25,6 +26,7 @@ async fn gates_http_and_preserves_upstream_requests() {
             ),
             session_ttl_seconds: 60,
             tcp: None,
+            limits: Default::default(),
         },
         None,
     )
@@ -108,6 +110,18 @@ async fn gates_http_and_preserves_upstream_requests() {
         .await
         .unwrap();
     assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+    let bad_framing = router
+        .clone()
+        .oneshot(
+            request("/resource")
+                .header(COOKIE, cookie)
+                .header(CONNECTION, "content-length")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_framing.status(), StatusCode::BAD_REQUEST);
     let allowed = router
         .oneshot(
             request("/resource?q=1")

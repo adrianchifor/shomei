@@ -18,10 +18,39 @@ pub struct Config {
     pub tls_key: PathBuf,
     pub state_dir: PathBuf,
     pub enrollment_token_file: Option<PathBuf>,
+    pub enrollment_tokens_file: Option<PathBuf>,
     pub http_upstream: Option<Url>,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
     pub tcp: Option<TcpConfig>,
+    #[serde(default)]
+    pub limits: Limits,
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Limits {
+    pub https_connections: usize,
+    pub tcp_connections: usize,
+    pub tls_handshakes: usize,
+    pub http_requests: usize,
+    pub auth_workers: usize,
+    pub pending_challenges: usize,
+    pub pending_per_ip: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            https_connections: 4096,
+            tcp_connections: 4096,
+            tls_handshakes: 512,
+            http_requests: 8192,
+            auth_workers: 32,
+            pending_challenges: 8192,
+            pending_per_ip: 128,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -55,6 +84,22 @@ impl Config {
         ensure!(
             (1..=3600).contains(&config.session_ttl_seconds),
             "session TTL must be 1 to 3600 seconds"
+        );
+        let limits = &config.limits;
+        ensure!(
+            [
+                limits.https_connections,
+                limits.tcp_connections,
+                limits.tls_handshakes,
+                limits.http_requests,
+                limits.pending_challenges,
+                limits.pending_per_ip
+            ]
+            .into_iter()
+            .all(|limit| (1..=65_536).contains(&limit))
+                && (1..=128).contains(&limits.auth_workers)
+                && limits.pending_per_ip <= limits.pending_challenges,
+            "invalid capacity limits"
         );
         if let Some(upstream) = &config.http_upstream {
             ensure!(

@@ -1,13 +1,7 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
-use openssl::{
-    asn1::Asn1Time,
-    bn::{BigNum, BigNumContext},
-    ec::{EcGroup, EcKey},
-    hash::MessageDigest,
-    nid::Nid,
-    pkey::Private,
-    sign::Signer,
-    x509::{X509Name, extension::BasicConstraints},
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, DnType, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, PublicKeyData, SigningKey, SubjectPublicKeyInfo,
 };
 use serde_cbor_2::Value::{self, Array, Bytes, Integer, Map, Text};
 use serde_json::json;
@@ -17,7 +11,7 @@ use super::*;
 const ORIGIN: &str = "https://shomei.example:8443";
 const RP: &str = "shomei.example";
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
-const ID: [u8; 32] = [42; 32];
+const SECOND_TOKEN: &str = "fedcba9876543210fedcba9876543210";
 
 #[test]
 fn verifies_attestation_and_consumes_challenges() {
@@ -25,19 +19,38 @@ fn verifies_attestation_and_consumes_challenges() {
     let token = dir.path().join("token");
     fs::write(&token, TOKEN).unwrap();
     let origin = Url::parse(ORIGIN).unwrap();
-    let mut auth = Auth::new(&origin, dir.path(), Some(&token)).unwrap();
+    let peers = Limits {
+        pending_per_ip: 8,
+        ..Limits::default()
+    };
+    let peer = "127.0.0.1".parse().unwrap();
+    let tokens = dir.path().join("tokens.toml");
+    fs::write(&tokens, format!("alice = {SECOND_TOKEN:?}")).unwrap();
+    let mut auth = Auth::new(&origin, dir.path(), Some(&token), Some(&tokens), &peers).unwrap();
     let root_key = p256();
-    let root = certificate(&root_key, None);
+    let mut params = certificate("Fixture CA");
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let root = params.self_signed(&root_key).unwrap();
+    let root_issuer = Issuer::new(params, root_key);
+    let issuer_key = p256();
+    let mut params = certificate("Fixture FIDO CA");
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let intermediate = params.signed_by(&issuer_key, &root_issuer).unwrap();
+    let issuer = Issuer::new(params, issuer_key);
     let attestation_key = p256();
-    let leaf = certificate(&attestation_key, Some((&root, &root_key)));
+    let leaf = certificate("Fixture")
+        .signed_by(&attestation_key, &issuer)
+        .unwrap();
     let signing_key = p256();
     let model = Uuid::parse_str(YUBIKEY_5_MODELS[0]).unwrap();
 
-    assert!(auth.start_enroll(Some("wrong-token")).is_err());
-    let challenge = auth.start_enroll(Some(TOKEN)).unwrap();
+    assert!(auth.start_enroll(None, Some("wrong-token"), peer).is_err());
+    let challenge = auth.start_enroll(None, Some(TOKEN), peer).unwrap();
     let unsigned = registration(&challenge, &signing_key, model, None);
     assert!(auth.finish_enroll(Some(TOKEN), unsigned).is_err());
-    let challenge = auth.start_enroll(Some(TOKEN)).unwrap();
+    let challenge = auth.start_enroll(None, Some(TOKEN), peer).unwrap();
     let untrusted = registration(
         &challenge,
         &signing_key,
@@ -48,13 +61,16 @@ fn verifies_attestation_and_consumes_challenges() {
 
     let mut roots = AttestationCaListBuilder::new();
     roots
-        .insert_device_x509(root.clone(), model, "Test key".into(), Default::default())
+        .insert_device_der(root.der(), model, "Test key".into(), Default::default())
         .unwrap();
     auth.yubikeys = YubikeyPolicy {
         roots: roots.build(),
-        leaf_issuers: vec![root],
+        paths: vec![AttestationPath {
+            issuer: intermediate.der().clone(),
+            intermediates: vec![intermediate.der().clone()],
+        }],
     };
-    let challenge = auth.start_enroll(Some(TOKEN)).unwrap();
+    let challenge = auth.start_enroll(None, Some(TOKEN), peer).unwrap();
     let wrong_model = registration(
         &challenge,
         &signing_key,
@@ -62,7 +78,7 @@ fn verifies_attestation_and_consumes_challenges() {
         Some((&leaf, &attestation_key)),
     );
     assert!(auth.finish_enroll(Some(TOKEN), wrong_model).is_err());
-    let challenge = auth.start_enroll(Some(TOKEN)).unwrap();
+    let challenge = auth.start_enroll(None, Some(TOKEN), peer).unwrap();
     let approved = registration(
         &challenge,
         &signing_key,
@@ -70,9 +86,9 @@ fn verifies_attestation_and_consumes_challenges() {
         Some((&leaf, &attestation_key)),
     );
     auth.finish_enroll(Some(TOKEN), approved).unwrap();
-    assert!(auth.start_enroll(Some(TOKEN)).is_err());
+    assert!(auth.start_enroll(None, Some(TOKEN), peer).is_err());
 
-    let challenge = auth.start_login(Grant::Http).unwrap();
+    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
     assert!(
         auth.finish_login(assertion(&challenge, &signing_key, 0x01, 1))
             .is_err()
@@ -82,16 +98,18 @@ fn verifies_attestation_and_consumes_challenges() {
             .is_err()
     );
     let tcp_key = p256();
-    let public_key = PKey::public_key_from_der(&tcp_key.public_key_to_der().unwrap()).unwrap();
-    let older = auth.start_login(Grant::Http).unwrap();
-    let challenge = auth.start_login(Grant::Tcp(public_key)).unwrap();
+    let public_key = SubjectPublicKeyInfo::from_der(&tcp_key.subject_public_key_info()).unwrap();
+    let older = auth.start_login(None, Grant::Http, peer).unwrap();
+    let challenge = auth
+        .start_login(None, Grant::Tcp(public_key), peer)
+        .unwrap();
     let Grant::Tcp(granted_key) = auth
         .finish_login(assertion(&challenge, &signing_key, 0x05, 2))
         .unwrap()
     else {
         panic!("expected TCP grant");
     };
-    assert!(granted_key.public_eq(&tcp_key));
+    assert_eq!(granted_key.der_bytes(), tcp_key.der_bytes());
     assert!(
         auth.finish_login(assertion(&challenge, &signing_key, 0x05, 3))
             .is_err()
@@ -100,45 +118,81 @@ fn verifies_attestation_and_consumes_challenges() {
         auth.finish_login(assertion(&older, &signing_key, 0x05, 1))
             .is_err()
     );
-    let challenge = auth.start_login(Grant::Http).unwrap();
+    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
     assert!(matches!(
         auth.finish_login(assertion(&challenge, &signing_key, 0x05, 3)),
         Ok(Grant::Http)
     ));
     let saved: AttestedPasskey =
-        serde_json::from_reader(File::open(auth.credential_file).unwrap()).unwrap();
+        serde_json::from_reader(File::open(&auth.accounts[DEFAULT_ACCOUNT].file).unwrap()).unwrap();
     assert_eq!(Credential::from(saved).counter, 3);
+
+    let alice_key = p256();
+    assert!(auth.start_enroll(Some("alice"), Some(TOKEN), peer).is_err());
+    let challenge = auth
+        .start_enroll(Some("alice"), Some(SECOND_TOKEN), peer)
+        .unwrap();
+    let approved = registration(
+        &challenge,
+        &alice_key,
+        model,
+        Some((&leaf, &attestation_key)),
+    );
+    auth.finish_enroll(Some(SECOND_TOKEN), approved).unwrap();
+    let challenge = auth.start_login(Some("alice"), Grant::Http, peer).unwrap();
+    assert!(matches!(
+        auth.finish_login(assertion(&challenge, &alice_key, 0x05, 1)),
+        Ok(Grant::Http)
+    ));
+    assert!(auth.accounts["alice"].file.is_file());
+
+    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    let mut response = assertion(&challenge, &signing_key, 0x05, 4);
+    let client = json!({"type": "webauthn.get", "origin": ORIGIN, "crossOrigin": true,
+        "challenge": B64.encode(&challenge.options.public_key.challenge)});
+    let client = serde_json::to_vec(&client).unwrap();
+    response.credential.response.signature = sign(&signing_key, &auth_data(0x05, 4), &client);
+    response.credential.response.client_data_json = client;
+    assert!(auth.finish_login(response).is_err());
+
+    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    assert!(
+        auth.finish_login(assertion(&challenge, &signing_key, 0x15, 4))
+            .is_err()
+    );
+
+    for _ in 0..peers.pending_per_ip {
+        auth.start_login(None, Grant::Http, peer).unwrap();
+    }
+    assert_eq!(
+        auth.check_challenge_capacity(peer).unwrap_err().0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    auth.check_challenge_capacity("127.0.0.2".parse().unwrap())
+        .unwrap();
 }
 
 fn registration(
     challenge: &Challenge<CreationChallengeResponse>,
-    key: &PKey<Private>,
+    key: &KeyPair,
     model: Uuid,
-    attestation: Option<(&X509, &PKey<Private>)>,
+    attestation: Option<(&Certificate, &KeyPair)>,
 ) -> SignedChallenge<RegisterPublicKeyCredential> {
     let client = client_data(&challenge.options.public_key.challenge, "webauthn.create");
-    let key = key.ec_key().unwrap();
-    let (mut x, mut y) = (BigNum::new().unwrap(), BigNum::new().unwrap());
-    key.public_key()
-        .affine_coordinates(
-            key.group(),
-            &mut x,
-            &mut y,
-            &mut BigNumContext::new().unwrap(),
-        )
-        .unwrap();
+    let public_key = key.der_bytes();
+    let id = hash(public_key);
     let cose = Map([
         (Integer(1), Integer(2)),
-        (Integer(3), Integer(-7)),
+        (Integer(3), Integer(ES256.into())),
         (Integer(-1), Integer(1)),
-        (Integer(-2), Bytes(x.to_vec_padded(32).unwrap())),
-        (Integer(-3), Bytes(y.to_vec_padded(32).unwrap())),
+        (Integer(-2), Bytes(public_key[1..33].to_vec())),
+        (Integer(-3), Bytes(public_key[33..].to_vec())),
     ]
     .into());
     let mut data = auth_data(0x45, 0);
     data.extend_from_slice(model.as_bytes());
-    data.extend_from_slice(&(ID.len() as u16).to_be_bytes());
-    data.extend_from_slice(&ID);
+    data.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    data.extend_from_slice(&id);
     data.extend(serde_cbor_2::to_vec(&cose).unwrap());
     let (format, statement) = if let Some((cert, attestation_key)) = attestation {
         (
@@ -146,7 +200,7 @@ fn registration(
             object([
                 ("alg", Integer(-7)),
                 ("sig", Bytes(sign(attestation_key, &data, &client))),
-                ("x5c", Array(vec![Bytes(cert.to_der().unwrap())])),
+                ("x5c", Array(vec![Bytes(cert.der().to_vec())])),
             ]),
         )
     } else {
@@ -160,7 +214,7 @@ fn registration(
     SignedChallenge {
         challenge_id: challenge.challenge_id,
         credential: serde_json::from_value(json!({
-            "id": B64.encode(ID), "rawId": B64.encode(ID), "type": "public-key",
+            "id": B64.encode(id), "rawId": B64.encode(id), "type": "public-key",
             "response": {
                 "clientDataJSON": B64.encode(client),
                 "attestationObject": B64.encode(serde_cbor_2::to_vec(&object).unwrap()),
@@ -172,16 +226,17 @@ fn registration(
 
 fn assertion(
     challenge: &Challenge<RequestChallengeResponse>,
-    key: &PKey<Private>,
+    key: &KeyPair,
     flags: u8,
     counter: u32,
 ) -> SignedChallenge<PublicKeyCredential> {
     let client = client_data(&challenge.options.public_key.challenge, "webauthn.get");
     let data = auth_data(flags, counter);
+    let id = hash(key.der_bytes());
     SignedChallenge {
         challenge_id: challenge.challenge_id,
         credential: serde_json::from_value(json!({
-            "id": B64.encode(ID), "rawId": B64.encode(ID), "type": "public-key",
+            "id": B64.encode(id), "rawId": B64.encode(id), "type": "public-key",
             "response": {
                 "clientDataJSON": B64.encode(&client),
                 "authenticatorData": B64.encode(&data),
@@ -206,63 +261,37 @@ fn client_data(challenge: &[u8], kind: &str) -> Vec<u8> {
 
 fn auth_data(flags: u8, counter: u32) -> Vec<u8> {
     [
-        sha256(RP.as_bytes()).as_slice(),
+        hash(RP.as_bytes()).as_slice(),
         &[flags],
         &counter.to_be_bytes(),
     ]
     .concat()
 }
 
-fn sign(key: &PKey<Private>, data: &[u8], client: &[u8]) -> Vec<u8> {
-    let mut signer = Signer::new(MessageDigest::sha256(), key).unwrap();
-    signer.update(data).unwrap();
-    signer.update(&sha256(client)).unwrap();
-    signer.sign_to_vec().unwrap()
+fn sign(key: &KeyPair, data: &[u8], client: &[u8]) -> Vec<u8> {
+    key.sign(&[data, &hash(client)].concat()).unwrap()
 }
 
-fn p256() -> PKey<Private> {
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-    PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap()
+fn hash(data: &[u8]) -> [u8; 32] {
+    digest(&SHA256, data).as_ref().try_into().unwrap()
 }
 
-fn certificate(key: &PKey<Private>, issuer: Option<(&X509, &PKey<Private>)>) -> X509 {
-    let mut name = X509Name::builder().unwrap();
-    name.append_entry_by_text("C", "SE").unwrap();
-    name.append_entry_by_text("O", "Test").unwrap();
-    name.append_entry_by_text("OU", "Authenticator Attestation")
-        .unwrap();
-    name.append_entry_by_text(
-        "CN",
-        if issuer.is_some() {
-            "Fixture"
-        } else {
-            "Fixture CA"
-        },
-    )
-    .unwrap();
-    let name = name.build();
-    let mut cert = X509::builder().unwrap();
-    let serial = BigNum::from_u32(if issuer.is_some() { 2 } else { 1 })
-        .unwrap()
-        .to_asn1_integer()
-        .unwrap();
-    cert.set_serial_number(&serial).unwrap();
-    cert.set_version(2).unwrap();
-    cert.set_subject_name(&name).unwrap();
-    cert.set_issuer_name(issuer.map_or(name.as_ref(), |(cert, _)| cert.subject_name()))
-        .unwrap();
-    cert.set_pubkey(key).unwrap();
-    cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
-        .unwrap();
-    cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
-        .unwrap();
-    let constraints = if issuer.is_some() {
-        BasicConstraints::new().build()
-    } else {
-        BasicConstraints::new().critical().ca().build()
-    };
-    cert.append_extension(constraints.unwrap()).unwrap();
-    cert.sign(issuer.map_or(key, |(_, key)| key), MessageDigest::sha256())
-        .unwrap();
-    cert.build()
+fn p256() -> KeyPair {
+    KeyPair::generate().unwrap()
+}
+
+fn certificate(common_name: &str) -> CertificateParams {
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CountryName, "SE");
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, "Test");
+    params
+        .distinguished_name
+        .push(DnType::OrganizationalUnitName, "Authenticator Attestation");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    params.is_ca = IsCa::ExplicitNoCa;
+    params
 }

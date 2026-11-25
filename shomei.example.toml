@@ -11,3 +11,12 @@ session_ttl_seconds = 600
 bind = "0.0.0.0:9443"
 upstream = "host.docker.internal:9000"
 cert_ttl_seconds = 300
+
+[limits]
+https_connections = 4096
+tcp_connections = 4096
+tls_handshakes = 512
+http_requests = 8192
+auth_workers = 32
+pending_challenges = 8192
+pending_per_ip = 128

@@ -6,28 +6,35 @@ rust-version = "1.95"
 publish = false
 
 [dependencies]
-anyhow = "1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-base64 = "0.22"
-http-body = "1"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "webpki-roots"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "service"] }
-openssl = "0.10"
-ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tempfile = "3"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-toml = "0.8"
-url = { version = "2", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-webauthn-rs = { version = "0.5.5", features = ["attestation", "danger-credential-internals"] }
+anyhow = "=1.0.105"
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "=0.23.1"
+crypto-glue = "=0.2.2"
+http-body = "=1.1.0"
+http-body-util = "=0.1.5"
+hyper = { version = "=1.13.0", features = ["client", "server", "http1", "http2"] }
+hyper-rustls = { version = "=0.27.10", default-features = false, features = ["http1", "http2", "ring", "webpki-roots"] }
+hyper-util = { version = "=0.1.21", features = ["client-legacy", "server-auto", "tokio", "service"] }
+rcgen = { version = "=0.14.10", features = ["x509-parser"] }
+ring = "=0.17.14"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_cbor_2 = "=0.13.0"
+serde_json = "=1.0.154"
+subtle = "=2.6.1"
+tempfile = "=3.27.0"
+time = "=0.3.55"
+tokio = { version = "=1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring"] }
+toml = "=1.2.3"
+url = { version = "=2.5.9", features = ["serde"] }
+uuid = { version = "=1.29.3", features = ["v4", "serde"] }
+webauthn-rs = { version = "=0.6.2", features = ["attestation", "danger-credential-internals"] }
+x509-parser = { version = "=0.18.1", features = ["verify"] }
+zeroize = "=1.9.2"
 
 [dev-dependencies]
-serde_cbor_2 = "0.13"
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "=0.5.3", features = ["util"] }
+
+[patch.crates-io]
+crypto-glue = { git = "https://github.com/kanidm/crypto-glue.git", rev = "a3c634ceca6bf338cc42d20d7c87d7bc771f8441" }

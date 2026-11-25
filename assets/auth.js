@@ -1,12 +1,13 @@
 const enroll = location.pathname === "/_shomei/enroll";
 const form = document.querySelector("form");
-const token = form.querySelector("input");
+const account = form.querySelector("#account");
+const token = form.querySelector("#enrollment-token");
 const button = form.querySelector("button");
 const status = document.querySelector("#status");
 
 if (enroll) {
   document.querySelector("h1").textContent = "Enroll your YubiKey";
-  form.querySelector("label").hidden = false;
+  token.closest("label").hidden = false;
   token.required = true;
 }
 
@@ -42,7 +43,8 @@ form.addEventListener("submit", async (event) => {
     }
     const flow = enroll ? "enroll" : "auth";
     const bearer = enroll ? token.value.trim() : undefined;
-    const { challenge_id, publicKey } = await post(`${flow}/start`, {}, bearer);
+    const name = account.value.trim();
+    const { challenge_id, publicKey } = await post(`${flow}/start`, name ? { account: name } : {}, bearer);
     publicKey.hints = ["security-key"];
     const credential = enroll
       ? await navigator.credentials.create({ publicKey: PublicKeyCredential.parseCreationOptionsFromJSON(publicKey) })

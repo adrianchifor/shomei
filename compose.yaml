@@ -5,9 +5,11 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    pids_limit: 64
-    environment:
-      TOKIO_WORKER_THREADS: "2"
+    pids_limit: 256
+    ulimits:
+      nofile:
+        soft: 32768
+        hard: 32768
     ports:
       - "127.0.0.1:8443:8443"
       - "127.0.0.1:9443:9443"

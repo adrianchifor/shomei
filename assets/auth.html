@@ -8,7 +8,8 @@
 <main>
   <h1>Sign in with your YubiKey</h1>
   <form>
-    <label hidden>Enrollment token <input type="password" autocomplete="off"></label>
+    <label>Account <input id="account" type="text" autocomplete="username" placeholder="operator" maxlength="64"></label>
+    <label hidden>Enrollment token <input id="enrollment-token" type="password" autocomplete="off"></label>
     <button type="submit">Use YubiKey</button>
   </form>
   <p id="status" role="status"></p>
