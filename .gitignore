@@ -1,4 +1,5 @@
 /target/
 /local/
+/.env
 /.venv/
 __pycache__/

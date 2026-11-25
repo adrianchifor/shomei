@@ -4,20 +4,28 @@ Rust authentication proxy and CLI for supported YubiKey 5 Series keys with firmw
 
 ## Local setup
 
-Build with Rust 1.95 or newer. Linux builds need `pkg-config`, `libudev-dev`, and `libclang-dev`. Linux release binaries need `libudev.so.1`. Create the local TLS files and identity array once for both examples. [mkcert](https://github.com/FiloSottile/mkcert)
+Set up localhost TLS and the identity file before starting either Compose example. [mkcert](https://github.com/FiloSottile/mkcert)
+
+```sh
+export SHOMEI_PROXY=https://localhost:8443
+export SHOMEI_UID="$(id -u)" SHOMEI_GID="$(id -g)"
+export CAROOT="$PWD/local/ca"
+export SHOMEI_CA_FILE="$CAROOT/rootCA.pem"
+umask 077
+mkdir -p local/config local/deploy-state local/ssh-state
+mkcert -install
+mkcert -ecdsa -cert-file local/config/tls.pem -key-file local/config/tls-key.pem localhost
+[ -e local/config/identities.json ] || printf '[]\n' > local/config/identities.json
+```
+
+An empty allowlist lets the stack start and denies every authentication request. To approve requests, build the CLI with Rust 1.95 or newer and register a YubiKey. Linux builds need `pkg-config`, `libudev-dev`, and `libclang-dev`. Linux release binaries need `libudev.so.1`.
 
 ```sh
 cargo build --locked --release
 export PATH="$PWD/target/release:$PATH"
-export SHOMEI_PROXY=https://localhost:8443
-export SHOMEI_UID="$(id -u)" SHOMEI_GID="$(id -g)"
-umask 077
-mkdir -p local/config local/deploy-state local/ssh-state
-mkcert -install
-mkcert -cert-file local/config/tls.pem -key-file local/config/tls-key.pem localhost
-export SHOMEI_CA_FILE="$(mkcert -CAROOT)/rootCA.pem"
 shomei init --account operator --identity-file local/operator.json
-shomei get-id --identity-file local/operator.json | jq -s . > local/config/identities.json
+shomei get-id --identity-file local/operator.json | jq -es 'select(length > 0)' > local/config/identities.next \
+  && mv local/config/identities.next local/config/identities.json
 ```
 
 Use `shomei init --set-pin` when the key has no FIDO2 PIN. Both examples use the same HTTPS origin and identity file. Run one stack at a time.
@@ -27,6 +35,8 @@ Use `shomei init --set-pin` when the key has no FIDO2 PIN. Both examples use the
 ```sh
 docker compose -f compose.deploy.yaml up --build --wait
 ```
+
+If the gateway exits during startup, run `docker compose -f compose.deploy.yaml logs shomei` for the cause.
 
 Open [the deploy page](https://localhost:8443/_shomei/action), click **Deploy service**, and complete the YubiKey prompt. The page sends a one-use assertion with `POST /api/deploy`. Shomei verifies the assertion before the private demo API increments its revision. Each deployment requires a fresh assertion. The session cookie can read `/status`.
 

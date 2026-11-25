@@ -15,10 +15,18 @@ services:
       - ./fixtures/ssh/shomei.toml:/etc/shomei/shomei.toml:ro
       - ./local/config:/run/shomei:ro
       - ./local/ssh-state:/var/lib/shomei
+    healthcheck:
+      test: [CMD, bash, -c, "true </dev/tcp/127.0.0.1/8443"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
 
   ssh-fixture:
     build: ./fixtures/ssh
     network_mode: "service:shomei"
+    depends_on:
+      shomei:
+        condition: service_healthy
     read_only: true
     security_opt: ["no-new-privileges:true"]
     tmpfs:

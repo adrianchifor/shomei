@@ -41,9 +41,11 @@ pub struct Identity {
 impl Identity {
     pub fn load(cert_path: &Path, key_path: &Path) -> Result<Self> {
         let certs = CertificateDer::pem_file_iter(cert_path)
-            .context("open TLS certificate")?
-            .collect::<Result<Vec<_>, _>>()?;
-        let key = PrivateKeyDer::from_pem_file(key_path).context("read TLS private key")?;
+            .with_context(|| format!("open TLS certificate {}", cert_path.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| format!("read TLS certificate {}", cert_path.display()))?;
+        let key = PrivateKeyDer::from_pem_file(key_path)
+            .with_context(|| format!("read TLS private key {}", key_path.display()))?;
         Ok(Self { certs, key })
     }
 

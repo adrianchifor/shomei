@@ -14,10 +14,18 @@ services:
       - ./fixtures/deploy/shomei.toml:/etc/shomei/shomei.toml:ro
       - ./local/config:/run/shomei:ro
       - ./local/deploy-state:/var/lib/shomei
+    healthcheck:
+      test: [CMD, bash, -c, "true </dev/tcp/127.0.0.1/8443"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
 
   deploy-api:
     image: python:3.14-slim-trixie@sha256:22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b
     network_mode: "service:shomei"
+    depends_on:
+      shomei:
+        condition: service_healthy
     user: "10001:10001"
     read_only: true
     cap_drop: [ALL]

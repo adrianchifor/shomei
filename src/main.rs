@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|_| tls::Issuer::new())
         .transpose()?;
-    let https = listen(config.https_bind).context("bind HTTPS listener")?;
+    let https_bind = config.https_bind;
     let https_tls = identity.server(None)?;
     let tcp = if let (Some(tcp), Some(issuer)) = (&config.tcp, &issuer) {
         let listener = listen(tcp.bind).context("bind TCP listener")?;
@@ -48,9 +48,10 @@ async fn main() -> Result<()> {
     let handshakes = config.limits.tls_handshakes;
     let https_handshakes = Arc::new(Semaphore::new(handshakes));
     let (app, auth) = http::app(config, issuer)?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let https = listen(https_bind).context("bind HTTPS listener")?;
     let generation = auth.subscribe_generation();
     let reloader = tokio::spawn(reload_identities(auth));
-    let mut terminate = signal(SignalKind::terminate())?;
     eprintln!("HTTPS listening on {}", https.local_addr()?);
     if let Some((listener, _, _)) = &tcp {
         eprintln!("mTLS listening on {}", listener.local_addr()?);

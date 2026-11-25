@@ -436,7 +436,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 fn read_identities(path: &Path) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     File::open(path)
-        .context("open identities file")?
+        .with_context(|| format!("open identities file {}", path.display()))?
         .take(MAX_IDENTITIES_BYTES + 1)
         .read_to_end(&mut data)
         .context("read identities file")?;
