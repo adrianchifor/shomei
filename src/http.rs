@@ -1,3 +1,5 @@
+pub(crate) mod approval;
+
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv6Addr, SocketAddr},
@@ -46,7 +48,7 @@ use webauthn_rs::prelude::PublicKeyCredential;
 use crate::{
     accept_tls,
     auth::{ApiError, Auth, Grant, SignedChallenge},
-    config::{Config, Endpoint, HttpUpstreamConfig, http_path_is_unambiguous, http_path_matches},
+    config::{Config, Endpoint, HttpUpstreamConfig, ProtectedPath},
     session::{Sessions, session_value},
     tailscale::TailscaleSsh,
     tls::{Issuer, csr_key},
@@ -66,6 +68,7 @@ pub struct App {
     upstreams: HashMap<Endpoint, HttpUpstream>,
     http_client: Client<HttpsConnector<HttpConnector>, Body>,
     tickets: Mutex<HashMap<Uuid, LoginTicket>>,
+    approvals: approval::Approvals,
     ticket_limit: usize,
     tcp: Option<TcpAccess>,
     forward: Option<ForwardAccess>,
@@ -113,7 +116,8 @@ impl Peer {
 
 struct HttpUpstream {
     origin: Uri,
-    protected_paths: Option<Vec<String>>,
+    protected_paths: Option<Vec<ProtectedPath>>,
+    browser_approval_ttl_seconds: u64,
     sessions: Sessions,
 }
 
@@ -175,11 +179,15 @@ fn state_with_auth(
             hostname: None,
             upstream: origin,
             protected_paths: config.protected_paths,
+            browser_approval_ttl_seconds: None,
         });
     }
     sites.sort_by_key(|site| site.hostname.is_some());
     for site in sites {
         let origin = site.upstream.as_str().parse::<Uri>()?;
+        let browser_approval_ttl_seconds = site
+            .browser_approval_ttl_seconds
+            .unwrap_or(config.browser_approval_ttl_seconds);
         if let Some(host) = site.hostname {
             let host = Endpoint::parse(&host, port)?;
             hosts.insert(host.clone());
@@ -190,6 +198,7 @@ fn state_with_auth(
                         HttpUpstream {
                             origin: origin.clone(),
                             protected_paths: site.protected_paths.clone(),
+                            browser_approval_ttl_seconds,
                             sessions: sessions(alias)?,
                         },
                     );
@@ -201,6 +210,7 @@ fn state_with_auth(
                 HttpUpstream {
                     origin,
                     protected_paths: site.protected_paths,
+                    browser_approval_ttl_seconds,
                     sessions,
                 },
             );
@@ -211,6 +221,7 @@ fn state_with_auth(
                     HttpUpstream {
                         origin: origin.clone(),
                         protected_paths: site.protected_paths.clone(),
+                        browser_approval_ttl_seconds,
                         sessions: sessions(host)?,
                     },
                 );
@@ -252,6 +263,7 @@ fn state_with_auth(
         upstreams,
         http_client,
         tickets: Mutex::new(HashMap::new()),
+        approvals: approval::Approvals::new(config.limits.pending_challenges),
         ticket_limit: config.limits.pending_challenges,
         tcp,
         forward: forward
@@ -295,10 +307,15 @@ fn routes(state: Arc<App>) -> Router {
         .route("/login", get(page))
         .route("/auth.js", get(script))
         .route("/webauthn.js", get(webauthn_script))
+        .route("/approval.js", get(approval::script))
+        .route("/approval.css", get(approval::stylesheet))
+        .route("/approval.html", get(approval::dialog))
+        .route("/approval-popup", get(approval::popup))
         .route("/auth.css", get(styles))
         .route("/seal.png", get(seal))
         .route("/geist.woff2", get(font))
         .route("/api/auth/start", post(login_start))
+        .route(approval::CHECK_PATH, post(approval::check))
         .route("/api/auth/finish", post(login_finish))
         .route("/api/auth/tailscale/start", post(tailscale_start))
         .route("/api/auth/tailscale/finish", post(tailscale_finish))
@@ -531,15 +548,29 @@ async fn check_host(State(app): State<Arc<App>>, mut request: Request, next: Nex
 }
 
 async fn protect_auth(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
-    let mut origins = request.headers().get_all(ORIGIN).iter();
-    let wrong_origin = origins
-        .next()
-        .is_some_and(|origin| origin.as_bytes() != app.origin.as_bytes())
-        || origins.next().is_some();
-    let alias_write = *request.method() != Method::GET
-        && *request.method() != Method::HEAD
-        && reverse_endpoint(&request).as_ref() != Some(&app.canonical);
-    let mut response = if wrong_origin || alias_write {
+    let authorized_origin = if request.uri().path() == approval::CHECK_PATH {
+        let host = request.extensions().get::<RequestHost>();
+        reverse_endpoint(&request).is_some_and(|wire| {
+            host.is_some_and(|host| {
+                host.0 == wire && approval::same_origin_browser(request.headers(), &wire, true)
+            })
+        })
+    } else {
+        let read = matches!(*request.method(), Method::GET | Method::HEAD);
+        let wire = reverse_endpoint(&request);
+        let read_origin = read
+            .then(|| wire.as_ref().map(approval::site_origin))
+            .flatten();
+        let expected_origin = read_origin.as_deref().unwrap_or(&app.origin);
+        let mut origins = request.headers().get_all(ORIGIN).iter();
+        let wrong_origin = origins
+            .next()
+            .is_some_and(|origin| origin.as_bytes() != expected_origin.as_bytes())
+            || origins.next().is_some();
+        let alias_write = !read && wire.as_ref() != Some(&app.canonical);
+        !wrong_origin && !alias_write
+    };
+    let mut response = if !authorized_origin {
         ApiError(StatusCode::FORBIDDEN, "origin mismatch").into_response()
     } else {
         timeout(Duration::from_secs(10), next.run(request))
@@ -707,11 +738,13 @@ struct LoginStart {
     http_destination: Option<url::Url>,
     tcp_destination: Option<String>,
     browser_login: Option<BrowserQuery>,
+    browser_approval: Option<approval::Start>,
 }
 
 async fn login_start(
     State(app): State<Arc<App>>,
     Extension(peer): Extension<Peer>,
+    headers: HeaderMap,
     Json(mut body): Json<LoginStart>,
 ) -> Result<impl IntoResponse, ApiError> {
     auth_work(app, move |app| {
@@ -719,6 +752,7 @@ async fn login_start(
         app.auth.check_challenge_capacity(peer)?;
         let destinations = [
             body.browser_login.is_some(),
+            body.browser_approval.is_some(),
             body.http_destination.is_some(),
             body.tcp_destination.is_some(),
             body.tcp_target.is_some(),
@@ -728,12 +762,26 @@ async fn login_start(
         .count();
         if destinations > 1
             || (body.client_csr_pem.is_some()
-                && (body.browser_login.is_some() || body.http_destination.is_some()))
+                && (body.browser_login.is_some()
+                    || body.browser_approval.is_some()
+                    || body.http_destination.is_some()))
             || (body.tcp_destination.is_some() && body.client_csr_pem.is_none())
         {
             return Err(ApiError(
                 StatusCode::BAD_REQUEST,
                 "invalid approval destination or client CSR",
+            ));
+        }
+        if let Some(browser) = body.browser_approval.take() {
+            if !approval::same_origin_browser(&headers, &app.canonical, true) {
+                return Err(ApiError(
+                    StatusCode::FORBIDDEN,
+                    "browser approval requires the gateway origin",
+                ));
+            }
+            let intent = approval::intent(app, browser)?;
+            return Ok(Json(
+                app.auth.start_login(Grant::BrowserApproval(intent), peer)?,
             ));
         }
         if let Some(browser) = body.browser_login.take() {
@@ -906,6 +954,7 @@ async fn login_start(
 
 async fn login_finish(
     State(app): State<Arc<App>>,
+    headers: HeaderMap,
     Json(body): Json<SignedChallenge<PublicKeyCredential>>,
 ) -> Result<Response, ApiError> {
     auth_work(app, move |app| {
@@ -929,6 +978,15 @@ async fn login_finish(
                 StatusCode::BAD_REQUEST,
                 "use the assertion on the selected reverse HTTP upstream",
             )),
+            Grant::BrowserApproval(intent) => {
+                if !approval::same_origin_browser(&headers, &app.canonical, true) {
+                    return Err(ApiError(
+                        StatusCode::FORBIDDEN,
+                        "browser approval requires the gateway origin",
+                    ));
+                }
+                app.approvals.issue(intent, generation)
+            }
             Grant::BrowserLogin { host, next } => {
                 let key = Uuid::new_v4();
                 let mut tickets = app.tickets.lock().map_err(ApiError::internal)?;
@@ -1216,18 +1274,22 @@ async fn reverse(
         Ok(signed) => signed,
         Err(error) => return error.into_response(),
     };
-    let fresh_approval = upstream
-        .protected_paths
-        .as_ref()
-        .is_some_and(|paths| path_needs_approval(request.uri().path(), paths));
-    if fresh_approval && signed.is_none() {
-        let mut response = ApiError(
-            StatusCode::UNAUTHORIZED,
-            "a fresh YubiKey approval is required",
-        )
-        .into_response();
-        response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
-        return response;
+    if signed.is_none()
+        && let Some(policy) = approval::policy(upstream, request.uri().path())
+    {
+        match approval::authorize(&app, &host, &request, policy) {
+            Ok(true) => {}
+            Err(error) => return error.into_response(),
+            Ok(false) => {
+                let mut response = ApiError(
+                    StatusCode::UNAUTHORIZED,
+                    "a fresh YubiKey approval is required",
+                )
+                .into_response();
+                response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
+                return response;
+            }
+        }
     }
     if upstream.protected_paths.is_none()
         && signed.is_none()
@@ -1357,19 +1419,6 @@ async fn reverse(
     response
 }
 
-fn path_needs_approval(path: &str, protected: &[String]) -> bool {
-    let Ok(decoded) = percent_encoding::percent_decode_str(path).decode_utf8() else {
-        return true;
-    };
-    !http_path_is_unambiguous(&decoded)
-        || (decoded.len() != path.len()
-            && decoded.matches('/').count() != path.matches('/').count())
-        || http_path_matches(&decoded, PREFIX)
-        || protected
-            .iter()
-            .any(|prefix| http_path_matches(&decoded, prefix))
-}
-
 fn wants_login(request: &Request) -> bool {
     let path = request.uri().path();
     request.method() == Method::GET
@@ -1413,6 +1462,7 @@ pub(crate) fn strip_hop_headers(headers: &mut HeaderMap) -> Result<(), ()> {
         HeaderName::from_static("proxy-connection"),
         PROXY_AUTHENTICATE,
         PROXY_AUTHORIZATION,
+        HeaderName::from_static(approval::HEADER),
         HeaderName::from_static("proxy-authentication-info"),
         TE,
         TRAILER,

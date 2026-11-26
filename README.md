@@ -64,7 +64,8 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 | `http_upstream` | HTTP or HTTPS origin to forward to. |
 | `hostnames` | Additional reverse hostnames or IPs for the default upstream. |
 | `[[http_upstreams]]` | Reverse sites with a public `hostname` and a private `upstream`. |
-| `protected_paths` | Require fresh approval for selected reverse-proxy paths and leave others public. |
+| `protected_paths` | Require approval for selected reverse-proxy paths and leave others public. |
+| `browser_approval_ttl_seconds` | Browser action approval lifetime. Defaults to `0` for a touch each time. |
 | `tcp.upstream` | Fixed TCP host and port. Set `tcp.ssh_host` to the alias used by `shomei ssh`. |
 | `[tcp_upstreams]` | Named reverse TCP targets keyed by client-facing host and port. |
 | `[forward]` | Forward listeners for signed HTTP traffic and mTLS TCP traffic, with named destination scopes. |
@@ -79,16 +80,42 @@ Replace the identity file atomically to reload the allowlist. Removing or replac
 
 ### Protect selected endpoints
 
-Set `protected_paths` alongside `http_upstream` to make the rest of the site public. Listed paths, descendants, and format suffixes such as `/api/deploy.json` require a fresh approval. Matching is case-insensitive. Ambiguous paths also require approval. Add any other paths that the application routes to the same handler.
+Set `protected_paths` alongside `http_upstream` to make the rest of the site public. Listed paths, descendants, and format suffixes such as `/api/deploy.json` require approval. Matching is case-insensitive. Ambiguous paths also require approval. Add any other paths that the application routes to the same handler.
 
 ```toml
 http_upstream = "http://app:8080"
 protected_paths = ["/api/deploy"]
 ```
 
-The app controls the action and its payload. A browser app can use the WebAuthn helper to attach an assertion to its request. CLI clients can run `shomei sign` and send the result in `Authorization: Shomei <assertion>`. [Deploy demo script](fixtures/deploy/deploy.js)
+CLI clients can run `shomei sign` and send the result in `Authorization: Shomei <assertion>`.
 
 Omit `protected_paths` to require authentication across the site. Unauthenticated HTML GETs open the login page, and unauthenticated API requests receive `401`. A valid session authorizes subsequent site requests.
+
+### Add a browser approval overlay
+
+Use `approvedFetch` in the app's Run or Deploy button handler. The app supplies the URL, method, headers, and payload.
+
+```js
+import { approvedFetch } from "/_shomei/approval.js";
+
+await approvedFetch("/api/jobs/example/run", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ environment: "staging" }),
+});
+```
+
+Serve the app through Shomei and protect the action path. On the WebAuthn origin, the overlay opens the key prompt directly. On another configured app host, it opens a small gateway window for the prompt. [Deploy demo script](fixtures/deploy/deploy.js)
+
+```toml
+browser_approval_ttl_seconds = 300
+protected_paths = [
+  "/api/jobs",
+  { path = "/api/jobs/production", browser_approval_ttl_seconds = 0 },
+]
+```
+
+Browser approvals can be reused in the tab for the configured TTL, up to 3600 seconds. The most specific path rule wins. Use `0` for a fresh touch on every request. A named upstream can set its own default TTL. API assertions from `shomei sign` remain single-use.
 
 ### Share a gateway across services
 

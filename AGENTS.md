@@ -74,13 +74,15 @@ Open the authentication page as a top-level navigation. Shomei sets `frame-ances
 
 ### Require approval for a website action
 
-Add `protected_paths` at the top level to leave the rest of the site public. Listed paths and descendants require a fresh assertion on every request. Matching is case-insensitive, and ambiguous paths also require approval. Include any application route aliases that reach the protected handler.
+Add `protected_paths` at the top level or in the named HTTP upstream to leave the rest of the site public. Listed paths and descendants require approval. Matching is case-insensitive, and ambiguous paths always require fresh approval. Include any application route aliases that reach the protected handler.
 
 ```toml
 protected_paths = ["/api/deploy"]
 ```
 
-The app owns the button, request method, and payload. On the gateway origin, import `prepareApproval`, `signApproval`, and `authorizationHeader` from `/_shomei/webauthn.js`. Prepare the challenge, prompt for the YubiKey, then use the returned authorization header on the app request. [Deploy demo script](fixtures/deploy/deploy.js)
+The app owns the button, request method, and payload. Import `approvedFetch` from `/_shomei/approval.js` and call it with the same URL and options you would give `fetch`. It loads the overlay HTML and CSS from the app origin and sends the request after approval. On an app hostname separate from `origin`, the overlay uses a gateway popup for WebAuthn. [Deploy demo script](fixtures/deploy/deploy.js)
+
+Set `browser_approval_ttl_seconds` on the gateway or HTTP upstream to reuse browser approvals. A specific rule can override it with `{ path = "/api/deploy", browser_approval_ttl_seconds = 0 }` in `protected_paths`. The default is `0`, which requires a fresh touch each time. Positive TTLs reuse approval for the method and protected rule. Browser approvals expire on allowlist revocation or gateway restart. [Overlay configuration](README.md#add-a-browser-approval-overlay)
 
 For a custom WebAuthn client, `POST {}` as JSON to `/_shomei/api/auth/start`. Pass the returned `publicKey` options to `navigator.credentials.get` after decoding the challenge and credential IDs. Serialize the result as WebAuthn JSON. Submit `{challenge_id, credential}` to `/_shomei/api/auth/finish` to create a session, or send that JSON as base64url without padding in `Authorization: Shomei <assertion>` on the intended upstream request. Each challenge can be used once. [WebAuthn helper](assets/webauthn.js)
 

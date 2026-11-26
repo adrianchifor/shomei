@@ -46,6 +46,7 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
+        browser_approval_ttl_seconds: 0,
         session_ttl_seconds: 60,
         tcp: None,
         forward: None,
@@ -308,7 +309,8 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
         hostnames: Default::default(),
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
-        protected_paths: Some(vec!["/api/deploy".into()]),
+        protected_paths: Some(vec![ProtectedPath::Path("/api/deploy".into())]),
+        browser_approval_ttl_seconds: 0,
         session_ttl_seconds: 60,
         tcp: None,
         forward: None,
@@ -408,6 +410,200 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
     );
     assert_eq!(
         send(&router, deploy()).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn browser_approvals_are_scoped_and_follow_per_path_ttls() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let identities = dir.path().join("identities");
+    let file = dir.path().join("shomei.toml");
+    let config = format!(
+        r#"
+        origin = "https://localhost:8443"
+        hostnames = ["jobs.example.test"]
+        tls_cert = "unused"
+        tls_key = "unused"
+        state_dir = {:?}
+        identities_file = {identities:?}
+        http_upstream = "http://{}"
+        browser_approval_ttl_seconds = 60
+        protected_paths = [
+          "/api/jobs",
+          {{ path = "/api/jobs/production", browser_approval_ttl_seconds = 0 }},
+        ]
+    "#,
+        dir.path(),
+        upstream.local_addr().unwrap()
+    );
+    std::fs::write(&file, config).unwrap();
+    let config = Config::load(&file).unwrap();
+    let (auth, signer) = test_auth(
+        &config.origin,
+        &config.state_dir,
+        &identities,
+        &config.limits,
+        false,
+    );
+    let state = state_with_auth(config, None, auth, None).unwrap();
+    let router = routes(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            upstream,
+            Router::new().fallback(|req: Request| async move {
+                assert!(!req.headers().contains_key(approval::HEADER));
+                axum::body::to_bytes(req.into_body(), 4096).await.unwrap()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+    let site = "jobs.example.test:8443";
+    let site_origin = "https://jobs.example.test:8443";
+    let gateway = "https://localhost:8443";
+    let context = |mut request: Request, origin: &str| {
+        request
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_str(origin).unwrap());
+        request
+            .headers_mut()
+            .insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        request
+    };
+    let browser_post = |path, value| context(post_json(path, value), gateway);
+    let approve = async |path, counter| {
+        let start = send(&router, browser_post("/_shomei/api/auth/start", json!({
+            "browser_approval": { "host": site, "request": { "method": "POST", "path": path } }
+        }))).await;
+        assert_eq!(start.status(), StatusCode::OK);
+        let signed = signed_answer(&signer, &json_body(start).await, counter);
+        let issued = send(&router, browser_post("/_shomei/api/auth/finish", signed)).await;
+        assert_eq!(issued.status(), StatusCode::OK);
+        assert!(!issued.headers().contains_key(SET_COOKIE));
+        json_body(issued).await
+    };
+    let deploy = |method: Method, host: &str, path: &str, token: &str| {
+        let req = request(path)
+            .method(method)
+            .header(approval::HEADER, token)
+            .body(Body::from("job payload"))
+            .unwrap();
+        let mut req = context(req, &format!("https://{host}"));
+        req.headers_mut()
+            .insert(HOST, HeaderValue::from_str(host).unwrap());
+        req
+    };
+
+    let path = "/api/jobs/example/run";
+    let mut probe = post_json(
+        "/_shomei/api/auth/browser/check",
+        json!({
+            "request": { "method": "POST", "path": path }
+        }),
+    );
+    probe
+        .headers_mut()
+        .insert(HOST, HeaderValue::from_static("jobs.example.test:8443"));
+    let denied = send(&router, context(probe, gateway)).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let reusable = approve(path, 1).await;
+    assert_eq!(reusable["reusable"], true);
+    assert_eq!(reusable["site_origin"], site_origin);
+    let token = reusable["approval"].as_str().unwrap();
+    let mut probe = post_json(
+        "/_shomei/api/auth/browser/check",
+        json!({
+            "request": { "method": "POST", "path": path }, "approval": token
+        }),
+    );
+    probe
+        .headers_mut()
+        .insert(HOST, HeaderValue::from_static("jobs.example.test:8443"));
+    let ready = send(&router, context(probe, site_origin)).await;
+    assert_eq!(ready.status(), StatusCode::OK);
+    assert_eq!(json_body(ready).await["ready"], true);
+
+    for path in [path, "/api/jobs/another/run"] {
+        let res = send(&router, deploy(Method::POST, site, path, token)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.into_body().collect().await.unwrap().to_bytes(),
+            "job payload"
+        );
+    }
+    for (method, host, path) in [
+        (Method::GET, site, path),
+        (Method::POST, "localhost:8443", path),
+        (Method::POST, site, "/api/jobs/production"),
+        (Method::POST, site, "/api/jobs/%2e/production"),
+    ] {
+        assert_eq!(
+            send(&router, deploy(method, host, path, token))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let mut raw = deploy(Method::POST, site, path, token);
+    raw.headers_mut().remove("sec-fetch-site");
+    assert_eq!(send(&router, raw).await.status(), StatusCode::UNAUTHORIZED);
+
+    let production = "/api/jobs/production?region=eu";
+    let one_use = approve(production, 2).await;
+    assert_eq!(one_use["reusable"], false);
+    let one_use = one_use["approval"].as_str().unwrap();
+    assert_eq!(
+        send(
+            &router,
+            deploy(
+                Method::POST,
+                site,
+                "/api/jobs/production?region=us",
+                one_use
+            )
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(&router, deploy(Method::POST, site, production, one_use))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&router, deploy(Method::POST, site, production, one_use))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let start = send(&router, post_json("/_shomei/api/auth/start", json!({}))).await;
+    let signed = signed_answer(&signer, &json_body(start).await, 3);
+    let assertion = format!("Shomei {}", URL_SAFE_NO_PAD.encode(signed.to_string()));
+    let cli = || {
+        request(production)
+            .method(Method::POST)
+            .header(AUTHORIZATION, &assertion)
+            .body(Body::from("job payload"))
+            .unwrap()
+    };
+    assert_eq!(send(&router, cli()).await.status(), StatusCode::OK);
+    assert_eq!(
+        send(&router, cli()).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    std::fs::write(identities, "[]").unwrap();
+    assert!(state.auth.reload().unwrap());
+    assert_eq!(
+        send(&router, deploy(Method::POST, site, path, token))
+            .await
+            .status(),
         StatusCode::UNAUTHORIZED
     );
     server.abort();
@@ -752,6 +948,7 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
+        browser_approval_ttl_seconds: 0,
         session_ttl_seconds: 60,
         tcp: None,
         forward: None,
@@ -901,6 +1098,7 @@ async fn approves_one_request(u2f: bool) {
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
+        browser_approval_ttl_seconds: 0,
         session_ttl_seconds: 60,
         tcp: Some(TcpConfig {
             bind: "127.0.0.1:9443".parse().unwrap(),

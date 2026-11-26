@@ -130,6 +130,7 @@ pub enum Grant {
         host: crate::config::Endpoint,
         next: String,
     },
+    BrowserApproval(crate::http::approval::Intent),
     Tcp(SubjectPublicKeyInfo),
     Forward {
         key: SubjectPublicKeyInfo,

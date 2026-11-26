@@ -10,12 +10,14 @@ export async function readJson(response) {
   return value;
 }
 
-export async function post(path, body) {
+export async function post(path, body, signal) {
   return readJson(await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
     redirect: "error",
+    referrerPolicy: "strict-origin",
+    signal,
   }));
 }
 
@@ -29,8 +31,8 @@ function encode(value) {
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-export async function prepareApproval(request = {}) {
-  const { challenge_id, publicKey } = await post("/_shomei/api/auth/start", request);
+export async function prepareApproval(request = {}, signal) {
+  const { challenge_id, publicKey } = await post("/_shomei/api/auth/start", request, signal);
   return {
     challenge_id,
     loadedAt: Date.now(),
@@ -47,13 +49,14 @@ export async function prepareApproval(request = {}) {
   };
 }
 
-export async function signApproval(approval) {
+export async function signApproval(approval, signal) {
   const credential = await navigator.credentials.get({
     publicKey: {
       ...approval.publicKey,
       timeout: Math.min(approval.publicKey.timeout ?? 90_000, 90_000, 115_000 - (Date.now() - approval.loadedAt)),
     },
     mediation: "required",
+    signal,
   });
   if (!credential) throw new DOMException("Approval canceled", "NotAllowedError");
 
