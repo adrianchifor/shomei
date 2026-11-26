@@ -116,6 +116,19 @@ impl DeviceKey {
             Self::U2f(key) => key.clone().into(),
         }
     }
+
+    /// Drops the attestation chain once the record is verified. Signing in
+    /// never reads it, and every pending challenge holds a copy of each key.
+    fn without_attestation(self) -> Self {
+        let strip = |mut credential: Credential| {
+            credential.attestation = ParsedAttestation::default();
+            credential
+        };
+        match self {
+            Self::Fido2(key) => Self::Fido2(strip(key.into()).into()),
+            Self::U2f(key) => Self::U2f(strip(key.into()).into()),
+        }
+    }
 }
 
 enum Login {
@@ -430,7 +443,7 @@ impl Device {
             Err(error) => return Err(error).context("read YubiKey counter"),
         };
         Ok(Self {
-            key,
+            key: key.without_attestation(),
             digest,
             counter_file,
             counter: Mutex::new(counter),
