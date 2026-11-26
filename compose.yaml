@@ -2,6 +2,7 @@ services:
   shomei:
     image: "${SHOMEI_IMAGE:-ghcr.io/adrianchifor/shomei:latest}"
     user: "${SHOMEI_UID:-10001}:${SHOMEI_GID:-10001}"
+    restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
