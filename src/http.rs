@@ -3,7 +3,10 @@ pub(crate) mod approval;
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -39,7 +42,7 @@ use serde::Deserialize;
 use tokio::{
     net::TcpStream,
     sync::{OwnedSemaphorePermit, Semaphore},
-    time::timeout,
+    time::{sleep, timeout},
 };
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
@@ -56,6 +59,7 @@ use crate::{
 
 const PREFIX: &str = "/_shomei";
 const NO_STORE: HeaderValue = HeaderValue::from_static("private, no-store");
+const HTTP2_IDLE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 60 });
 
 pub struct App {
     pub(crate) auth: Arc<Auth>,
@@ -312,12 +316,18 @@ pub async fn serve(
     state: Arc<App>,
     handshakes: Arc<Semaphore>,
 ) {
-    let Some(stream) = accept_tls(socket, tls.clone(), &handshakes).await else {
+    if socket.set_nodelay(true).is_err() {
+        return;
+    }
+    let Some(stream) = accept_tls(socket, &tls, &handshakes).await else {
         return;
     };
     let app = TowerToHyperService::new(app);
     let peer = peer.ip().to_canonical();
+    let requests = Arc::new(AtomicU64::new(0));
+    let started = requests.clone();
     let service = service_fn(move |mut request: hyper::Request<Incoming>| {
+        started.fetch_add(1, Ordering::Relaxed);
         request.extensions_mut().insert(Peer(peer));
         let state = state.clone();
         let app = app.clone();
@@ -398,15 +408,45 @@ pub async fn serve(
         }
     });
     if stream.get_ref().1.alpn_protocol() == Some(b"h2") {
-        let _ = http2()
-            .serve_connection(TokioIo::new(stream), service)
-            .await;
+        let builder = http2();
+        let connection = builder.serve_connection(TokioIo::new(stream), service);
+        until_idle(connection, &requests, |connection| {
+            connection.graceful_shutdown()
+        })
+        .await;
     } else {
         let _ = crate::forward::http1()
             .serve_connection(TokioIo::new(stream), service)
             .with_upgrades()
             .await;
     }
+}
+
+/// Drives an HTTP/2 connection and starts a graceful shutdown once no request
+/// has arrived for `HTTP2_IDLE`. HTTP/2 has no idle timeout of its own, so a
+/// silent connection would otherwise hold its slot for as long as the peer
+/// answers pings. Requests already in flight finish first.
+async fn until_idle<C: Future>(
+    connection: C,
+    requests: &AtomicU64,
+    shutdown: impl Fn(std::pin::Pin<&mut C>),
+) {
+    let mut connection = std::pin::pin!(connection);
+    let mut seen = 0;
+    loop {
+        tokio::select! {
+            _ = connection.as_mut() => return,
+            () = sleep(HTTP2_IDLE) => {
+                let started = requests.load(Ordering::Relaxed);
+                if started == seen {
+                    break;
+                }
+                seen = started;
+            }
+        }
+    }
+    shutdown(connection.as_mut());
+    connection.await;
 }
 
 fn http2() -> auto::Builder<TokioExecutor> {
@@ -431,16 +471,16 @@ async fn serve_reverse_tunnel(
     peer: IpAddr,
     handshakes: Arc<Semaphore>,
 ) {
-    let Ok(Some(stream)) = timeout(Duration::from_secs(10), async {
-        let socket = upgrade.await.ok()?;
-        let _permit = handshakes.acquire().await.ok()?;
-        tls.accept(TokioIo::new(socket)).await.ok()
-    })
-    .await
-    else {
+    let Ok(Ok(socket)) = timeout(crate::HANDSHAKE_TIMEOUT, upgrade).await else {
         return;
     };
+    let Some(stream) = accept_tls(TokioIo::new(socket), &tls, &handshakes).await else {
+        return;
+    };
+    let requests = Arc::new(AtomicU64::new(0));
+    let started = requests.clone();
     let service = service_fn(move |mut request: hyper::Request<Incoming>| {
+        started.fetch_add(1, Ordering::Relaxed);
         let expected = host.clone();
         let app = app.clone();
         async move {
@@ -454,9 +494,12 @@ async fn serve_reverse_tunnel(
         }
     });
     if stream.get_ref().1.alpn_protocol() == Some(b"h2") {
-        let _ = http2()
-            .serve_connection(TokioIo::new(stream), service)
-            .await;
+        let builder = http2();
+        let connection = builder.serve_connection(TokioIo::new(stream), service);
+        until_idle(connection, &requests, |connection| {
+            connection.graceful_shutdown()
+        })
+        .await;
     } else {
         let _ = crate::forward::http1()
             .serve_connection(TokioIo::new(stream), service)

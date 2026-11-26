@@ -11,15 +11,18 @@ use std::{future, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::{config::Config, tls::Identity};
 use anyhow::{Context, Result};
+use rustls::server::Acceptor;
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpSocket, TcpStream},
     signal::unix::{SignalKind, signal},
     sync::Semaphore,
     time::{MissedTickBehavior, interval, sleep, timeout},
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, server::TlsStream};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ACCEPT_FAILURES: u32 = 100;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -114,15 +117,22 @@ fn listen(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(4096)
 }
 
-async fn accept_tls(
-    socket: TcpStream,
-    tls: TlsAcceptor,
-    handshakes: &Semaphore,
-) -> Option<TlsStream<TcpStream>> {
+/// Completes a TLS handshake. A connection waits for its ClientHello without a
+/// handshake slot, so idle sockets cannot keep other clients from connecting.
+async fn accept_tls<IO>(io: IO, tls: &TlsAcceptor, handshakes: &Semaphore) -> Option<TlsStream<IO>>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let hello = timeout(
+        HANDSHAKE_TIMEOUT,
+        LazyConfigAcceptor::new(Acceptor::default(), io),
+    )
+    .await
+    .ok()?
+    .ok()?;
     timeout(HANDSHAKE_TIMEOUT, async {
         let _permit = handshakes.acquire().await.ok()?;
-        socket.set_nodelay(true).ok()?;
-        tls.accept(socket).await.ok()
+        hello.into_stream(tls.config().clone()).await.ok()
     })
     .await
     .ok()
@@ -138,6 +148,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let slots = Arc::new(Semaphore::new(limit));
+    let mut failures = 0;
     loop {
         let permit = slots
             .clone()
@@ -158,8 +169,20 @@ where
                 sleep(Duration::from_millis(100)).await;
                 continue;
             }
+            // Other errors are usually transient, such as a peer that reset
+            // while queued or a kernel short of buffers. Stop only when the
+            // listener keeps failing, so a supervisor can restart the gateway.
+            Err(error) if failures < MAX_ACCEPT_FAILURES => {
+                if failures == 0 {
+                    eprintln!("Accepting a connection failed, retrying: {error}");
+                }
+                failures += 1;
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             Err(error) => return Err(error),
         };
+        failures = 0;
         let connection = handle(socket, peer);
         tokio::spawn(async move {
             connection.await;
