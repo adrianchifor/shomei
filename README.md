@@ -36,12 +36,14 @@ export SHOMEI_UID="$(id -u)" SHOMEI_GID="$(id -g)"
 mkcert -install
 mkcert -ecdsa -cert-file local/config/tls.pem -key-file local/config/tls-key.pem localhost
 
-shomei init --identity-file local/key.json
-shomei get-id --identity-file local/key.json | jq -es 'select(length > 0)' > local/config/identities.next \
+shomei init
+shomei get-id | jq -es 'select(length > 0)' > local/config/identities.next \
   && mv local/config/identities.next local/config/identities.json
 ```
 
 Add `--set-pin` to `shomei init` if your YubiKey 5 has no FIDO2 PIN. For a YubiKey 4, add `--u2f` instead. Both demos enable attested, touch-only U2F for localhost.
+
+The CLI stores the public identity in `~/.shomei/identity.json`. `shomei init` defaults to `https://localhost:8443`. For another gateway, set `SHOMEI_PROXY` or pass `--proxy` during enrollment. `shomei sign` can use the saved origin.
 
 ### Approve a deploy
 

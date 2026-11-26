@@ -65,7 +65,7 @@ enum Command {
 
 #[derive(Args)]
 struct IdentityFile {
-    /// Local public identity file. Defaults to ~/.config/shomei/identity.json.
+    /// Local public identity file. Defaults to ~/.shomei/identity.json.
     #[arg(long)]
     identity_file: Option<PathBuf>,
 }
@@ -75,19 +75,38 @@ impl IdentityFile {
         if let Some(path) = self.identity_file {
             return Ok(path);
         }
+        let home = env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         let config = env::var_os("XDG_CONFIG_HOME")
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .context("set --identity-file when no user configuration directory is available")?;
-        Ok(config.join("shomei/identity.json"))
+            .map(PathBuf::from);
+        default_identity_path(home.as_deref(), config.as_deref())
     }
+}
+
+fn default_identity_path(home: Option<&Path>, config: Option<&Path>) -> Result<PathBuf> {
+    let path = home.map(|home| home.join(".shomei/identity.json"));
+    if let Some(path) = &path
+        && path.try_exists()?
+    {
+        return Ok(path.clone());
+    }
+    let legacy = config
+        .map(|config| config.join("shomei/identity.json"))
+        .or_else(|| home.map(|home| home.join(".config/shomei/identity.json")));
+    if let Some(legacy) = legacy
+        && legacy.try_exists()?
+    {
+        return Ok(legacy);
+    }
+    path.context("set --identity-file when the home directory is unavailable")
 }
 
 #[derive(Args)]
 struct InitArgs {
     /// The gateway HTTPS origin, including its port if nonstandard.
-    #[arg(long, env = "SHOMEI_PROXY", value_parser = https_origin)]
+    #[arg(long, env = "SHOMEI_PROXY", default_value = "https://localhost:8443", value_parser = https_origin)]
     proxy: Url,
     /// Set a FIDO2 PIN on a YubiKey that has never had one.
     #[arg(long)]
@@ -101,12 +120,14 @@ struct InitArgs {
 
 #[derive(Args)]
 struct Access {
-    /// The gateway HTTPS origin, including its port if nonstandard.
+    /// The gateway HTTPS origin. Defaults to the origin in the local identity.
     #[arg(long, env = "SHOMEI_PROXY", value_parser = https_origin)]
-    proxy: Url,
+    proxy: Option<Url>,
     /// PEM trust roots for this gateway. Defaults to public WebPKI roots.
     #[arg(long, env = "SHOMEI_CA_FILE")]
     ca_file: Option<PathBuf>,
+    #[command(flatten)]
+    identity: IdentityFile,
 }
 
 pub async fn run() -> Result<Option<PathBuf>> {
@@ -117,7 +138,8 @@ pub async fn run() -> Result<Option<PathBuf>> {
         Some(Command::Init(args)) => init(args).await?,
         Some(Command::GetId(args)) => get_id(args)?,
         Some(Command::Sign(args)) => {
-            let gateway = Gateway::new(args.proxy, trust_roots(args.ca_file.as_deref())?)?;
+            let origin = sign_origin(args.proxy, args.identity)?;
+            let gateway = Gateway::new(origin, trust_roots(args.ca_file.as_deref())?)?;
             let signed = gateway.sign(None).await?;
             println!("{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&signed)?));
         }
@@ -145,7 +167,7 @@ async fn init(args: InitArgs) -> Result<()> {
     let path = args.identity.resolve()?;
     ensure!(
         !path.try_exists()?,
-        "identity already exists at {}",
+        "identity already exists at {}. Run shomei get-id or choose another --identity-file",
         path.display()
     );
     let dir = path
@@ -174,13 +196,33 @@ async fn init(args: InitArgs) -> Result<()> {
 }
 
 fn get_id(args: IdentityFile) -> Result<()> {
+    let identity = read_identity(args)?;
+    println!("{}", serde_json::to_string(&identity)?);
+    Ok(())
+}
+
+fn read_identity(args: IdentityFile) -> Result<StaticIdentity> {
     let path = args.resolve()?;
     let file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
     let identity: StaticIdentity =
         serde_json::from_reader(BufReader::new(file)).context("read public identity")?;
     identity.verify()?;
-    println!("{}", serde_json::to_string(&identity)?);
-    Ok(())
+    Ok(identity)
+}
+
+fn sign_origin(proxy: Option<Url>, args: IdentityFile) -> Result<Url> {
+    if args.identity_file.is_none()
+        && let Some(proxy) = proxy
+    {
+        return Ok(proxy);
+    }
+    let identity = read_identity(args)
+        .context("load the local identity to select a proxy. Run shomei init or pass --proxy")?;
+    ensure!(
+        proxy.is_none_or(|proxy| proxy == identity.origin),
+        "proxy URL does not match the selected identity"
+    );
+    Ok(identity.origin)
 }
 
 fn trust_roots(path: Option<&Path>) -> Result<RootCertStore> {
@@ -310,5 +352,40 @@ impl Gateway {
             bail!("gateway returned {status}");
         }
         serde_json::from_slice(&body).context("invalid gateway response")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_the_home_store_and_falls_back_to_the_previous_default() {
+        let home = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let path = home.path().join(".shomei/identity.json");
+        let legacy = config.path().join("shomei/identity.json");
+        let resolve = || default_identity_path(Some(home.path()), Some(config.path())).unwrap();
+
+        assert_eq!(resolve(), path);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "").unwrap();
+        assert_eq!(resolve(), legacy);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "").unwrap();
+        assert_eq!(resolve(), path);
+    }
+
+    #[test]
+    fn an_explicit_proxy_can_sign_without_a_local_identity() {
+        let proxy = https_origin("https://gateway.example.com").unwrap();
+        let resolved = sign_origin(
+            Some(proxy.clone()),
+            IdentityFile {
+                identity_file: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved, proxy);
     }
 }

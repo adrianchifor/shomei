@@ -15,18 +15,20 @@ Run this on the operator’s machine. The default policy uses a supported YubiKe
 
 ```sh
 export SHOMEI_PROXY=https://gateway.example.com:8443
-umask 077
-mkdir -p local/config
-shomei init --identity-file local/key.json
+shomei init
 ```
 
 Use `--set-pin` for a YubiKey 5 with no FIDO2 PIN. For a localhost YubiKey 4 demo, use `--u2f` and set `allow_yubikey_4 = true` in the gateway config. Set `SHOMEI_CA_FILE` or pass `--ca-file` on access commands when the gateway uses a private CA.
 
+The default public identity is `~/.shomei/identity.json`. `init` defaults to `https://localhost:8443` when the proxy is unspecified. `get-id` reads the local identity and `sign` can use its recorded origin from any working directory. Use `--identity-file` to select a separate identity.
+
 The identity file is a JSON array of public records from `shomei get-id`. To create a new Compose allowlist, run:
 
 ```sh
+umask 077
+mkdir -p local/config
 if [ ! -e local/config/identities.json ]; then
-  shomei get-id --identity-file local/key.json | jq -es 'select(length == 1)' > local/config/identities.next \
+  shomei get-id | jq -es 'select(length == 1)' > local/config/identities.next \
     && mv local/config/identities.next local/config/identities.json
 fi
 ```
