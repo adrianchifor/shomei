@@ -259,3 +259,16 @@ async fn fixed_named_and_scoped_tcp_share_an_mtls_listener() {
     gateway.abort();
     https_server.abort();
 }
+
+#[test]
+fn mtls_export_checks_the_output_parent_before_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(check_output_dir(&dir.path().join("creds")).is_ok());
+    assert!(check_output_dir(Path::new("creds-that-do-not-exist")).is_ok());
+    assert!(check_output_dir(dir.path()).is_err());
+    let missing = check_output_dir(&dir.path().join("missing/creds")).unwrap_err();
+    assert!(missing.to_string().contains("parent directory"));
+    let file = dir.path().join("file");
+    fs::write(&file, b"").unwrap();
+    assert!(check_output_dir(&file.join("creds")).is_err());
+}

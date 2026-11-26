@@ -1,8 +1,12 @@
 use std::{
     ffi::{OsStr, OsString},
+    fs,
     io::{self, Read, Write},
     net::{IpAddr, Shutdown},
-    os::unix::net::UnixStream as BlockingStream,
+    os::{
+        fd::AsFd,
+        unix::{fs::PermissionsExt, net::UnixStream as BlockingStream},
+    },
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::Arc,
@@ -298,9 +302,7 @@ async fn openssh(
     host: &str,
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
 ) -> Result<ExitStatus> {
-    let dir = tempfile::Builder::new()
-        .prefix("shomei-")
-        .tempdir_in("/tmp")?;
+    let dir = bridge_dir()?;
     let socket_path = dir.path().join("ssh.sock");
     let listener = UnixListener::bind(&socket_path).context("open local SSH bridge")?;
     let executable = shell_arg(std::env::current_exe()?.as_os_str())?;
@@ -340,6 +342,14 @@ async fn openssh(
     status.context("wait for OpenSSH")
 }
 
+// Keep the bridge socket private regardless of umask. The path stays short for sun_path.
+fn bridge_dir() -> io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("shomei-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+}
+
 fn openssh_command() -> Command {
     let mut ssh = Command::new("ssh");
     ssh.kill_on_drop(true)
@@ -364,7 +374,8 @@ pub(super) fn stdio(socket: &Path) -> Result<()> {
         let _ = io::copy(&mut io::stdin().lock(), &mut output);
         let _ = output.shutdown(Shutdown::Write);
     });
-    let mut stdout = io::stdout().lock();
+    // Write each chunk to fd 1 directly; the stdout LineWriter would split chunks at newlines.
+    let mut stdout = fs::File::from(io::stdout().as_fd().try_clone_to_owned()?);
     let mut buffer = [0; 16 * 1024];
     loop {
         let bytes = stream.read(&mut buffer)?;
@@ -372,13 +383,19 @@ pub(super) fn stdio(socket: &Path) -> Result<()> {
             return Ok(());
         }
         stdout.write_all(&buffer[..bytes])?;
-        stdout.flush()?;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_bridge_directory_is_private() {
+        let dir = bridge_dir().unwrap();
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
 
     #[test]
     fn tailscale_connects_directly_without_ssh_credentials() {
