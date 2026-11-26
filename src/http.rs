@@ -1501,18 +1501,19 @@ async fn reverse(
     }
     filter_cookies(headers, COOKIE);
 
-    let request = request.map(|body| relay_body(body, None));
+    let sent = Arc::new(AtomicU64::new(0));
+    let request = request.map(|body| upload_body(body, sent.clone()));
     let mut response =
-        match timeout(Duration::from_secs(30), app.http_client.request(request)).await {
-            Ok(Ok(response)) if response.status() == StatusCode::SWITCHING_PROTOCOLS => {
+        match response_head(app.http_client.request(request), &sent, UPSTREAM_TIMEOUT).await {
+            Some(Ok(response)) if response.status() == StatusCode::SWITCHING_PROTOCOLS => {
                 StatusCode::BAD_GATEWAY.into_response()
             }
-            Ok(Ok(response)) => response.map(|body| relay_body(Body::new(body), Some(permit))),
-            Ok(Err(error)) => {
+            Some(Ok(response)) => response.map(|body| relay_body(Body::new(body), Some(permit))),
+            Some(Err(error)) => {
                 eprintln!("HTTP upstream request failed: {error}");
                 StatusCode::BAD_GATEWAY.into_response()
             }
-            Err(_) => StatusCode::GATEWAY_TIMEOUT.into_response(),
+            None => StatusCode::GATEWAY_TIMEOUT.into_response(),
         };
     if strip_hop_headers(response.headers_mut()).is_err() {
         return StatusCode::BAD_GATEWAY.into_response();
@@ -1620,6 +1621,41 @@ fn filter_cookies(headers: &mut HeaderMap, name: HeaderName) {
     headers.remove(&name);
     for entry in entries {
         headers.append(&name, entry);
+    }
+}
+
+pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_UPLOAD_PROGRESS: u64 = 1024 * 1024;
+
+/// A request body that counts the bytes the upstream has taken.
+pub(crate) fn upload_body(body: Body, sent: Arc<AtomicU64>) -> Body {
+    Body::new(relay_body(body, None).map_frame(move |frame| {
+        if let Some(data) = frame.data_ref() {
+            sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+        frame
+    }))
+}
+
+/// Waits for an upstream's response head. The limit restarts after each
+/// `window` in which the request body moved at least `MIN_UPLOAD_PROGRESS`
+/// bytes, so a large upload is not cut off while a stalled one still is.
+pub(crate) async fn response_head<F: Future>(
+    response: F,
+    sent: &AtomicU64,
+    window: Duration,
+) -> Option<F::Output> {
+    let mut response = std::pin::pin!(response);
+    let mut seen = 0;
+    loop {
+        if let Ok(output) = timeout(window, response.as_mut()).await {
+            return Some(output);
+        }
+        let total = sent.load(Ordering::Relaxed);
+        if total - seen < MIN_UPLOAD_PROGRESS {
+            return None;
+        }
+        seen = total;
     }
 }
 

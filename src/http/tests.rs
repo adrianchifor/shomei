@@ -458,6 +458,34 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
 }
 
 #[tokio::test]
+async fn upstream_timeout_restarts_while_an_upload_makes_progress() {
+    let window = Duration::from_millis(100);
+    let reply = || tokio::time::sleep(Duration::from_millis(350));
+    let sent = Arc::new(AtomicU64::new(0));
+    assert!(response_head(reply(), &sent, window).await.is_none());
+
+    let trickle = sent.clone();
+    let upload = tokio::spawn(async move {
+        loop {
+            trickle.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    assert!(response_head(reply(), &sent, window).await.is_none());
+    upload.abort();
+
+    let steady = sent.clone();
+    let upload = tokio::spawn(async move {
+        loop {
+            steady.fetch_add(MIN_UPLOAD_PROGRESS, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    assert!(response_head(reply(), &sent, window).await.is_some());
+    upload.abort();
+}
+
+#[tokio::test]
 async fn browser_and_cli_approvals_follow_protected_path_session_ttls() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = tempfile::tempdir().unwrap();
