@@ -336,6 +336,7 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
     let server = tokio::spawn(async move {
         let app = Router::new().fallback(|request: Request| async move {
             assert!(!request.headers().contains_key("x-original-url"));
+            assert!(!request.headers().contains_key("x-http-method-override"));
             assert!(!request.headers().contains_key(AUTHORIZATION));
             format!("{} {}", request.method(), request.uri())
         });
@@ -362,6 +363,7 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
                 .method(method.clone())
                 .header(ACCEPT, "text/html")
                 .header("x-original-url", "/api/deploy")
+                .header("x-http-method-override", "DELETE")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -681,6 +683,54 @@ async fn browser_and_cli_approvals_follow_protected_path_session_ttls() {
         StatusCode::UNAUTHORIZED
     );
     server.abort();
+}
+
+#[test]
+fn upstream_requests_get_one_cookie_header_and_a_browser_style_host() {
+    let mut headers = HeaderMap::new();
+    for value in [
+        "a=1; __Host-shomei-action-x=secret",
+        "b=2",
+        "__Host-shomei=s",
+    ] {
+        headers.append(COOKIE, HeaderValue::from_static(value));
+    }
+    filter_cookies(&mut headers, COOKIE);
+    assert_eq!(
+        headers.get_all(COOKIE).iter().collect::<Vec<_>>(),
+        ["a=1; b=2"]
+    );
+    filter_cookies(&mut headers, COOKIE);
+    assert_eq!(headers[COOKIE], "a=1; b=2");
+    let mut only_sessions =
+        HeaderMap::from_iter([(COOKIE, HeaderValue::from_static("__Host-shomei=s"))]);
+    filter_cookies(&mut only_sessions, COOKIE);
+    assert!(only_sessions.is_empty());
+
+    let mut responses = HeaderMap::new();
+    for value in [
+        "__Host-shomei=blocked; Secure",
+        "app=new; Path=/",
+        "other=1",
+    ] {
+        responses.append(SET_COOKIE, HeaderValue::from_static(value));
+    }
+    filter_cookies(&mut responses, SET_COOKIE);
+    assert_eq!(
+        responses.get_all(SET_COOKIE).iter().collect::<Vec<_>>(),
+        ["app=new; Path=/", "other=1"]
+    );
+
+    for (host, expected) in [
+        ("app.example.com", "app.example.com"),
+        ("app.example.com:8443", "app.example.com:8443"),
+        ("[2001:db8::1]", "[2001:db8::1]"),
+    ] {
+        assert_eq!(
+            forwarded_host(&Endpoint::parse(host, Some(443)).unwrap()),
+            expected
+        );
+    }
 }
 
 #[tokio::test]

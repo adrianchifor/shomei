@@ -1373,12 +1373,16 @@ async fn reverse(
             "x-rewrite-url",
             "x-rewrite-uri",
             "x-envoy-original-path",
+            // Approvals are bound to the method the gateway sees.
+            "x-http-method-override",
+            "x-http-method",
+            "x-method-override",
         ] {
             headers.remove(name);
         }
     }
     headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-    if let Ok(host) = HeaderValue::from_str(&host.to_string()) {
+    if let Ok(host) = HeaderValue::from_str(&forwarded_host(&host)) {
         headers.insert("x-forwarded-host", host);
     }
     filter_cookies(headers, COOKIE);
@@ -1462,26 +1466,42 @@ pub(crate) fn strip_hop_headers(headers: &mut HeaderMap) -> Result<(), ()> {
     Ok(())
 }
 
+/// The public authority as a browser writes it, without the default port.
+fn forwarded_host(host: &Endpoint) -> String {
+    approval::site_origin(host)["https://".len()..].to_owned()
+}
+
 fn filter_cookies(headers: &mut HeaderMap, name: HeaderName) {
+    if name == COOKIE {
+        // HTTP/2 clients may split cookies over several fields. An HTTP/1.1
+        // upstream expects them in one (RFC 9113 section 8.2.3).
+        let cookies = headers
+            .get_all(&name)
+            .iter()
+            .filter_map(|header| header.to_str().ok())
+            .flat_map(|line| line.split(';'))
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty() && session_value(pair).is_none())
+            .collect::<Vec<_>>()
+            .join("; ");
+        headers.remove(&name);
+        if !cookies.is_empty()
+            && let Ok(cookies) = HeaderValue::from_str(&cookies)
+        {
+            headers.insert(&name, cookies);
+        }
+        return;
+    }
     let entries: Vec<_> = headers
         .get_all(&name)
         .iter()
-        .filter_map(|header| {
-            let line = header.to_str().ok()?;
-            if name == COOKIE {
-                let cookies = line
-                    .split(';')
-                    .map(str::trim)
-                    .filter(|pair| !pair.is_empty() && session_value(pair).is_none())
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return (!cookies.is_empty())
-                    .then(|| HeaderValue::from_str(&cookies).ok())
-                    .flatten();
-            }
-            let pair = line.split_once(';').map_or(line, |(pair, _)| pair);
-            session_value(pair).is_none().then(|| header.clone())
+        .filter(|header| {
+            header.to_str().is_ok_and(|line| {
+                let pair = line.split_once(';').map_or(line, |(pair, _)| pair);
+                session_value(pair).is_none()
+            })
         })
+        .cloned()
         .collect();
     headers.remove(&name);
     for entry in entries {
