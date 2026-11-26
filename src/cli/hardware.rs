@@ -91,7 +91,13 @@ pub async fn register(
         return block_in_place(|| u2f::register(origin, options));
     }
     let ui = Terminal::default();
-    let mut key = usb_key(&ui).await?.context(CONNECT_FIDO2)?;
+    let mut key = usb_key(&ui).await?.with_context(|| {
+        if origin.domain() == Some("localhost") {
+            format!("{CONNECT_FIDO2}. For a YubiKey 4 on localhost, run shomei init --u2f")
+        } else {
+            CONNECT_FIDO2.to_owned()
+        }
+    })?;
     if key.get_info().get_option("clientPin") == Some(false) {
         ensure!(
             set_pin,
