@@ -33,9 +33,15 @@ use webauthn_rs::prelude::{PublicKeyCredential, RequestChallengeResponse};
 
 use crate::auth::{ACCOUNT, StaticIdentity, encode_identity, prepare_identity};
 
+// Release builds set SHOMEI_VERSION to the release tag.
+const VERSION: &str = match option_env!("SHOMEI_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
 #[command(
-    version,
+    version = VERSION,
     about = "YubiKey authentication proxy",
     args_conflicts_with_subcommands = true
 )]
