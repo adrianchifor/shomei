@@ -34,9 +34,9 @@ use super::{
 
 #[derive(Args)]
 pub(super) struct MtlsArgs {
-    /// Name of the configured forward proxy scope.
+    /// Forward proxy scope. The gateway selects it automatically when there is only one.
     #[arg(long)]
-    scope: String,
+    scope: Option<String>,
     /// New directory for the certificate and private key.
     #[arg(long)]
     out: PathBuf,
@@ -60,7 +60,7 @@ pub(super) struct ConnectArgs {
 
 #[derive(Args, Default)]
 pub(super) struct CredentialsArgs {
-    /// Approve a new certificate for this configured forward proxy scope.
+    /// Approve a new certificate for this scope. Optional when the gateway has one scope.
     #[arg(long, conflicts_with = "credentials")]
     scope: Option<String>,
     /// Reuse a certificate directory created by shomei mtls.
@@ -89,21 +89,13 @@ struct Credentials {
 }
 
 impl Credentials {
-    async fn approve(origin: Url, roots: RootCertStore, scope: &str) -> Result<Self> {
+    async fn approve(origin: Url, roots: RootCertStore, scope: Option<&str>) -> Result<Self> {
         let gateway = Gateway::new(origin.clone(), roots)?;
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let csr = CertificateParams::default()
             .serialize_request(&key)?
             .pem()?;
-        let signed = gateway
-            .sign_challenge(
-                "start",
-                &serde_json::json!({
-                    "forward_scope": scope,
-                    "client_csr_pem": csr,
-                }),
-            )
-            .await?;
+        let signed = gateway.sign_forward(scope, Some(&csr)).await?;
         let grant: Certificate = gateway.post("finish", &signed).await?;
         let metadata = CredentialMetadata {
             origin,
@@ -207,10 +199,10 @@ impl CredentialsArgs {
             let roots = trust_roots(&origin, access.ca_file.as_deref())?;
             return Tunnel::new(credentials, roots);
         }
-        let scope = self.scope.context("pass --scope or --credentials")?;
         let origin = sign_origin(access.proxy, access.identity)?;
         let roots = trust_roots(&origin, access.ca_file.as_deref())?;
-        let credentials = Credentials::approve(origin, roots.clone(), &scope).await?;
+        let credentials =
+            Credentials::approve(origin, roots.clone(), self.scope.as_deref()).await?;
         Tunnel::new(credentials, roots)
     }
 }
@@ -222,7 +214,7 @@ pub(super) async fn export(args: MtlsArgs) -> Result<()> {
     );
     let origin = sign_origin(args.access.proxy, args.access.identity)?;
     let roots = trust_roots(&origin, args.access.ca_file.as_deref())?;
-    let credentials = Credentials::approve(origin, roots, &args.scope).await?;
+    let credentials = Credentials::approve(origin, roots, args.scope.as_deref()).await?;
     let (_, _, lifetime) = credentials.endpoint()?;
     credentials.write(&args.out)?;
     eprintln!(

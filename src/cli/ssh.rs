@@ -37,6 +37,9 @@ pub(super) struct SshArgs {
     /// Approve SSH over Tailscale and connect directly from this device.
     #[arg(long, conflicts_with_all = ["auth_url", "scope", "credentials"])]
     tailscale: bool,
+    /// Use the TCP forward proxy and select the sole scope automatically.
+    #[arg(long = "forward", conflicts_with_all = ["auth_url", "tailscale"])]
+    forward_mode: bool,
     /// PEM trust roots. Localhost can use ~/.shomei/localhost-ca.pem.
     #[arg(long, env = "SHOMEI_CA_FILE")]
     ca_file: Option<PathBuf>,
@@ -69,7 +72,7 @@ pub(super) async fn run(mut args: SshArgs) -> Result<()> {
     let host = ssh_host(&args.destination)?;
     let status = if args.tailscale {
         open_tailscale(&args, host).await?
-    } else if args.forward.enabled() {
+    } else if args.forward_mode || args.forward.enabled() {
         ensure!(
             args.auth_url.is_none(),
             "--auth-url is only used with tls:// proxies"
@@ -363,6 +366,7 @@ mod tests {
             proxy: Url::parse("https://shomei.example.ts.net:8443").unwrap(),
             auth_url: None,
             tailscale: true,
+            forward_mode: false,
             ca_file: None,
             forward: Default::default(),
             ssh_arg: vec!["-v".into()],

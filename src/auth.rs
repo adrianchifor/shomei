@@ -130,6 +130,9 @@ pub enum Grant {
         key: SubjectPublicKeyInfo,
         scope: usize,
     },
+    ForwardHttp {
+        scope: usize,
+    },
     Tailscale(crate::tailscale::Device),
 }
 

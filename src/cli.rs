@@ -59,9 +59,9 @@ enum Command {
     GetId(GetIdArgs),
     /// Delete the local public identity after confirmation.
     Clear(IdentityFile),
-    /// Print a one-use Shomei authorization assertion.
-    Sign(Access),
-    /// Export a reusable, short-lived mTLS credential for a forward proxy scope.
+    /// Approve HTTP access and print an assertion or forward session.
+    Sign(SignArgs),
+    /// Export a reusable, short-lived mTLS credential for TCP forwarding.
     Mtls(forward::MtlsArgs),
     /// Open a local TCP bridge through the forward proxy.
     Connect(forward::ConnectArgs),
@@ -151,6 +151,21 @@ struct Access {
     identity: IdentityFile,
 }
 
+#[derive(Args)]
+struct SignArgs {
+    /// Approve a request through the HTTP forward proxy.
+    #[arg(long)]
+    forward: bool,
+    /// Authorize HTTP forwarding within this configured scope.
+    #[arg(long)]
+    scope: Option<String>,
+    /// Exchange the assertion for a reusable HTTP forward session.
+    #[arg(long)]
+    session: bool,
+    #[command(flatten)]
+    access: Access,
+}
+
 pub async fn run() -> Result<Option<PathBuf>> {
     let args = Arguments::parse();
     match args.command {
@@ -162,11 +177,24 @@ pub async fn run() -> Result<Option<PathBuf>> {
             clear_identity(&args.resolve()?, io::stdin().lock(), io::stderr().lock())?;
         }
         Some(Command::Sign(args)) => {
-            let origin = sign_origin(args.proxy, args.identity)?;
-            let roots = trust_roots(&origin, args.ca_file.as_deref())?;
+            let origin = sign_origin(args.access.proxy, args.access.identity)?;
+            let roots = trust_roots(&origin, args.access.ca_file.as_deref())?;
             let gateway = Gateway::new(origin, roots)?;
-            let signed = gateway.sign(None).await?;
-            println!("{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&signed)?));
+            let signed = if args.forward || args.session || args.scope.is_some() {
+                gateway.sign_forward(args.scope.as_deref(), None).await?
+            } else {
+                gateway.sign(None).await?
+            };
+            if args.session {
+                #[derive(Deserialize)]
+                struct ForwardSession {
+                    proxy_session: String,
+                }
+                let session: ForwardSession = gateway.post("finish", &signed).await?;
+                println!("{}", session.proxy_session);
+            } else {
+                println!("{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&signed)?));
+            }
         }
         Some(Command::Ssh(args)) => ssh::run(args).await?,
         Some(Command::Mtls(args)) => forward::export(args).await?,
@@ -371,6 +399,17 @@ impl Gateway {
         let mut body = serde_json::json!({});
         if let Some((target, csr)) = tcp {
             body["tcp_target"] = target.into();
+            body["client_csr_pem"] = csr.into();
+        }
+        self.sign_challenge("start", &body).await
+    }
+
+    async fn sign_forward(&self, scope: Option<&str>, csr: Option<&str>) -> Result<Signed> {
+        let mut body = match scope {
+            Some(name) => serde_json::json!({ "forward_scope": name }),
+            None => serde_json::json!({ "forward": true }),
+        };
+        if let Some(csr) = csr {
             body["client_csr_pem"] = csr.into();
         }
         self.sign_challenge("start", &body).await

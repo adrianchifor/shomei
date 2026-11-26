@@ -21,16 +21,27 @@ upstream = "host.docker.internal:9000"
 public_port = 9443
 cert_ttl_seconds = 300
 
-# Explicit HTTPS forward proxy. Replace the example DNS and IP ranges with your own.
+# Forward proxy. Replace the example DNS and IP ranges with your own.
 # [forward]
+# TCP and SSH use mTLS on this listener.
 # bind = "0.0.0.0:9444"
 # public_port = 9444
 # cert_ttl_seconds = 300
+# HTTP and HTTPS use signed approvals or sessions over TLS. Omit to disable.
+# http_bind = "0.0.0.0:9445"
 
 # [forward.scopes.fleet]
 # dns_suffixes = ["internal.example.com"]
 # cidrs = ["10.42.0.0/16", "fd00:42::/48"]
 # ports = [22, 80, 443, 5432]
+# HTTP and HTTPS destinations must also match these protocol-specific lists.
+# http_ports = [80]
+# https_ports = [443]
+
+# Alternative to the scope above. Let the gateway's network policy limit destinations.
+# [forward.scopes.unrestricted]
+# allow_all = true
+# HTTPS CONNECT still uses https_ports, which defaults to [443].
 
 # Use the gateway's MagicDNS origin and TLS certificate, and bind https_bind to its Tailscale IP.
 # [tailscale_ssh]

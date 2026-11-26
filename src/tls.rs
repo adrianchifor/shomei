@@ -50,6 +50,16 @@ impl Identity {
     }
 
     pub fn server(&self, issuer: Option<&Issuer>) -> Result<TlsAcceptor> {
+        Ok(TlsAcceptor::from(Arc::new(self.server_config(issuer)?)))
+    }
+
+    pub fn http1_server(&self) -> Result<TlsAcceptor> {
+        let mut config = self.server_config(None)?;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(TlsAcceptor::from(Arc::new(config)))
+    }
+
+    fn server_config(&self, issuer: Option<&Issuer>) -> Result<ServerConfig> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = match issuer {
             Some(issuer) => {
@@ -73,7 +83,7 @@ impl Identity {
             config.session_storage = ServerSessionMemoryCache::new(4096);
             config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         }
-        Ok(TlsAcceptor::from(Arc::new(config)))
+        Ok(config)
     }
 }
 

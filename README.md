@@ -3,7 +3,7 @@
 Shomei (署名, Japanese for “signature”) is a Rust authentication proxy for HTTP and TCP backed by hardware-attested YubiKeys.
 
 - **Reverse proxy** supports browser WebAuthn, one-use CLI assertions, and encrypted session cookies for HTTP. Configured TCP targets use short-lived mTLS certificates.
-- **Forward proxy** uses one short-lived mTLS certificate for HTTP, HTTPS, and TCP connections within a destination scope.
+- **Forward proxy** uses YubiKey assertions or sessions for HTTP and HTTPS, and short-lived mTLS certificates for TCP and SSH.
 - **Tailscale SSH** can require YubiKey approval before a direct connection from the caller’s device.
 
 All enrolled keys authenticate as `shomei`. The default policy requires a supported YubiKey 5 Series key with firmware 5.7.4 or later, PIN, and touch.
@@ -63,7 +63,7 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 | `tls_cert`, `tls_key` | Gateway TLS certificate and private key. |
 | `http_upstream` | HTTP or HTTPS origin to forward to. |
 | `tcp.upstream` | Fixed TCP host and port. Set `tcp.ssh_host` to the alias used by `shomei ssh`. |
-| `[forward]` | Optional mTLS HTTPS listener and named destination scopes. |
+| `[forward]` | Forward listeners for signed HTTP traffic and mTLS TCP traffic, with named destination scopes. |
 | `session_ttl_seconds` | HTTP session lifetime. Defaults to 600 seconds. |
 | `tcp.cert_ttl_seconds` | mTLS certificate lifetime. Defaults to 300 seconds. Active relays close at expiry. |
 | `[browser_action]` | Exposes an approval page and requires a fresh assertion for HTTP writes. |
@@ -72,6 +72,8 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 Put one `shomei get-id` token per line in the identity file. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. All keys use the `shomei` account. Shomei decodes the compressed records in memory and verifies their hardware attestation. Existing JSON arrays also work. Use `shomei get-id --json` for JSON-based tooling. [Convert an existing allowlist](AGENTS.md#enroll-a-key)
 
 Replace the identity file atomically to reload the allowlist. Removing or replacing a key revokes existing HTTP sessions and TCP relay access. Restarting the proxy invalidates its session cookies.
+
+To protect only selected paths and leave the rest public, route those paths through Shomei at your ingress. Keep the protected backend private. A Shomei reverse proxy requires authentication for all paths it serves.
 
 ### Share a gateway across services
 
@@ -83,21 +85,35 @@ One enrollment covers those routes and an SSH upstream configured on the same ga
 
 Enable `[forward]` and define `[forward.scopes.fleet]` with permitted CIDRs and ports. Add `dns_suffixes` to require matching DNS names in those ranges. Shomei resolves destinations on the gateway and connects only to matching addresses. Every enrolled YubiKey can approve any configured scope. [Example configuration](shomei.example.toml)
 
+Shomei selects the scope automatically when there's only one. Specify `--scope NAME` when there are multiple. To rely on your gateway's outbound network policy, configure a scope with `allow_all = true` and omit `cidrs`, `ports`, and `dns_suffixes`. It permits any reachable destination and port for TCP and HTTP. HTTPS tunnels still check `https_ports`, which defaults to `[443]`.
+
+Set `forward.http_bind` to `0.0.0.0:9445` to enable HTTP forwarding. Each signed assertion approves one HTTP request or one HTTPS tunnel. Add `--session` to reuse that approval until `session_ttl_seconds` expires.
+
 ```sh
 gateway=https://shomei.example.com:8443
-shomei mtls --proxy "$gateway" --scope fleet --out ./fleet-cert
-curl --proxy https://shomei.example.com:9444 \
-  --proxy-cert ./fleet-cert/client.pem --proxy-key ./fleet-cert/client-key.pem \
-  https://status.internal.example.com/
+approval="$(shomei sign --proxy "$gateway" --forward)" &&
+  curl --proxy https://shomei.example.com:9445 \
+    --proxy-header "Proxy-Authorization: Shomei $approval" \
+    https://status.internal.example.com/
 
+session="$(shomei sign --proxy "$gateway" --forward --session)" &&
+  curl --proxy https://shomei.example.com:9445 \
+    --proxy-header "Proxy-Authorization: Shomei-Session $session" \
+    http://reports.internal.example.com/today
+```
+
+HTTPS stays encrypted through the tunnel. The proxy authorizes the destination when the tunnel opens. A deploy behind the reverse proxy can still ask for a fresh browser WebAuthn approval for each write. [curl proxy options](https://curl.se/docs/manpage.html#--proxy-header)
+
+For TCP and SSH, approve a reusable mTLS certificate for the scope.
+
+```sh
+shomei mtls --proxy "$gateway" --out ./fleet-cert
 shomei ssh --proxy "$gateway" --credentials ./fleet-cert ubuntu@host.internal.example.com
 shomei connect --credentials ./fleet-cert --listen 127.0.0.1:15432 db.internal.example.com:5432
 # While connect is running, point your TCP client at 127.0.0.1:15432.
 ```
 
-Pass `--scope fleet` to `connect` or `ssh` to approve a certificate in memory. Curl accepts HTTP and HTTPS destination URLs. You can set `http_proxy` and `https_proxy` instead of `--proxy` and still supply the client certificate and key. HTTPS uses an end-to-end TLS tunnel. [curl proxy options](https://curl.se/docs/manpage.html#--proxy)
-
-Forward certificates default to five minutes and can be reused across the scope until expiry, allowlist revocation, or gateway restart. Active tunnels close when access expires. Keep deployment approvals on the reverse proxy and its upstreams outside forward scopes.
+For an in-memory certificate, omit `--credentials` with `connect` or use `ssh --forward`. Forward TCP certificates default to five minutes. Sessions and certificates expire on allowlist revocation or gateway restart. Active tunnels close when access expires.
 
 ## Tailscale SSH
 

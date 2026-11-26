@@ -15,12 +15,10 @@ use crate::{
 };
 
 #[tokio::test]
-async fn reuses_scoped_credentials_for_http_and_https_tunnels() {
+async fn uses_scoped_mtls_for_tcp_tunnels() {
     let (identity, roots) = server_fixture();
-    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let https = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http.local_addr().unwrap();
     let https_addr = https.local_addr().unwrap();
     let addr = listener.local_addr().unwrap();
     let proxy = Arc::new(
@@ -29,9 +27,8 @@ async fn reuses_scoped_credentials_for_http_and_https_tunnels() {
                 r#"
         [scopes.fleet]
         cidrs = ["127.0.0.1/32"]
-        ports = [{}, {}]
+        ports = [{}]
     "#,
-                http_addr.port(),
                 https_addr.port()
             ))
             .unwrap(),
@@ -55,31 +52,6 @@ async fn reuses_scoped_credentials_for_http_and_https_tunnels() {
                 allowed.clone(),
             ));
         }
-    });
-    let http_server = tokio::spawn(async move {
-        let (socket, _) = http.accept().await.unwrap();
-        hyper::server::conn::http1::Builder::new()
-            .serve_connection(
-                TokioIo::new(socket),
-                service_fn(move |request: Request<Incoming>| async move {
-                    assert_eq!(request.uri(), "/status?q=1");
-                    assert_eq!(request.headers()[HOST], http_addr.to_string());
-                    assert!(
-                        !request
-                            .headers()
-                            .contains_key(hyper::header::PROXY_AUTHORIZATION)
-                    );
-                    assert_eq!(
-                        request.into_body().collect().await.unwrap().to_bytes(),
-                        "hello"
-                    );
-                    Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from_static(
-                        b"http ok",
-                    ))))
-                }),
-            )
-            .await
-            .unwrap();
     });
     let origin_tls = identity.server(None).unwrap();
     let https_server = tokio::spawn(async move {
@@ -158,24 +130,13 @@ async fn reuses_scoped_credentials_for_http_and_https_tunnels() {
             .body(Full::new(Bytes::from_static(b"hello")))
             .unwrap()
     };
-    let denied = http
-        .send_request(req(format!("http://127.0.0.2:{}/", http_addr.port())))
-        .await
-        .unwrap();
-    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     let response = http
-        .send_request(req(format!("http://{http_addr}/status?q=1")))
+        .send_request(req(format!("http://{https_addr}/status?q=1")))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.into_body().collect().await.unwrap().to_bytes(),
-        "http ok"
-    );
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
 
-    let disallowed_port = (1..4)
-        .find(|port| ![http_addr.port(), https_addr.port()].contains(port))
-        .unwrap();
+    let disallowed_port = if https_addr.port() == 22 { 23 } else { 22 };
     let denied = tunnel
         .open(destination(&format!("127.0.0.1:{disallowed_port}")).unwrap())
         .await;
@@ -213,6 +174,5 @@ async fn reuses_scoped_credentials_for_http_and_https_tunnels() {
         .unwrap()
         .ok();
     gateway.abort();
-    http_server.abort();
     https_server.abort();
 }

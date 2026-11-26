@@ -1,16 +1,20 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use axum::http;
+use http_body_util::{Empty, Full};
 use rcgen::{CertificateParams, KeyPair};
-use rustls::pki_types::{CertificateDer, pem::PemObject};
+use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, UnixListener};
+use tokio_rustls::TlsConnector;
 use tower::ServiceExt;
 
 use super::*;
 use crate::{
     auth::tests::{TestSigner, test_auth},
     config::{TailscaleSshConfig, TcpConfig},
+    forward,
+    tls::tests::server_fixture,
 };
 
 #[tokio::test]
@@ -21,6 +25,250 @@ async fn approves_one_deploy_and_allows_only_reads_with_its_cookie() {
 #[tokio::test]
 async fn attested_yubikey_4_approves_deploy_and_tcp_grants() {
     approves_one_deploy(true).await;
+}
+
+#[tokio::test]
+async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = "https://localhost:8443".parse().unwrap();
+    let identities_file = dir.path().join("identities");
+    let config = Config {
+        origin,
+        https_bind: "127.0.0.1:0".parse().unwrap(),
+        tls_cert: "unused".into(),
+        tls_key: "unused".into(),
+        state_dir: dir.path().into(),
+        identities_file: identities_file.clone(),
+        allow_yubikey_4: false,
+        http_upstream: None,
+        browser_action: None,
+        session_ttl_seconds: 60,
+        tcp: None,
+        forward: None,
+        tailscale_ssh: None,
+        limits: Default::default(),
+    };
+    let (auth, signer) = test_auth(
+        &config.origin,
+        &config.state_dir,
+        &identities_file,
+        &config.limits,
+        false,
+    );
+    let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let secure = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let plain_addr = plain.local_addr().unwrap();
+    let secure_addr = secure.local_addr().unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gateway = Arc::new(
+        forward::Gateway::new(
+            toml::from_str(&format!(
+                r#"
+        http_bind = "{addr}"
+        [scopes.web]
+        cidrs = ["127.0.0.1/32"]
+        ports = [{}, {}]
+        http_ports = [{}]
+        https_ports = [{}]
+    "#,
+                plain_addr.port(),
+                secure_addr.port(),
+                plain_addr.port(),
+                secure_addr.port(),
+            ))
+            .unwrap(),
+            16,
+        )
+        .unwrap(),
+    );
+    let state = state_with_auth(config, None, auth, Some(gateway.clone())).unwrap();
+    let router = routes(state.clone());
+    let (identity, roots) = server_fixture();
+    let tls = identity.http1_server().unwrap();
+    let app = state.clone();
+    let proxy = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        forward::serve_http(socket, tls, gateway, Arc::new(Semaphore::new(16)), app).await;
+    });
+    let http_server = tokio::spawn(async move {
+        let app = Router::new().fallback(move |request: Request| async move {
+            assert_eq!(request.uri(), "/path?q=1");
+            assert_eq!(request.headers()[HOST], plain_addr.to_string());
+            assert_eq!(request.headers()[AUTHORIZATION], "Bearer upstream");
+            assert!(!request.headers().contains_key(PROXY_AUTHORIZATION));
+            "forwarded"
+        });
+        axum::serve(plain, app).await.unwrap();
+    });
+    let tls = identity.http1_server().unwrap();
+    let https_server = tokio::spawn(async move {
+        let (socket, _) = secure.accept().await.unwrap();
+        let tls = tls.accept(socket).await.unwrap();
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(tls),
+                service_fn(|request: hyper::Request<Incoming>| async move {
+                    assert_eq!(request.uri(), "/tls");
+                    assert!(!request.headers().contains_key(PROXY_AUTHORIZATION));
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                        Bytes::from_static(b"tunneled"),
+                    )))
+                }),
+            )
+            .await;
+    });
+    let tls = TlsConnector::from(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ));
+    let host = ServerName::try_from("localhost").unwrap();
+    let socket = tls
+        .connect(host.clone(), TcpStream::connect(addr).await.unwrap())
+        .await
+        .unwrap();
+    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(socket))
+        .await
+        .unwrap();
+    tokio::spawn(connection.with_upgrades());
+    let request = |authorization: &str| {
+        hyper::Request::get(format!("http://{plain_addr}/path?q=1"))
+            .header(HOST, "replaced.test")
+            .header(AUTHORIZATION, "Bearer upstream")
+            .header(PROXY_AUTHORIZATION, authorization)
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+    let unauthorized = client.send_request(request("")).await.unwrap();
+    assert_eq!(
+        unauthorized.status(),
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED
+    );
+    assert_eq!(unauthorized.headers()[PROXY_AUTHENTICATE], "Shomei");
+    let challenge = async |counter| {
+        let start = send(
+            &router,
+            post_json("/_shomei/api/auth/start", json!({ "forward": true })),
+        )
+        .await;
+        assert_eq!(start.status(), StatusCode::OK);
+        signed_answer(&signer, &json_body(start).await, counter)
+    };
+    let answer = challenge(1).await;
+    let assertion = format!("Shomei {}", URL_SAFE_NO_PAD.encode(answer.to_string()));
+    let approved = client.send_request(request(&assertion)).await.unwrap();
+    assert_eq!(
+        approved.into_body().collect().await.unwrap().to_bytes(),
+        "forwarded"
+    );
+    assert_eq!(
+        client
+            .send_request(request(&assertion))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED
+    );
+
+    let issued = send(
+        &router,
+        post_json("/_shomei/api/auth/finish", challenge(2).await),
+    )
+    .await;
+    assert_eq!(issued.status(), StatusCode::OK);
+    assert!(!issued.headers().contains_key(SET_COOKIE));
+    let issued = json_body(issued).await;
+    let token = issued["proxy_session"].as_str().unwrap();
+    assert!(token.starts_with("web."));
+    let authorization = format!("Shomei-Session {token}");
+    let tampered = authorization.replace(" web.", " other.");
+    assert_eq!(
+        client
+            .send_request(request(&tampered))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED
+    );
+    let approved = client.send_request(request(&authorization)).await.unwrap();
+    assert_eq!(
+        approved.into_body().collect().await.unwrap().to_bytes(),
+        "forwarded"
+    );
+
+    let csr = CertificateParams::default()
+        .serialize_request(&KeyPair::generate().unwrap())
+        .unwrap()
+        .pem()
+        .unwrap();
+    let start = send(
+        &router,
+        post_json(
+            "/_shomei/api/auth/start",
+            json!({ "forward": true, "client_csr_pem": csr }),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let answer = signed_answer(&signer, &json_body(start).await, 3);
+    let issued = send(&router, post_json("/_shomei/api/auth/finish", answer)).await;
+    assert_eq!(issued.status(), StatusCode::OK);
+    let issued = json_body(issued).await;
+    let leaf =
+        CertificateDer::from_pem_slice(issued["certificate_pem"].as_str().unwrap().as_bytes())
+            .unwrap();
+    assert_eq!(crate::tls::client_grant(&leaf).unwrap().1, 0);
+
+    let connect = |addr: SocketAddr| {
+        hyper::Request::builder()
+            .method(Method::CONNECT)
+            .uri(Uri::builder().authority(addr.to_string()).build().unwrap())
+            .header(HOST, addr.to_string())
+            .header(PROXY_AUTHORIZATION, &authorization)
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+    assert_eq!(
+        client
+            .send_request(connect(plain_addr))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = client.send_request(connect(secure_addr)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let tunnel = TokioIo::new(hyper::upgrade::on(response).await.unwrap());
+    let inner = tls.connect(host, tunnel).await.unwrap();
+    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(inner))
+        .await
+        .unwrap();
+    let mut connected = tokio::spawn(conn);
+    let response = client
+        .send_request(
+            hyper::Request::get("/tls")
+                .header(HOST, "localhost")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "tunneled"
+    );
+    assert!(!connected.is_finished());
+    std::fs::write(identities_file, "[]").unwrap();
+    assert!(state.auth.reload().unwrap());
+    timeout(Duration::from_secs(2), &mut connected)
+        .await
+        .unwrap()
+        .unwrap()
+        .ok();
+    proxy.abort();
+    http_server.abort();
+    https_server.abort();
 }
 
 #[tokio::test]
@@ -495,6 +743,13 @@ async fn approves_one_deploy(u2f: bool) {
             .unwrap()
             .starts_with("-----BEGIN CERTIFICATE-----")
     );
+
+    let ambiguous = send(
+        &router,
+        post_json("/_shomei/api/auth/start", json!({ "forward": true })),
+    )
+    .await;
+    assert_eq!(ambiguous.status(), StatusCode::BAD_REQUEST);
 
     for (scope, expected) in [
         ("unknown", StatusCode::FORBIDDEN),

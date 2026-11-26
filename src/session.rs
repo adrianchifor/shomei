@@ -47,6 +47,15 @@ impl Sessions {
     }
 
     pub fn issue(&self, generation: u64) -> Result<(HeaderValue, u64)> {
+        let (token, expires) = self.issue_token(generation)?;
+        let cookie = format!(
+            "{COOKIE_NAME}={token}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
+            self.ttl
+        );
+        Ok((HeaderValue::from_str(&cookie)?, expires))
+    }
+
+    pub fn issue_token(&self, generation: u64) -> Result<(String, u64)> {
         let expires = self.now() + self.ttl;
         let sequence = self
             .sequence
@@ -73,12 +82,7 @@ impl Sessions {
         raw[NONCE_LEN + PAYLOAD_LEN..].copy_from_slice(tag.as_ref());
         let mut token = [0; TOKEN_LEN];
         URL_SAFE_NO_PAD.encode_slice(raw, &mut token)?;
-        let token = std::str::from_utf8(&token)?;
-        let cookie = format!(
-            "{COOKIE_NAME}={token}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
-            self.ttl
-        );
-        Ok((HeaderValue::from_str(&cookie)?, expires))
+        Ok((String::from_utf8(token.to_vec())?, expires))
     }
 
     pub fn verify(&self, headers: &HeaderMap, generation: u64) -> bool {
@@ -91,12 +95,13 @@ impl Sessions {
         let Some(token) = tokens.next() else {
             return false;
         };
-        tokens.next().is_none()
-            && self
-                .claims(token)
-                .is_some_and(|(expires, issued_generation)| {
-                    issued_generation == generation && self.now() < expires
-                })
+        tokens.next().is_none() && self.remaining(token, generation).is_some()
+    }
+
+    pub fn remaining(&self, token: &str, generation: u64) -> Option<u64> {
+        let (expires, issued_generation) = self.claims(token)?;
+        let remaining = expires.saturating_sub(self.now());
+        (issued_generation == generation && remaining != 0).then_some(remaining)
     }
 
     fn claims(&self, token: &str) -> Option<(u64, u64)> {

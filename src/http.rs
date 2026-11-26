@@ -54,7 +54,7 @@ const PREFIX: &str = "/_shomei";
 const NO_STORE: HeaderValue = HeaderValue::from_static("private, no-store");
 
 pub struct App {
-    auth: Arc<Auth>,
+    pub(crate) auth: Arc<Auth>,
     origin: String,
     host: HeaderValue,
     sessions: Sessions,
@@ -77,6 +77,8 @@ struct TcpAccess {
 struct ForwardAccess {
     gateway: Arc<crate::forward::Gateway>,
     endpoint: String,
+    http_sessions: Vec<Sessions>,
+    http_ttl: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -100,10 +102,9 @@ pub fn app(
     config: Config,
     issuer: Option<Issuer>,
     forward: Option<Arc<crate::forward::Gateway>>,
-) -> Result<(Router, Arc<Auth>)> {
+) -> Result<(Router, Arc<App>)> {
     let state = state(config, issuer, forward)?;
-    let auth = state.auth.clone();
-    Ok((routes(state), auth))
+    Ok((routes(state.clone()), state))
 }
 
 fn state(
@@ -169,16 +170,32 @@ fn state_with_auth(
         upstream,
         browser_action: config.browser_action,
         tcp,
-        forward: forward.map(|gateway| ForwardAccess {
-            endpoint: format!(
-                "{hostname}:{}",
-                gateway
-                    .config
-                    .public_port
-                    .unwrap_or(gateway.config.bind.port())
-            ),
-            gateway,
-        }),
+        forward: forward
+            .map(|gateway| -> Result<_> {
+                let http_sessions = if gateway.config.http_bind.is_some() {
+                    gateway
+                        .config
+                        .scopes
+                        .keys()
+                        .map(|_| Sessions::new(config.session_ttl_seconds))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                };
+                Ok(ForwardAccess {
+                    endpoint: format!(
+                        "{hostname}:{}",
+                        gateway
+                            .config
+                            .public_port
+                            .unwrap_or(gateway.config.bind.port())
+                    ),
+                    gateway,
+                    http_sessions,
+                    http_ttl: config.session_ttl_seconds,
+                })
+            })
+            .transpose()?,
         tailscale: config
             .tailscale_ssh
             .map(|tailscale| TailscaleSsh::new(tailscale, config.limits.auth_workers))
@@ -380,6 +397,8 @@ async fn auth_work<T: Send + 'static>(
 struct LoginStart {
     client_csr_pem: Option<String>,
     tcp_target: Option<String>,
+    #[serde(default)]
+    forward: bool,
     forward_scope: Option<String>,
 }
 
@@ -391,28 +410,43 @@ async fn login_start(
     auth_work(app, move |app| {
         let peer = peer.challenge_key();
         app.auth.check_challenge_capacity(peer)?;
-        if let Some(scope) = body.forward_scope {
+        if body.forward || body.forward_scope.is_some() {
             let forward = app.forward.as_ref().ok_or(ApiError(
                 StatusCode::BAD_REQUEST,
                 "forward proxy is disabled",
             ))?;
-            let scope = forward.gateway.scope_id(&scope).ok_or(ApiError(
-                StatusCode::FORBIDDEN,
-                "forward proxy scope is not configured",
-            ))?;
-            let csr = body
-                .client_csr_pem
-                .as_deref()
-                .filter(|_| body.tcp_target.is_none())
-                .ok_or(ApiError(
+            let scope = match body.forward_scope {
+                Some(scope) => forward.gateway.scope_id(&scope).ok_or(ApiError(
+                    StatusCode::FORBIDDEN,
+                    "forward proxy scope is not configured",
+                ))?,
+                None if forward.gateway.config.scopes.len() == 1 => 0,
+                None => {
+                    return Err(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "multiple forward scopes configured, specify --scope",
+                    ));
+                }
+            };
+            if body.tcp_target.is_some() {
+                return Err(ApiError(
                     StatusCode::BAD_REQUEST,
-                    "forward scope requires a client CSR and no TCP target",
-                ))?;
-            let key = csr_key(csr)
-                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid P-256 client CSR"))?;
-            return Ok(Json(
-                app.auth.start_login(Grant::Forward { key, scope }, peer)?,
-            ));
+                    "forward scope cannot include a TCP target",
+                ));
+            }
+            let grant = if let Some(csr) = body.client_csr_pem {
+                let key = csr_key(&csr)
+                    .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid P-256 client CSR"))?;
+                Grant::Forward { key, scope }
+            } else if forward.http_sessions.get(scope).is_some() {
+                Grant::ForwardHttp { scope }
+            } else {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "HTTP forward proxy is disabled",
+                ));
+            };
+            return Ok(Json(app.auth.start_login(grant, peer)?));
         }
         let grant =
             match body.client_csr_pem {
@@ -508,6 +542,28 @@ async fn login_finish(
                     "certificate_pem": certificate.certificate_pem,
                     "expires_at": certificate.expires_at,
                     "forward_endpoint": forward.endpoint,
+                }))
+                .into_response())
+            }
+            Grant::ForwardHttp { scope } => {
+                let forward = app
+                    .forward
+                    .as_ref()
+                    .ok_or_else(|| ApiError::internal("missing forward proxy"))?;
+                let name = forward
+                    .gateway
+                    .scope_name(scope)
+                    .ok_or_else(|| ApiError::internal("missing forward scope"))?;
+                let sessions = forward
+                    .http_sessions
+                    .get(scope)
+                    .ok_or_else(|| ApiError::internal("missing forward sessions"))?;
+                let (token, expires_at) = sessions
+                    .issue_token(generation)
+                    .map_err(ApiError::internal)?;
+                Ok(Json(serde_json::json!({
+                    "proxy_session": format!("{name}.{token}"),
+                    "expires_at": expires_at,
                 }))
                 .into_response())
             }
@@ -615,17 +671,80 @@ fn signed_header(
     for value in entries.iter().filter_map(|value| value.to_str().ok()) {
         let (scheme, token) = value.split_once(' ').unwrap_or((value, ""));
         if scheme.eq_ignore_ascii_case("shomei") {
-            let invalid = || ApiError(StatusCode::UNAUTHORIZED, "invalid Shomei authorization");
-            if entries.iter().count() != 1 || token.is_empty() || token.len() > 8192 {
-                return Err(invalid());
+            if entries.iter().count() != 1 {
+                return Err(ApiError(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid Shomei authorization",
+                ));
             }
-            let body = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
-            return serde_json::from_slice(&body)
-                .map(Some)
-                .map_err(|_| invalid());
+            return decode_assertion(token).map(Some);
         }
     }
     Ok(None)
+}
+
+fn decode_assertion(token: &str) -> Result<SignedChallenge<PublicKeyCredential>, ApiError> {
+    let invalid = || ApiError(StatusCode::UNAUTHORIZED, "invalid Shomei authorization");
+    if token.is_empty() || token.len() > 8192 {
+        return Err(invalid());
+    }
+    let body = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
+    serde_json::from_slice(&body).map_err(|_| invalid())
+}
+
+pub(crate) async fn approve_forward_http(
+    app: Arc<App>,
+    headers: &HeaderMap,
+) -> Result<(usize, u64, Duration), StatusCode> {
+    let required = StatusCode::PROXY_AUTHENTICATION_REQUIRED;
+    let mut values = headers.get_all(PROXY_AUTHORIZATION).iter();
+    let (scheme, token) = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .ok_or(required)?;
+    if values.next().is_some() {
+        return Err(required);
+    }
+    let forward = app.forward.as_ref().ok_or(required)?;
+    if scheme.eq_ignore_ascii_case("shomei-session") {
+        let (name, token) = token.split_once('.').ok_or(required)?;
+        let scope = forward.gateway.scope_id(name).ok_or(required)?;
+        let generation = app.auth.generation();
+        let remaining = forward
+            .http_sessions
+            .get(scope)
+            .and_then(|sessions| sessions.remaining(token, generation))
+            .ok_or(required)?;
+        return Ok((scope, generation, Duration::from_secs(remaining)));
+    }
+    if !scheme.eq_ignore_ascii_case("shomei") {
+        return Err(required);
+    }
+    let signed = decode_assertion(token).map_err(|_| required)?;
+    auth_work(app, move |app| {
+        let (grant, generation) = app.auth.finish_login(signed)?;
+        let Grant::ForwardHttp { scope } = grant else {
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "HTTP forward approval required",
+            ));
+        };
+        check_generation(app, generation)?;
+        let forward = app
+            .forward
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("missing forward proxy"))?;
+        Ok((scope, generation, Duration::from_secs(forward.http_ttl)))
+    })
+    .await
+    .map_err(|error| {
+        if error.0 == StatusCode::UNAUTHORIZED {
+            required
+        } else {
+            error.0
+        }
+    })
 }
 
 async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response {
@@ -797,6 +916,7 @@ pub(crate) fn strip_hop_headers(headers: &mut HeaderMap) -> Result<(), ()> {
         HeaderName::from_static("proxy-connection"),
         PROXY_AUTHENTICATE,
         PROXY_AUTHORIZATION,
+        HeaderName::from_static("proxy-authentication-info"),
         TE,
         TRAILER,
         TRANSFER_ENCODING,

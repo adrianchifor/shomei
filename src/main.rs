@@ -59,11 +59,21 @@ async fn main() -> Result<()> {
             Ok((listener, gateway, tls))
         })
         .transpose()?;
-    let (app, auth) = http::app(
+    let http_forward = forward
+        .as_ref()
+        .and_then(|(_, gateway, _)| {
+            gateway.config.http_bind.map(|bind| -> Result<_> {
+                let listener = listen(bind).context("bind HTTP forward proxy listener")?;
+                Ok((listener, gateway.clone(), identity.http1_server()?))
+            })
+        })
+        .transpose()?;
+    let (app, state) = http::app(
         config,
         issuer,
         forward.as_ref().map(|(_, gateway, _)| gateway.clone()),
     )?;
+    let auth = state.auth.clone();
     let mut terminate = signal(SignalKind::terminate())?;
     let https = listen(https_bind).context("bind HTTPS listener")?;
     let generation = auth.subscribe_generation();
@@ -73,10 +83,12 @@ async fn main() -> Result<()> {
     if let Some((listener, _, _)) = &tcp {
         eprintln!("mTLS listening on {}", listener.local_addr()?);
     }
-
     if let Some((listener, _, _)) = &forward {
+        eprintln!("TCP forward proxy listening on {}", listener.local_addr()?);
+    }
+    if let Some((listener, _, _)) = &http_forward {
         eprintln!(
-            "HTTPS forward proxy listening on {}",
+            "HTTP forward proxy listening with TLS on {}",
             listener.local_addr()?
         );
     }
@@ -92,6 +104,11 @@ async fn main() -> Result<()> {
             let Some((listener, gateway, tls)) = forward else { return future::pending().await };
             let handshakes = Arc::new(Semaphore::new(handshakes));
             serve(listener, tcp_max, move |socket, _| forward::serve(socket, tls.clone(), gateway.clone(), handshakes.clone(), forward_generation.clone())).await
+        } => result?,
+        result = async {
+            let Some((listener, gateway, tls)) = http_forward else { return future::pending().await };
+            let handshakes = Arc::new(Semaphore::new(handshakes));
+            serve(listener, https_max, move |socket, _| forward::serve_http(socket, tls.clone(), gateway.clone(), handshakes.clone(), state.clone())).await
         } => result?,
         result = tokio::signal::ctrl_c() => result?,
         _ = terminate.recv() => {},
