@@ -109,8 +109,8 @@ pub(super) async fn run(mut args: SshArgs) -> Result<()> {
 
 async fn open_tailscale(args: &SshArgs, host: &str) -> Result<ExitStatus> {
     ensure!(
-        crate::config::is_magic_dns_name(host),
-        "expected a full MagicDNS SSH hostname"
+        crate::config::is_tailscale_target(host),
+        "expected a MagicDNS hostname or Tailscale IP"
     );
     let origin = https_origin(args.proxy.as_str())?;
     let roots = trust_roots(&origin, args.ca_file.as_deref())?;

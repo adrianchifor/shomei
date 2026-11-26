@@ -80,7 +80,7 @@ pub struct TcpConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TailscaleSshConfig {
-    pub target: String,
+    pub target: Option<String>,
     pub posture_attribute: String,
     pub oauth_client_id: String,
     pub oauth_client_secret_file: PathBuf,
@@ -190,8 +190,8 @@ impl Config {
                 "Tailscale SSH requires HTTPS to bind directly to a Tailscale IP"
             );
             ensure!(
-                is_magic_dns_name(&tailscale.target),
-                "Tailscale SSH target must be a full MagicDNS hostname"
+                tailscale.target.as_deref().is_none_or(is_tailscale_target),
+                "invalid Tailscale SSH target"
             );
             ensure!(
                 tailscale.posture_attribute.len() <= 128
@@ -286,6 +286,22 @@ pub fn is_magic_dns_name(host: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
+}
+
+pub fn is_tailscale_target(host: &str) -> bool {
+    if let Ok(ip) = host.parse() {
+        return is_tailnet_ip(ip);
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.contains('.') {
+        return is_magic_dns_name(&name.to_ascii_lowercase());
+    }
+    (1..=63).contains(&name.len())
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 pub fn validate_origin(origin: &Url) -> Result<()> {

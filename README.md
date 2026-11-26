@@ -122,7 +122,7 @@ For an in-memory certificate, omit `--credentials` with `connect` or use `ssh --
 
 ## Tailscale SSH
 
-Shomei verifies a YubiKey and grants the calling device a short access window to a fixed target. OpenSSH connects directly from that device, so Tailscale evaluates the caller’s posture and SSH re-authentication. This mode requires Tailscale Premium or Enterprise. [Setup and policy example](AGENTS.md#approve-direct-tailscale-ssh)
+Shomei verifies a YubiKey, sets a temporary posture attribute on the calling device, and starts OpenSSH to the requested host. Tailscale's policy controls which hosts the device can reach during that window and applies its SSH re-authentication rules. This mode requires Tailscale Premium or Enterprise. [Setup and policy example](AGENTS.md#approve-direct-tailscale-ssh)
 
 ```sh
 shomei ssh --tailscale --proxy https://shomei.example.ts.net:8443 ubuntu@deploy.example.ts.net

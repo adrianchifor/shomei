@@ -455,12 +455,12 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         allow_yubikey_4: false,
         http_upstream: None,
         protected_paths: None,
-        browser_action: None,
         session_ttl_seconds: 60,
         tcp: None,
         forward: None,
+        browser_action: None,
         tailscale_ssh: Some(TailscaleSshConfig {
-            target: TARGET.into(),
+            target: None,
             posture_attribute: "custom:shomei_ssh".into(),
             oauth_client_id: "test-client".into(),
             oauth_client_secret_file: secret,
@@ -504,14 +504,14 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        send_as(START, json!({ "target": "other.example.ts.net" }), LOCAL)
+        send_as(START, json!({ "target": "other.example.org" }), LOCAL)
             .await
             .status(),
         StatusCode::FORBIDDEN
     );
 
     assert_eq!(
-        send_as(START, json!({ "target": TARGET }), OTHER)
+        send_as(START, json!({ "target": "other.example.ts.net" }), OTHER)
             .await
             .status(),
         StatusCode::OK

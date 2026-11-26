@@ -152,40 +152,39 @@ Create a Tailscale OAuth client with the `devices:posture_attributes` write scop
 
 ```toml
 [tailscale_ssh]
-target = "deploy.example.ts.net"
-posture_attribute = "custom:shomei_ssh_deploy"
+posture_attribute = "custom:shomei_ssh"
 oauth_client_id = "your-oauth-client-id"
 oauth_client_secret_file = "/etc/shomei/tailscale-oauth-secret"
 socket = "/var/run/tailscale/tailscaled.sock"
 ttl_seconds = 300
 ```
 
-Enable Tailscale SSH on `deploy`. In the tailnet policy, allow your users to reach the approval endpoint and require the approval attribute on every grant that gives them TCP port 22 on `deploy`. Include your existing device checks in the same posture definition as the approval assertion. Entries in `srcPosture` are alternatives. Keep the SSH `check` rule for the caller’s existing login and re-authentication policy. [Tailscale posture rules](https://tailscale.com/docs/features/device-posture/postures-in-access-rules) · [Tailscale SSH policy](https://tailscale.com/docs/reference/syntax/policy-file#tailscale-ssh)
+Enable Tailscale SSH on the target devices. Allow users to reach the approval endpoint and require the approval attribute on grants for TCP port 22. Include your existing device checks in the same posture definition as the approval assertion. Entries in `srcPosture` are alternatives. Keep the SSH `check` rule for login and re-authentication. [Tailscale posture rules](https://tailscale.com/docs/features/device-posture/postures-in-access-rules) · [Tailscale SSH policy](https://tailscale.com/docs/reference/syntax/policy-file#tailscale-ssh)
 
-Choose your caller group and destination tags in the tailnet policy. Replace the example `group:ops`, `tag:shomei`, and `tag:deploy` with your own selectors for the callers, gateway, and configured target. Scope the target selector to that device. Match the custom attribute to `posture_attribute` and replace the auto-update check with your existing posture assertions.
+Choose the caller group and destination tags in tailnet policy. Replace `group:ops`, `tag:shomei`, and `tag:ssh` with your selectors. Match the custom attribute to `posture_attribute` and replace the auto-update check with your existing posture assertions.
 
 ```json
 {
   "postures": {
-    "posture:approvedDeploy": ["node:tsAutoUpdate == true", "custom:shomei_ssh_deploy == true"]
+    "posture:shomeiApproved": ["node:tsAutoUpdate == true", "custom:shomei_ssh == true"]
   },
   "grants": [
     { "src": ["group:ops"], "dst": ["tag:shomei"], "ip": ["tcp:8443"] },
-    { "src": ["group:ops"], "dst": ["tag:deploy"], "ip": ["tcp:22"], "srcPosture": ["posture:approvedDeploy"] }
+    { "src": ["group:ops"], "dst": ["tag:ssh"], "ip": ["tcp:22"], "srcPosture": ["posture:shomeiApproved"] }
   ],
   "ssh": [
-    { "action": "check", "src": ["group:ops"], "dst": ["tag:deploy"], "users": ["ubuntu"], "checkPeriod": "always" }
+    { "action": "check", "src": ["group:ops"], "dst": ["tag:ssh"], "users": ["ubuntu"], "checkPeriod": "always" }
   ]
 }
 ```
 
-From the caller’s Tailscale device, use the configured target’s full MagicDNS name. Verify its SSH host key through your usual trusted channel.
+From the caller's Tailscale device, pass the destination as the SSH host. Shomei accepts MagicDNS names and tailnet IPs. Omit `tailscale_ssh.target` to defer destination selection to tailnet policy. Verify the SSH host key through your usual trusted channel.
 
 ```sh
 shomei ssh --tailscale --proxy https://shomei.example.ts.net:8443 ubuntu@deploy.example.ts.net
 ```
 
-After a successful YubiKey approval, Shomei sets the device’s attribute to expire in `ttl_seconds` (default 300, range 1–3600). Each fresh approval starts a new window. Tailscale removes the attribute automatically at expiry. Removing a YubiKey from the Shomei allowlist blocks new approvals. To revoke an approval early, remove the device’s approval attribute in Tailscale. [Tailscale attribute expiry](https://tailscale.com/docs/features/tailscale-accessbot-jit#set-custom-posture-attributes-by-using-the-api)
+After a successful YubiKey approval, Shomei sets the calling device's attribute for `ttl_seconds` (default 300, range 1–3600) and starts OpenSSH directly to the requested destination. The approval applies to all matching tailnet grants during that window. Removing a YubiKey from the Shomei allowlist blocks new approvals. To revoke an approval early, remove the device's attribute in Tailscale. [Tailscale attribute expiry](https://tailscale.com/docs/features/tailscale-accessbot-jit#set-custom-posture-attributes-by-using-the-api)
 
 ## Verify the integration
 

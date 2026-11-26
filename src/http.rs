@@ -586,7 +586,12 @@ async fn tailscale_start(
     Json(body): Json<TailscaleStart>,
 ) -> Result<impl IntoResponse, ApiError> {
     let tailscale = app.tailscale.as_ref().ok_or(TAILSCALE_DISABLED)?;
-    if !tailscale.target.eq_ignore_ascii_case(&body.target) {
+    if !crate::config::is_tailscale_target(&body.target)
+        || tailscale
+            .target
+            .as_ref()
+            .is_some_and(|target| !target.eq_ignore_ascii_case(&body.target))
+    {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
             "Tailscale SSH target is not allowed",

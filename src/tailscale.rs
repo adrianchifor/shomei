@@ -29,7 +29,7 @@ const RESPONSE_LIMIT: usize = 32 * 1024;
 const SCOPE: &str = "devices:posture_attributes";
 
 pub struct TailscaleSsh {
-    pub target: String,
+    pub target: Option<String>,
     pub requests: Semaphore,
     posture_attribute: String,
     ttl_seconds: u64,

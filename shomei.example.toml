@@ -48,6 +48,7 @@ cert_ttl_seconds = 300
 
 # Use the gateway's MagicDNS origin and TLS certificate, and bind https_bind to its Tailscale IP.
 # [tailscale_ssh]
+# Optional fixed SSH destination. Omit to let tailnet policy select the permitted hosts.
 # target = "deploy.example.ts.net"
 # posture_attribute = "custom:shomei_ssh_deploy"
 # oauth_client_id = "your-oauth-client-id"
