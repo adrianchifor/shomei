@@ -707,6 +707,7 @@ struct LoginStart {
     forward: bool,
     forward_scope: Option<String>,
     http_destination: Option<url::Url>,
+    http_method: Option<String>,
     tcp_destination: Option<String>,
     browser_login: Option<BrowserQuery>,
     browser_approval: Option<approval::Start>,
@@ -789,13 +790,39 @@ async fn login_start(
                 StatusCode::BAD_REQUEST,
                 "invalid HTTP destination",
             ))?;
+            let bound = body
+                .http_method
+                .take()
+                .map(|method| {
+                    let method = method.parse::<Method>().ok()?;
+                    let target = url[url::Position::BeforePath..url::Position::AfterQuery]
+                        .parse()
+                        .ok()?;
+                    (method != Method::CONNECT).then_some((method, target))
+                })
+                .map(|bound| bound.ok_or(ApiError(StatusCode::BAD_REQUEST, "invalid HTTP method")))
+                .transpose()?;
             if app.upstreams.contains_key(&host) || app.allow_unlisted_host {
                 let host = if app.upstreams.contains_key(&host) {
                     host
                 } else {
                     app.canonical.clone()
                 };
-                return Ok(Json(app.auth.start_login(Grant::HttpHost(host), peer)?));
+                let grant = match bound {
+                    Some((method, target)) => Grant::HttpRequest {
+                        host,
+                        method,
+                        target,
+                    },
+                    None => Grant::HttpHost(host),
+                };
+                return Ok(Json(app.auth.start_login(grant, peer)?));
+            }
+            if bound.is_some() {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "a method can only bind a reverse HTTP request",
+                ));
             }
             if app.hostnames.contains(&host.host) {
                 return Err(ApiError(
@@ -804,6 +831,12 @@ async fn login_start(
                 ));
             }
             body.forward = true;
+        }
+        if body.http_method.is_some() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "a method requires an HTTP destination",
+            ));
         }
         if let Some(target) = body.tcp_destination.take() {
             let endpoint = Endpoint::parse(&target, None)
@@ -948,7 +981,7 @@ async fn login_finish(
                 )
                     .into_response())
             }
-            Grant::HttpHost(_) => Err(ApiError(
+            Grant::HttpHost(_) | Grant::HttpRequest { .. } => Err(ApiError(
                 StatusCode::BAD_REQUEST,
                 "use the assertion on the selected reverse HTTP upstream",
             )),
@@ -1305,28 +1338,39 @@ async fn reverse(
     };
     let session = if let Some(signed) = signed {
         let approved_host = host.clone();
+        let sent = (
+            request.method().clone(),
+            request.uri().path_and_query().cloned(),
+        );
         let result = auth_work(app.clone(), move |app| {
             let (grant, generation) = app.auth.finish_login(signed)?;
+            // An assertion bound to one request buys neither another request
+            // nor a session.
             let accepted = match grant {
-                Grant::Http => approved_host == app.canonical,
-                Grant::HttpHost(host) => host == approved_host,
-                _ => false,
+                Grant::Http => (approved_host == app.canonical).then_some(false),
+                Grant::HttpHost(host) => (host == approved_host).then_some(false),
+                Grant::HttpRequest {
+                    host,
+                    method,
+                    target,
+                } => (host == approved_host && (method, Some(target)) == sent).then_some(true),
+                _ => None,
             };
-            if !accepted {
-                return Err(ApiError(
-                    StatusCode::UNAUTHORIZED,
-                    "HTTP authorization required",
-                ));
-            }
-            Ok(generation)
+            let bound = accepted.ok_or(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "HTTP authorization required",
+            ))?;
+            Ok((generation, bound))
         })
         .await;
         match result {
-            Ok(generation) => {
+            Ok((generation, bound)) => {
                 if let Err(error) = check_generation(&app, generation) {
                     return error.into_response();
                 }
-                let cookie = if let Some(policy) = approval_policy {
+                let cookie = if bound {
+                    Ok(None)
+                } else if let Some(policy) = approval_policy {
                     approval::issue_cookie(&app, &request, policy, generation)
                 } else {
                     upstream

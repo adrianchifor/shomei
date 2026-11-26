@@ -126,6 +126,12 @@ enum Login {
 pub enum Grant {
     Http,
     HttpHost(crate::config::Endpoint),
+    /// One reverse HTTP request with this method, path and query.
+    HttpRequest {
+        host: crate::config::Endpoint,
+        method: axum::http::Method,
+        target: axum::http::uri::PathAndQuery,
+    },
     BrowserLogin {
         host: crate::config::Endpoint,
         next: String,

@@ -414,6 +414,44 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
         send(&router, deploy()).await.status(),
         StatusCode::UNAUTHORIZED
     );
+
+    let mut counter = 1;
+    let mut signed_for = async |start: Value, sent: Method, path: &str| {
+        let start = send(&router, post_json("/_shomei/api/auth/start", start)).await;
+        assert_eq!(start.status(), StatusCode::OK);
+        counter += 1;
+        let signed = signed_answer(&signer, &json_body(start).await, counter);
+        let approval = format!("Shomei {}", URL_SAFE_NO_PAD.encode(signed.to_string()));
+        let request = request(path).method(sent).header(AUTHORIZATION, approval);
+        send(&router, request.body(Body::empty()).unwrap()).await
+    };
+    let deploy = "https://localhost:8443/api/deploy?env=prod";
+    let bound = |url: &str, method: &str| json!({ "http_destination": url, "http_method": method });
+    for (sent, path) in [
+        (Method::POST, "/api/deploy?env=staging"),
+        (Method::POST, "/api/deploy"),
+        (Method::POST, "/"),
+        (Method::DELETE, "/api/deploy?env=prod"),
+    ] {
+        let refused = signed_for(bound(deploy, "POST"), sent, path).await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+    let exact = signed_for(bound(deploy, "POST"), Method::POST, "/api/deploy?env=prod").await;
+    assert_eq!(exact.status(), StatusCode::OK);
+    let home = "https://localhost:8443/";
+    let site = signed_for(json!({ "http_destination": home }), Method::GET, "/").await;
+    assert!(site.headers().contains_key(SET_COOKIE));
+    let exact = signed_for(bound(home, "GET"), Method::GET, "/").await;
+    assert_eq!(exact.status(), StatusCode::OK);
+    assert!(!exact.headers().contains_key(SET_COOKIE));
+    for invalid in [
+        json!({ "http_method": "POST" }),
+        json!({ "http_destination": "https://localhost:8443/", "http_method": "CONNECT" }),
+        json!({ "http_destination": "https://localhost:8443/", "http_method": "no method" }),
+    ] {
+        let start = send(&router, post_json("/_shomei/api/auth/start", invalid)).await;
+        assert_eq!(start.status(), StatusCode::BAD_REQUEST);
+    }
     server.abort();
 }
 

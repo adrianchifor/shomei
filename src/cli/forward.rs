@@ -112,6 +112,7 @@ impl Credentials {
                         "client_csr_pem": csr,
                         "forward_scope": scope,
                     }),
+                    &format!("a TCP certificate for {target}, or for its whole forward scope"),
                 )
                 .await?
         } else {
