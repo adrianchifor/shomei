@@ -14,7 +14,7 @@ All enrolled keys authenticate as `shomei`. The default policy requires a suppor
 
 ## Quickstart
 
-Start a local deploy API behind Shomei and approve a deploy with your YubiKey. Run the commands in an empty directory with Docker Compose installed. The bundled TLS key is public and for loopback demos only. Use `init --u2f` for a YubiKey 4. Once Compose is up, you can also approve a deploy from a browser that trusts `fixtures/localhost/ca.pem`. [Open Deploy service](https://localhost:8443/_shomei/action)
+Start a local deploy app behind Shomei and approve a deploy with your YubiKey. Run the commands in an empty directory with Docker Compose installed. The bundled TLS key is public and for loopback demos only. Use `init --u2f` for a YubiKey 4. Once Compose is up, you can also click Deploy in a browser that trusts `fixtures/localhost/ca.pem`. [Open the deploy demo](https://localhost:8443/)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh
@@ -67,7 +67,6 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 | `session_ttl_seconds` | HTTP session lifetime. Defaults to 600 seconds. |
 | `tcp.cert_ttl_seconds` | mTLS certificate lifetime. Defaults to 300 seconds. Active relays close at expiry. |
 | `protected_paths` | Require fresh approval for selected reverse-proxy paths and leave others public. |
-| `[browser_action]` | Exposes an approval page and requires a fresh assertion for HTTP writes. |
 | `[limits]` | Connection, request, and challenge limits. |
 
 Put one `shomei get-id` token per line in the identity file. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. All keys use the `shomei` account. Shomei decodes the compressed records in memory and verifies their hardware attestation. Existing JSON arrays also work. Use `shomei get-id --json` for JSON-based tooling. [Convert an existing allowlist](AGENTS.md#enroll-a-key)
@@ -78,7 +77,16 @@ To protect only selected paths and leave the rest public, route those paths thro
 
 ### Protect selected endpoints
 
-Set `protected_paths = ["/api/deploy"]` alongside `http_upstream`. Listed paths and their descendants require fresh approval. Other paths are public. Omit `protected_paths` to require authentication across the site.
+Set `protected_paths` alongside `http_upstream` to make the rest of the site public. Listed paths, descendants, and format suffixes such as `/api/deploy.json` require a fresh approval. Matching is case-insensitive. Ambiguous paths also require approval. Add any other paths that the application routes to the same handler.
+
+```toml
+http_upstream = "http://app:8080"
+protected_paths = ["/api/deploy"]
+```
+
+The app controls the action and its payload. A browser app can use the WebAuthn helper to attach an assertion to its request. CLI clients can run `shomei sign` and send the result in `Authorization: Shomei <assertion>`. [Deploy demo script](fixtures/deploy/deploy.js)
+
+Omit `protected_paths` to require authentication across the site. Unauthenticated HTML GETs open the login page, and unauthenticated API requests receive `401`. A valid session authorizes subsequent site requests.
 
 ### Share a gateway across services
 

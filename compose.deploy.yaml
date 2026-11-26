@@ -34,6 +34,8 @@ services:
     command: ["python", "-Bu", "/app/deploy.py"]
     volumes:
       - ./fixtures/deploy/deploy.py:/app/deploy.py:ro
+      - ./fixtures/deploy/index.html:/app/index.html:ro
+      - ./fixtures/deploy/deploy.js:/app/deploy.js:ro
     healthcheck:
       test: [CMD, python, -B, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/status', timeout=2).close()"]
       interval: 2s

@@ -44,7 +44,7 @@ use webauthn_rs::prelude::PublicKeyCredential;
 use crate::{
     accept_tls,
     auth::{ApiError, Auth, Grant, SignedChallenge},
-    config::{BrowserAction, Config, http_path_is_unambiguous, http_path_matches},
+    config::{Config, http_path_is_unambiguous, http_path_matches},
     session::{Sessions, session_value},
     tailscale::TailscaleSsh,
     tls::{Issuer, csr_key},
@@ -60,7 +60,6 @@ pub struct App {
     sessions: Sessions,
     upstream: Option<HttpUpstream>,
     protected_paths: Option<Vec<String>>,
-    browser_action: Option<BrowserAction>,
     tcp: Option<TcpAccess>,
     forward: Option<ForwardAccess>,
     tailscale: Option<TailscaleSsh>,
@@ -170,7 +169,6 @@ fn state_with_auth(
         sessions: Sessions::new(config.session_ttl_seconds)?,
         upstream,
         protected_paths: config.protected_paths,
-        browser_action: config.browser_action,
         tcp,
         forward: forward
             .map(|gateway| -> Result<_> {
@@ -210,8 +208,8 @@ fn state_with_auth(
 fn routes(state: Arc<App>) -> Router {
     let reserved = Router::new()
         .route("/login", get(page))
-        .route("/action", get(action_page))
         .route("/auth.js", get(script))
+        .route("/webauthn.js", get(webauthn_script))
         .route("/auth.css", get(styles))
         .route("/seal.png", get(seal))
         .route("/geist.woff2", get(font))
@@ -219,7 +217,6 @@ fn routes(state: Arc<App>) -> Router {
         .route("/api/auth/finish", post(login_finish))
         .route("/api/auth/tailscale/start", post(tailscale_start))
         .route("/api/auth/tailscale/finish", post(tailscale_finish))
-        .route("/api/action", get(action_details))
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), protect_auth));
@@ -336,22 +333,17 @@ async fn page() -> Html<&'static str> {
     Html(include_str!("../assets/auth.html"))
 }
 
-async fn action_page(State(app): State<Arc<App>>) -> Result<Html<&'static str>, StatusCode> {
-    app.browser_action.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Html(include_str!("../assets/action.html")))
-}
-
-async fn action_details(State(app): State<Arc<App>>) -> Result<Json<BrowserAction>, StatusCode> {
-    app.browser_action
-        .clone()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
-}
-
 async fn script() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../assets/auth.js"),
+    )
+}
+
+async fn webauthn_script() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../assets/webauthn.js"),
     )
 }
 
@@ -765,16 +757,10 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
         Ok(signed) => signed,
         Err(error) => return error.into_response(),
     };
-    let fresh_approval = match &app.protected_paths {
-        Some(paths) => path_needs_approval(request.uri().path(), paths),
-        None => {
-            app.browser_action.is_some()
-                && !matches!(
-                    *request.method(),
-                    Method::GET | Method::HEAD | Method::OPTIONS
-                )
-        }
-    };
+    let fresh_approval = app
+        .protected_paths
+        .as_ref()
+        .is_some_and(|paths| path_needs_approval(request.uri().path(), paths));
     if fresh_approval && signed.is_none() {
         let mut response = ApiError(
             StatusCode::UNAUTHORIZED,

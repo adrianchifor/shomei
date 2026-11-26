@@ -18,13 +18,13 @@ use crate::{
 };
 
 #[tokio::test]
-async fn approves_one_deploy_and_allows_only_reads_with_its_cookie() {
-    approves_one_deploy(false).await;
+async fn approves_one_request_and_issues_a_reusable_site_session() {
+    approves_one_request(false).await;
 }
 
 #[tokio::test]
 async fn attested_yubikey_4_approves_deploy_and_tcp_grants() {
-    approves_one_deploy(true).await;
+    approves_one_request(true).await;
 }
 
 #[tokio::test]
@@ -42,7 +42,6 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
         allow_yubikey_4: false,
         http_upstream: None,
         protected_paths: None,
-        browser_action: None,
         session_ttl_seconds: 60,
         tcp: None,
         forward: None,
@@ -290,7 +289,6 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
                 .unwrap(),
         ),
         protected_paths: Some(vec!["/api/deploy".into()]),
-        browser_action: None,
         session_ttl_seconds: 60,
         tcp: None,
         forward: None,
@@ -458,7 +456,6 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         session_ttl_seconds: 60,
         tcp: None,
         forward: None,
-        browser_action: None,
         tailscale_ssh: Some(TailscaleSshConfig {
             target: None,
             posture_attribute: "custom:shomei_ssh".into(),
@@ -583,7 +580,7 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
     local_server.abort();
 }
 
-async fn approves_one_deploy(u2f: bool) {
+async fn approves_one_request(u2f: bool) {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let identities_file = dir.path().join("identities.json");
@@ -601,10 +598,6 @@ async fn approves_one_deploy(u2f: bool) {
                 .unwrap(),
         ),
         protected_paths: None,
-        browser_action: Some(BrowserAction {
-            path: "/deploy".into(),
-            label: "Deploy service".into(),
-        }),
         session_ttl_seconds: 60,
         tcp: Some(TcpConfig {
             bind: "127.0.0.1:9443".parse().unwrap(),
@@ -717,21 +710,22 @@ async fn approves_one_deploy(u2f: bool) {
     assert!(html.contains("Tap your YubiKey to continue."));
     assert!(!html.contains("<button"));
 
+    let approval_script = send(
+        &router,
+        request("/_shomei/webauthn.js").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(approval_script.status(), StatusCode::OK);
+    assert_eq!(
+        approval_script.headers()[CONTENT_TYPE],
+        "text/javascript; charset=utf-8"
+    );
     let page = send(
         &router,
         request("/_shomei/action").body(Body::empty()).unwrap(),
     )
     .await;
-    assert_eq!(page.status(), StatusCode::OK);
-    let details = send(
-        &router,
-        request("/_shomei/api/action").body(Body::empty()).unwrap(),
-    )
-    .await;
-    assert_eq!(
-        json_body(details).await,
-        json!({"label": "Deploy service", "path": "/deploy"})
-    );
+    assert_eq!(page.status(), StatusCode::NOT_FOUND);
 
     let start = send(&router, post_json("/_shomei/api/auth/start", json!({}))).await;
     assert_eq!(start.status(), StatusCode::OK);
@@ -792,12 +786,12 @@ async fn approves_one_deploy(u2f: bool) {
     let cookie_only = send(
         &router,
         deploy()
-            .header(COOKIE, &cookie)
+            .header(COOKIE, format!("app=123; {cookie}"))
             .body(Body::empty())
             .unwrap(),
     )
     .await;
-    assert_eq!(cookie_only.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(cookie_only.status(), StatusCode::OK);
     let bad_framing = send(
         &router,
         request("/deploy")

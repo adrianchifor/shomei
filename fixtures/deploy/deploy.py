@@ -1,10 +1,21 @@
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Lock
+
+
+ASSETS = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/deploy.js": ("deploy.js", "text/javascript; charset=utf-8"),
+}
 
 
 class DeployAPI(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path in ASSETS:
+            name, content_type = ASSETS[self.path]
+            self.send_body(Path(__file__).with_name(name).read_bytes(), content_type)
+            return
         if self.path != "/status":
             self.send_error(404)
             return
@@ -22,9 +33,11 @@ class DeployAPI(BaseHTTPRequestHandler):
         self.reply({"revision": revision, "message": f"Demo service deployed. Revision {revision}."})
 
     def reply(self, value):
-        body = json.dumps(value).encode()
+        self.send_body(json.dumps(value).encode(), "application/json")
+
+    def send_body(self, body, content_type):
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

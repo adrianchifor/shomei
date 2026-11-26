@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use url::Url;
 
 #[derive(Deserialize)]
@@ -22,7 +22,6 @@ pub struct Config {
     pub allow_yubikey_4: bool,
     pub http_upstream: Option<Url>,
     pub protected_paths: Option<Vec<String>>,
-    pub browser_action: Option<BrowserAction>,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
     pub tcp: Option<TcpConfig>,
@@ -30,13 +29,6 @@ pub struct Config {
     pub tailscale_ssh: Option<TailscaleSshConfig>,
     #[serde(default)]
     pub limits: Limits,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserAction {
-    pub path: String,
-    pub label: String,
 }
 
 #[derive(Deserialize)]
@@ -130,27 +122,6 @@ impl Config {
             config.http_upstream.as_ref(),
             config.protected_paths.as_deref(),
         )?;
-        if let Some(action) = &config.browser_action {
-            ensure!(
-                config.http_upstream.is_some(),
-                "browser action requires an HTTP upstream"
-            );
-            ensure!(
-                action.path.starts_with('/')
-                    && !action.path.starts_with("/_shomei")
-                    && action.path.len() <= 1024
-                    && action.path.bytes().all(|byte| byte.is_ascii_alphanumeric()
-                        || matches!(byte, b'/' | b'.' | b'-' | b'_'))
-                    && action.path[1..]
-                        .split('/')
-                        .all(|segment| !matches!(segment, "" | "." | "..")),
-                "browser action requires an unambiguous upstream path"
-            );
-            ensure!(
-                !action.label.trim().is_empty() && action.label.len() <= 120,
-                "invalid browser action label"
-            );
-        }
         if let Some(tcp) = &config.tcp {
             let endpoint: axum::http::uri::Authority =
                 tcp.upstream.parse().context("parse TCP upstream")?;

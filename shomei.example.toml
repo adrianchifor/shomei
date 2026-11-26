@@ -11,12 +11,6 @@ session_ttl_seconds = 600
 # Require fresh approval for these paths and leave other paths public.
 # protected_paths = ["/api/deploy"]
 
-# With http_upstream above, this approves POST http://host.docker.internal:8080/api/deploy.
-# Enabling this requires fresh approval for HTTP writes.
-# [browser_action]
-# path = "/api/deploy"
-# label = "Deploy service"
-
 [tcp]
 bind = "0.0.0.0:9443"
 upstream = "host.docker.internal:9000"

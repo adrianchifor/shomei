@@ -79,14 +79,12 @@ Open the authentication page as a top-level navigation. Shomei sets `frame-ances
 Add `protected_paths` at the top level to leave the rest of the site public. Listed paths and descendants require a fresh assertion on every request. Matching is case-insensitive, and ambiguous paths also require approval. Include any application route aliases that reach the protected handler.
 
 ```toml
-[browser_action]
-path = "/api/deploy"
-label = "Deploy service"
+protected_paths = ["/api/deploy"]
 ```
 
-Link to `/_shomei/action` to open the built-in approval page. After a tap, it sends a signed `POST` to the configured path. This setting requires a fresh assertion for all HTTP writes through that gateway. Session cookies still authorize `GET`, `HEAD`, and `OPTIONS`.
+The app owns the button, request method, and payload. On the gateway origin, import `prepareApproval`, `signApproval`, and `authorizationHeader` from `/_shomei/webauthn.js`. Prepare the challenge, prompt for the YubiKey, then use the returned authorization header on the app request. [Deploy demo script](fixtures/deploy/deploy.js)
 
-For a custom same-origin WebAuthn UI, `POST {}` as JSON to `/_shomei/api/auth/start`. Pass the returned `publicKey` options to `navigator.credentials.get` after decoding the challenge and credential IDs. Serialize the result as WebAuthn JSON. Submit `{challenge_id, credential}` to `/_shomei/api/auth/finish` to create a session, or send that JSON as base64url without padding in `Authorization: Shomei <assertion>` on the intended upstream request. Each challenge can be used once. [Browser implementation](assets/auth.js)
+For a custom WebAuthn client, `POST {}` as JSON to `/_shomei/api/auth/start`. Pass the returned `publicKey` options to `navigator.credentials.get` after decoding the challenge and credential IDs. Serialize the result as WebAuthn JSON. Submit `{challenge_id, credential}` to `/_shomei/api/auth/finish` to create a session, or send that JSON as base64url without padding in `Authorization: Shomei <assertion>` on the intended upstream request. Each challenge can be used once. [WebAuthn helper](assets/webauthn.js)
 
 Agents can obtain a one-use assertion with `shomei sign`. The following example calls a read endpoint and saves the returned cookie for later requests to the same gateway.
 

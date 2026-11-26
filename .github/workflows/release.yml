@@ -151,6 +151,7 @@ jobs:
         run: |
           tar -czf dist/shomei-deploy-example.tar.gz \
             compose.deploy.yaml fixtures/deploy/shomei.toml fixtures/deploy/deploy.py \
+            fixtures/deploy/index.html fixtures/deploy/deploy.js \
             fixtures/localhost/ca.pem fixtures/localhost/localhost.pem fixtures/localhost/localhost-key.pem
           cd dist
           assets=(shomei-linux-amd64 shomei-linux-arm64 shomei-macos-arm64 shomei-deploy-example.tar.gz)
