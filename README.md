@@ -50,9 +50,7 @@ Stop the demo with `docker compose -f compose.ssh.yaml down`.
 
 ## Configure your own upstream
 
-Copy `shomei.example.toml` to `local/config/shomei.toml`, set your origin and upstreams, and create `local/state`. Keep upstream listeners private and start the gateway with `docker compose up -d`. To run without Docker, set the file paths for your host and run `shomei serve path/to/shomei.toml`. [Example configuration](shomei.example.toml)
-
-To run a gateway image built from your checkout, run `docker build -t shomei:local .` and set `SHOMEI_IMAGE=shomei:local` for Compose.
+Save the example configuration as `local/config/shomei.toml`, set your origin and upstreams, and create a writable `local/state`. Save the Compose file alongside `local/` and run `docker compose up -d` to start `ghcr.io/adrianchifor/shomei:latest`. Keep upstream listeners private. [Compose file](compose.yaml) · [Example configuration](shomei.example.toml)
 
 | Setting | Purpose |
 | --- | --- |
