@@ -4,7 +4,7 @@ use std::{
     convert::Infallible,
     future::Future,
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 
@@ -28,7 +28,10 @@ use tokio_rustls::TlsAcceptor;
 use crate::{
     accept_tls,
     config::{Endpoint, TcpConfig},
-    http::{App, approve_forward_http, relay_body, strip_hop_headers},
+    http::{
+        App, UPSTREAM_TIMEOUT, approve_forward_http, relay_body, response_head, strip_hop_headers,
+        upload_body,
+    },
     tls::{Issuer, client_grant},
 };
 
@@ -588,13 +591,12 @@ async fn proxy(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     tokio::spawn(approval.until_revoked(connection));
-    let mut response = timeout(
-        Duration::from_secs(30),
-        sender.send_request(request.map(|body| relay_body(Body::new(body), None))),
-    )
-    .await
-    .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
-    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let sent = Arc::new(AtomicU64::new(0));
+    let request = request.map(|body| upload_body(Body::new(body), sent.clone()));
+    let mut response = response_head(sender.send_request(request), &sent, UPSTREAM_TIMEOUT)
+        .await
+        .ok_or(StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         return Err(StatusCode::BAD_GATEWAY);
     }
