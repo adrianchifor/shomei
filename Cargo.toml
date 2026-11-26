@@ -45,5 +45,9 @@ zeroize = "=1.9.2"
 [dev-dependencies]
 tower = { version = "=0.5.3", features = ["util"] }
 
+[profile.release]
+codegen-units = 1
+strip = "symbols"
+
 [patch.crates-io]
 crypto-glue = { git = "https://github.com/kanidm/crypto-glue.git", rev = "a3c634ceca6bf338cc42d20d7c87d7bc771f8441" }
