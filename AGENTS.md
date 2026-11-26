@@ -4,10 +4,20 @@ Use Shomei for HTTP authentication, forward HTTP/TCP access, an SSH relay, or di
 
 ## Set up the gateway
 
-1. Use `ghcr.io/adrianchifor/shomei:latest` for the gateway on Linux amd64 or arm64. Set `SHOMEI_IMAGE` to pin a release tag or digest. Run `curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh` on the machine with the YubiKey. The installer checks the download against the release's `SHA256SUMS` and places the CLI at `~/.local/bin/shomei`. Use that path if `shomei` is outside `PATH`. On Linux the CLI requires `libudev.so.1`. Release binaries are built on Ubuntu 24.04. On a distribution with an older glibc, build from source with `cargo build --release`. [GitHub Packages](https://github.com/adrianchifor/shomei/pkgs/container/shomei) · [Binary releases](https://github.com/adrianchifor/shomei/releases)
-2. Pick the HTTPS origin clients will use, including any nondefault port. It must use a DNS name. Install a certificate and private key for that hostname. Use the same value for the config’s `origin` and the client’s `SHOMEI_PROXY`. For local TLS and sample stacks, follow the [quickstart](README.md#quickstart).
-3. Copy `shomei.example.toml` to `local/config/shomei.toml` and configure a reverse upstream, forward scope, or direct Tailscale SSH approval. For forward-only, keep the HTTPS authorization listener and remove the reverse upstream settings. Use absolute paths, because relative paths resolve against the gateway's working directory. On Linux, `host.docker.internal` is the Docker bridge address, so bind a host upstream to that address and not to `0.0.0.0`. [Example configuration](shomei.example.toml)
-4. On the gateway host, place the TLS files and the public allowlist from enrollment under `local/config`, and create `local/state`. Set `SHOMEI_UID` and `SHOMEI_GID` to a user that can read the config and write state. Run `docker compose up -d` after the files are in place. The supplied Compose file publishes listeners on loopback. For a native deployment, set the file paths and run `shomei serve path/to/shomei.toml`.
+1. Run the gateway from `ghcr.io/adrianchifor/shomei:latest` on Linux amd64 or arm64. Set `SHOMEI_IMAGE` to pin a release tag or digest. [GitHub Packages](https://github.com/adrianchifor/shomei/pkgs/container/shomei)
+2. Install the CLI on the machine with the YubiKey. [Binary releases](https://github.com/adrianchifor/shomei/releases)
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh
+   ```
+
+   The installer checks the download against the release's `SHA256SUMS` and places the CLI at `~/.local/bin/shomei`. Use that path if `shomei` is outside `PATH`. On Linux the CLI requires `libudev.so.1`. Release binaries are built on Ubuntu 24.04. On a distribution with an older glibc, build from source with `cargo build --release`.
+3. Pick the HTTPS origin clients will use, including any nondefault port. It must use a DNS name. Install a certificate and private key for that hostname. Use the same value for the config’s `origin` and the client’s `SHOMEI_PROXY`. For local TLS and sample stacks, follow the [quickstart](README.md#quickstart).
+4. Copy `shomei.example.toml` to `local/config/shomei.toml` and configure a reverse upstream, forward scope, or direct Tailscale SSH approval. [Example configuration](shomei.example.toml)
+   - For forward-only, keep the HTTPS authorization listener and remove the reverse upstream settings.
+   - Use absolute paths, because relative paths resolve against the gateway's working directory.
+   - On Linux, `host.docker.internal` is the Docker bridge address, so bind a host upstream to that address and not to `0.0.0.0`.
+5. On the gateway host, place the TLS files and the public allowlist from enrollment under `local/config`, and create `local/state`. Set `SHOMEI_UID` and `SHOMEI_GID` to a user that can read the config and write state. Run `docker compose up -d` after the files are in place. The supplied Compose file publishes listeners on loopback. For a native deployment, set the file paths and run `shomei serve path/to/shomei.toml`.
 
 ### Enroll a key
 
@@ -35,20 +45,7 @@ if [ ! -e local/config/identities ]; then
 fi
 ```
 
-Replace the file atomically to add or remove tokens. The gateway reloads it automatically. Removing or replacing a key revokes existing grants. For a JSON array allowlist, `shomei get-id --json` prints a compatible record.
-
-To migrate a legacy JSON allowlist to `identities`, set `old_allowlist` to its path and run this in Bash or Zsh with `jq` installed. Update `identities_file` in the gateway config if its path changed.
-
-```sh
-old_allowlist=local/config/identities.json
-(
-  set -o pipefail
-  jq -c 'if type == "array" then .[] else error("expected a JSON array") end' "$old_allowlist" |
-    while IFS= read -r identity; do
-      printf '%s\n' "$identity" | shomei get-id --identity-file /dev/stdin || exit 1
-    done > local/config/identities.next
-) && mv local/config/identities.next local/config/identities
-```
+Replace the file atomically to add or remove tokens. The gateway reloads it automatically. Removing or replacing a key revokes existing grants.
 
 ## Share a gateway across services
 
