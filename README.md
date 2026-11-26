@@ -7,74 +7,37 @@ Shomei (署名, Japanese for “signature”) is a Rust authentication proxy for
 
 All enrolled keys authenticate as `shomei`. The default policy requires a supported YubiKey 5 Series key with firmware 5.7.4 or later, PIN, and touch.
 
-## Install
+## Quickstart
 
-Release builds target Linux amd64 and arm64, and macOS arm64. Linux binaries require `libudev.so.1`. [Releases](https://github.com/adrianchifor/shomei/releases)
-
-To build from source, use Rust 1.95 or newer. On Debian or Ubuntu, install `pkg-config`, `libudev-dev`, and `libclang-dev`.
+Start a local deploy API behind Shomei and approve a deploy with your YubiKey. Run the commands in an empty directory with Docker Compose installed. The bundled TLS key is public and for loopback demos only. Use `init --u2f` for a YubiKey 4.
 
 ```sh
-cargo build --locked --release
-export PATH="$PWD/target/release:$PATH"
+curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh
+curl -fsSL https://github.com/adrianchifor/shomei/releases/latest/download/shomei-deploy-example.tar.gz | tar -xz
+
+shomei="$HOME/.local/bin/shomei"
+ca=fixtures/localhost/ca.pem
+deploy=https://localhost:8443/api/deploy
+mkdir -m 0755 -p local/config
+"$shomei" init
+"$shomei" get-id > local/config/identities.json
+chmod 0644 local/config/identities.json
+docker compose -f compose.deploy.yaml up --wait
+
+curl -si --cacert "$ca" -X POST "$deploy" # 401 Unauthorized
+approval="$("$shomei" sign --ca-file "$ca")" && curl -fsS --cacert "$ca" \
+  -H "Authorization: Shomei $approval" -X POST "$deploy"
+# Enter your PIN if prompted and touch your YubiKey. Expect HTTP 200 with the new deploy revision.
 ```
 
-## Local demos
+## SSH demo
 
-Use Docker Compose and a USB YubiKey. Run the commands from the repository root. Both demos use `https://localhost:8443`, so run one at a time.
-
-### Set up TLS and enroll a key
-
-Install `mkcert` to generate a trusted localhost certificate. [mkcert](https://github.com/FiloSottile/mkcert)
-
-```sh
-umask 077
-mkdir -p local/config local/deploy-state local/ssh-state "$HOME/.shomei"
-export CAROOT="$PWD/local/ca"
-export SHOMEI_PROXY=https://localhost:8443
-export SHOMEI_CA_FILE="$CAROOT/rootCA.pem"
-export SHOMEI_UID="$(id -u)" SHOMEI_GID="$(id -g)"
-mkcert -install
-mkcert -ecdsa -cert-file local/config/tls.pem -key-file local/config/tls-key.pem localhost
-install -m 0600 "$CAROOT/rootCA.pem" "$HOME/.shomei/localhost-ca.pem"
-
-shomei init
-if [ ! -e local/config/identities.json ]; then
-  shomei get-id > local/config/identities.next \
-    && mv local/config/identities.next local/config/identities.json
-fi
-```
-
-Add `--set-pin` to `shomei init` if your YubiKey 5 has no FIDO2 PIN. For a YubiKey 4, add `--u2f` instead. Both demos enable attested, touch-only U2F for localhost.
-
-The CLI stores the public identity in `~/.shomei/identity.json`. `shomei init` defaults to `https://localhost:8443`. For another gateway, set `SHOMEI_PROXY` or pass `--proxy` during enrollment. `shomei sign` can use the saved origin. `sign` and `ssh` use `~/.shomei/localhost-ca.pem` for localhost unless you specify a CA with `--ca-file` or `SHOMEI_CA_FILE`.
-
-Run `shomei clear` to delete the local identity after confirmation. Remove its entry from the gateway’s allowlist to revoke access.
-
-### Approve a deploy
-
-```sh
-docker compose -f compose.deploy.yaml up --build --wait
-```
-
-Select **Deploy service** and approve with your YubiKey. Each approval sends `POST /api/deploy` to the private demo API, which increments its revision. [Open the deploy page](https://localhost:8443/_shomei/action)
-
-The same API works from the CLI. Save the session cookie to read the revision later.
-
-```sh
-approval="$(shomei sign)" && curl --fail-with-body --cacert "$SHOMEI_CA_FILE" \
-  -c local/session.txt -H "Authorization: Shomei $approval" -X POST "$SHOMEI_PROXY/api/deploy"
-curl --fail-with-body --cacert "$SHOMEI_CA_FILE" -b local/session.txt "$SHOMEI_PROXY/status"
-docker compose -f compose.deploy.yaml down
-```
-
-### SSH into Ubuntu
-
-Use the public key that matches your OpenSSH identity.
+Run this demo in a repository checkout. Stop the deploy demo with `docker compose -f compose.deploy.yaml down`, then copy its `local/config/identities.json` into the checkout at the same path. Use the public key that matches your OpenSSH identity.
 
 ```sh
 sh fixtures/ssh/setup.sh "$HOME/.ssh/id_ed25519.pub"
-docker compose -f compose.ssh.yaml up --build --wait
-shomei ssh --proxy tls://localhost:9443 \
+docker compose -f compose.ssh.yaml up --wait
+"$HOME/.local/bin/shomei" ssh --proxy tls://localhost:9443 --ca-file fixtures/localhost/ca.pem \
   --ssh-arg=-o --ssh-arg="UserKnownHostsFile=$PWD/local/ssh/known_hosts" \
   --ssh-arg=-o --ssh-arg=StrictHostKeyChecking=yes ubuntu@deploy -- id -un
 ```
@@ -87,7 +50,9 @@ Stop the demo with `docker compose -f compose.ssh.yaml down`.
 
 ## Configure your own upstream
 
-Copy `shomei.example.toml` to `local/config/shomei.toml`, set your origin and upstreams, and create `local/state`. Keep upstream listeners private and start the gateway with `docker compose up --build`. To run without Docker, set the file paths for your host and run `shomei serve path/to/shomei.toml`. [Example configuration](shomei.example.toml)
+Copy `shomei.example.toml` to `local/config/shomei.toml`, set your origin and upstreams, and create `local/state`. Keep upstream listeners private and start the gateway with `docker compose up -d`. To run without Docker, set the file paths for your host and run `shomei serve path/to/shomei.toml`. [Example configuration](shomei.example.toml)
+
+To run a gateway image built from your checkout, run `docker build -t shomei:local .` and set `SHOMEI_IMAGE=shomei:local` for Compose.
 
 | Setting | Purpose |
 | --- | --- |

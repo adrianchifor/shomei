@@ -4,10 +4,10 @@ Use Shomei as the public entry point for an HTTP application, a fixed SSH upstre
 
 ## Set up the gateway
 
-1. Install a [release binary](https://github.com/adrianchifor/shomei/releases) or run `cargo build --locked --release` and add `target/release` to `PATH`. Use Rust 1.95 or newer. On Debian or Ubuntu, source builds need `pkg-config`, `libudev-dev`, and `libclang-dev`.
-2. Pick the HTTPS origin clients will use, including any nondefault port. It must use a DNS name. Install a certificate and private key for that hostname. Use the same value for the config’s `origin` and the client’s `SHOMEI_PROXY`. For local TLS and sample stacks, follow the [local demos](README.md#local-demos).
+1. Use `ghcr.io/adrianchifor/shomei:latest` for the gateway on Linux amd64 or arm64. Set `SHOMEI_IMAGE` to pin a release tag or digest. Run `curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh` on the machine with the YubiKey. The installer places the verified CLI at `~/.local/bin/shomei`. Use that path if `shomei` is outside `PATH`. On Linux the CLI requires `libudev.so.1`. [GitHub Packages](https://github.com/adrianchifor/shomei/pkgs/container/shomei) · [Binary releases](https://github.com/adrianchifor/shomei/releases)
+2. Pick the HTTPS origin clients will use, including any nondefault port. It must use a DNS name. Install a certificate and private key for that hostname. Use the same value for the config’s `origin` and the client’s `SHOMEI_PROXY`. For local TLS and sample stacks, follow the [quickstart](README.md#quickstart).
 3. Copy `shomei.example.toml` to `local/config/shomei.toml` and configure at least one upstream using the sections below. Use addresses the gateway can reach from its own network. For HTTP-only, remove `[tcp]`. For SSH-only, remove `http_upstream`. [Example configuration](shomei.example.toml)
-4. On the gateway host, place the TLS files and the public allowlist from enrollment under `local/config`, and create `local/state`. Set `SHOMEI_UID` and `SHOMEI_GID` to a user that can read the config and write state. Run `docker compose up --build` after the files are in place. The supplied Compose file publishes listeners on loopback. For a native deployment, set the file paths and run `shomei serve path/to/shomei.toml`.
+4. On the gateway host, place the TLS files and the public allowlist from enrollment under `local/config`, and create `local/state`. Set `SHOMEI_UID` and `SHOMEI_GID` to a user that can read the config and write state. Run `docker compose up -d` after the files are in place. The supplied Compose file publishes listeners on loopback. For a native deployment, set the file paths and run `shomei serve path/to/shomei.toml`.
 
 ### Enroll a key
 
@@ -18,7 +18,7 @@ export SHOMEI_PROXY=https://gateway.example.com:8443
 shomei init
 ```
 
-Use `--set-pin` for a YubiKey 5 with no FIDO2 PIN. For a localhost YubiKey 4 demo, use `--u2f` and set `allow_yubikey_4 = true` in the gateway config. For localhost, `sign` and `ssh` can read the public CA certificate from `~/.shomei/localhost-ca.pem`. Set `SHOMEI_CA_FILE` or pass `--ca-file` to select a different CA.
+Use `--set-pin` for a YubiKey 5 with no FIDO2 PIN. For a localhost YubiKey 4 demo, use `--u2f` and set `allow_yubikey_4 = true` in the gateway config. For the bundled demo certificates, pass `--ca-file fixtures/localhost/ca.pem` to `sign` and `ssh`. For other localhost setups the CLI can use the public CA at `~/.shomei/localhost-ca.pem`.
 
 The default public identity is `~/.shomei/identity.json`. `init` defaults to `https://localhost:8443` when the proxy is unspecified. `get-id` reads the local identity and `sign` can use its recorded origin from any working directory. Use `--identity-file` to select a separate identity.
 

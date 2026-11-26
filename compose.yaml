@@ -1,6 +1,6 @@
 services:
   shomei:
-    build: .
+    image: "${SHOMEI_IMAGE:-ghcr.io/adrianchifor/shomei:latest}"
     user: "${SHOMEI_UID:-10001}:${SHOMEI_GID:-10001}"
     read_only: true
     cap_drop: [ALL]

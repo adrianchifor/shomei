@@ -2,8 +2,7 @@ name: shomei-deploy
 
 services:
   shomei:
-    build: .
-    user: "${SHOMEI_UID:-10001}:${SHOMEI_GID:-10001}"
+    image: "${SHOMEI_IMAGE:-ghcr.io/adrianchifor/shomei:latest}"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -12,8 +11,9 @@ services:
       - "127.0.0.1:8443:8443"
     volumes:
       - ./fixtures/deploy/shomei.toml:/etc/shomei/shomei.toml:ro
+      - ./fixtures/localhost:/run/shomei-tls:ro
       - ./local/config:/run/shomei:ro
-      - ./local/deploy-state:/var/lib/shomei
+      - state:/var/lib/shomei
     healthcheck:
       test: [CMD, bash, -c, "true </dev/tcp/127.0.0.1/8443"]
       interval: 2s
@@ -39,3 +39,6 @@ services:
       interval: 2s
       timeout: 3s
       retries: 5
+
+volumes:
+  state:
