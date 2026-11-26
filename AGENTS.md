@@ -97,9 +97,9 @@ Pass `--cacert "$SHOMEI_CA_FILE"` to curl for a private CA. Session cookies belo
 
 ## Forward HTTP, HTTPS, and TCP
 
-Set `forwarding = true` and configure `cidrs` and `ports` in each `[forward.scopes.NAME]`. Optional `dns_suffixes` require a matching DNS name and resolved IP. All enrolled keys can approve all scopes. With one scope, omit `--scope`. With several, select `--scope NAME` when approving.
+Set `forwarding = true` and configure `cidrs` and `ports` in each `[scopes.NAME]`. Optional `dns_suffixes` require a matching DNS name and resolved IP. All enrolled keys can approve all scopes. With one scope, omit `--scope`. With several, select `--scope NAME` when approving.
 
-Set `allow_all = true` in place of CIDRs, DNS suffixes, and ports to allow all reachable destinations. TCP can use any port. The main HTTPS listener routes configured app hosts to their reverse upstreams and forwards other destinations. Set `forward.http_enabled = false` to disable HTTP forwarding. Plain HTTP checks `http_ports` when configured and defaults to port 80 for restricted scopes. HTTPS CONNECT checks `https_ports` (default 443). Keep those ports limited to HTTPS services because the tunnel can carry any TCP protocol. Keep deployment backends that require per-request approval outside unrestricted egress. [Example configuration](shomei.example.toml)
+Set `allow_all = true` in place of CIDRs, DNS suffixes, and ports to allow all reachable destinations. TCP can use any port. The main HTTPS listener routes configured app hosts to their reverse upstreams and forwards other destinations. Set `http_forwarding = false` to disable HTTP forwarding. Plain HTTP checks `http_ports` when configured and defaults to port 80 for restricted scopes. HTTPS CONNECT checks `https_ports` (default 443). Keep those ports limited to HTTPS services because the tunnel can carry any TCP protocol. Keep deployment backends that require per-request approval outside unrestricted egress. [Example configuration](shomei.example.toml)
 
 ```sh
 target=https://status.internal.example.com/
@@ -111,7 +111,7 @@ approval="$(shomei sign --proxy "$SHOMEI_PROXY" "$target")" &&
 
 Pass `--session` to issue a reusable forward session, and send it as `Proxy-Authorization: Shomei-Session <token>`. Reverse browser WebAuthn uses cookies. For a private proxy CA, pass `--proxy-cacert "$SHOMEI_CA_FILE"` to curl.
 
-Expose `forward.public_port` (9444 by default) as raw TCP on the authorization hostname. Shomei verifies mTLS certificates on this listener.
+Expose `tcp.public_port` (9443 by default) as raw TCP on the authorization hostname. Shomei verifies mTLS certificates on this listener.
 
 ```sh
 shomei mtls --proxy "$SHOMEI_PROXY" --out ./fleet-cert
@@ -122,7 +122,7 @@ For SSH, run `shomei ssh --proxy "$SHOMEI_PROXY" --credentials ./fleet-cert ubun
 
 ## Proxy SSH
 
-For multiple reverse targets, configure `[tcp_upstreams]` with client-facing `"host:port"` keys and private `"upstream:port"` values. They share the mTLS listener on `forward.bind` (default 9444). Run `shomei ssh user@host` for SSH or `shomei connect host:port` for any TCP client. A named route gets a certificate bound to that route.
+For named reverse targets, configure `[tcp_upstreams]` with client-facing `"host:port"` keys and private `"upstream:port"` values. They share the mTLS listener on `tcp.bind` (port 9443 by default) with scoped TCP and fixed relays. Run `shomei ssh user@host` for SSH or `shomei connect host:port` for any TCP client. A named route gets a certificate bound to that route.
 
 Set a fixed private upstream and a client-facing SSH alias in `[tcp]`. Set `public_port` to the port clients can reach.
 

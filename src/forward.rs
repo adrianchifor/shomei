@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     convert::Infallible,
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::Arc,
     time::Duration,
 };
@@ -18,7 +18,7 @@ use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Deserialize;
 use tokio::{
-    io::copy_bidirectional,
+    io::{AsyncWriteExt, copy_bidirectional},
     net::{TcpStream, lookup_host},
     sync::{Semaphore, watch},
     time::{Instant, sleep_until, timeout},
@@ -27,38 +27,12 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::{
     accept_tls,
-    config::Endpoint,
+    config::{Endpoint, TcpConfig},
     http::{App, approve_forward_http, relay_body, strip_hop_headers},
     tls::{Issuer, client_grant},
 };
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    #[serde(default = "bind")]
-    pub bind: SocketAddr,
-    pub public_port: Option<u16>,
-    pub http_bind: Option<SocketAddr>,
-    #[serde(default = "http_enabled")]
-    pub http_enabled: bool,
-    #[serde(default = "cert_ttl")]
-    pub cert_ttl_seconds: u64,
-    #[serde(default)]
-    pub scopes: BTreeMap<String, Scope>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            bind: bind(),
-            public_port: None,
-            http_bind: None,
-            http_enabled: false,
-            cert_ttl_seconds: cert_ttl(),
-            scopes: BTreeMap::new(),
-        }
-    }
-}
+pub const FIXED_TCP_GRANT: usize = usize::MAX;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -116,63 +90,48 @@ impl Network {
     }
 }
 
-impl Config {
-    pub fn validate(&self, tcp_routes: bool) -> Result<()> {
+pub fn validate_scopes(scopes: &BTreeMap<String, Scope>) -> Result<()> {
+    for (name, scope) in scopes {
         ensure!(
-            self.public_port.unwrap_or(self.bind.port()) != 0,
-            "forward public port must be nonzero"
+            (1..=64).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "invalid forward scope name {name:?}"
         );
-        ensure!(
-            (1..=3600).contains(&self.cert_ttl_seconds),
-            "forward certificate TTL must be 1 to 3600 seconds"
-        );
-        ensure!(
-            tcp_routes || !self.scopes.is_empty(),
-            "configure at least one forward scope or TCP upstream"
-        );
-        for (name, scope) in &self.scopes {
+        if scope.allow_all {
             ensure!(
-                (1..=64).contains(&name.len())
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
-                "invalid forward scope name {name:?}"
+                scope.cidrs.is_empty() && scope.ports.is_empty() && scope.dns_suffixes.is_empty(),
+                "forward scope {name:?} cannot combine allow_all with CIDRs, ports, or DNS suffixes"
             );
-            if scope.allow_all {
-                ensure!(
-                    scope.cidrs.is_empty()
-                        && scope.ports.is_empty()
-                        && scope.dns_suffixes.is_empty(),
-                    "forward scope {name:?} cannot combine allow_all with CIDRs, ports, or DNS suffixes"
-                );
-            } else {
-                ensure!(
-                    !scope.cidrs.is_empty() && !scope.ports.is_empty() && !scope.ports.contains(&0),
-                    "forward scope {name:?} needs CIDRs and nonzero ports"
-                );
-            }
+        } else {
             ensure!(
-                !scope
-                    .http_ports
-                    .as_ref()
-                    .is_some_and(|ports| ports.contains(&0))
-                    && !scope.https_ports.contains(&0),
-                "invalid HTTP proxy ports in forward scope {name:?}"
-            );
-            ensure!(
-                scope
-                    .dns_suffixes
-                    .iter()
-                    .all(|suffix| dns_name(suffix) && suffix.parse::<IpAddr>().is_err()),
-                "invalid DNS suffix in forward scope {name:?}"
+                !scope.cidrs.is_empty() && !scope.ports.is_empty() && !scope.ports.contains(&0),
+                "forward scope {name:?} needs CIDRs and nonzero ports"
             );
         }
-        Ok(())
+        ensure!(
+            !scope
+                .http_ports
+                .as_ref()
+                .is_some_and(|ports| ports.contains(&0))
+                && !scope.https_ports.contains(&0),
+            "invalid HTTP proxy ports in forward scope {name:?}"
+        );
+        ensure!(
+            scope
+                .dns_suffixes
+                .iter()
+                .all(|suffix| dns_name(suffix) && suffix.parse::<IpAddr>().is_err()),
+            "invalid DNS suffix in forward scope {name:?}"
+        );
     }
+    Ok(())
 }
 
 pub struct Gateway {
-    pub config: Config,
+    pub tcp: TcpConfig,
+    pub scopes: BTreeMap<String, Scope>,
     pub issuer: Issuer,
     scope_names: Vec<String>,
     tcp_targets: HashMap<Endpoint, usize>,
@@ -181,10 +140,11 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    pub fn new(config: Config, requests: usize) -> Result<Self> {
-        let scope_names = config.scopes.keys().cloned().collect();
+    pub fn new(tcp: TcpConfig, scopes: BTreeMap<String, Scope>, requests: usize) -> Result<Self> {
+        let scope_names = scopes.keys().cloned().collect();
         Ok(Self {
-            config,
+            tcp,
+            scopes,
             issuer: Issuer::new()?,
             scope_names,
             tcp_targets: HashMap::new(),
@@ -222,18 +182,6 @@ impl Gateway {
         self.tcp_upstreams
             .get(id.checked_sub(self.scope_names.len())?)
     }
-}
-
-fn bind() -> SocketAddr {
-    SocketAddr::from(([0, 0, 0, 0], 9444))
-}
-
-fn http_enabled() -> bool {
-    true
-}
-
-fn cert_ttl() -> u64 {
-    300
 }
 
 fn https_ports() -> Vec<u16> {
@@ -335,9 +283,9 @@ mod tests {
 
     #[tokio::test]
     async fn unrestricted_scope_dials_an_unlisted_port() {
-        let config: Config = toml::from_str("[scopes.all]\nallow_all = true").unwrap();
-        config.validate(false).unwrap();
-        let scope = &config.scopes["all"];
+        let scopes = toml::from_str("[all]\nallow_all = true").unwrap();
+        validate_scopes(&scopes).unwrap();
+        let scope = &scopes["all"];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(scope.allows_http_port(port, false));
@@ -346,16 +294,11 @@ mod tests {
         assert!(scope.dial("127.0.0.1", port).await.is_ok());
 
         for invalid in [
-            "[scopes.all]",
-            "[scopes.all]\nallow_all = true\nports = [80]",
-            "[scopes.all]\nallow_all = true\nhttps_ports = [0]",
+            "[all]",
+            "[all]\nallow_all = true\nports = [80]",
+            "[all]\nallow_all = true\nhttps_ports = [0]",
         ] {
-            assert!(
-                toml::from_str::<Config>(invalid)
-                    .unwrap()
-                    .validate(false)
-                    .is_err()
-            );
+            assert!(validate_scopes(&toml::from_str(invalid).unwrap()).is_err());
         }
     }
 
@@ -433,7 +376,7 @@ pub async fn serve(
     handshakes: Arc<Semaphore>,
     allowed: watch::Receiver<u64>,
 ) {
-    let Some(stream) = accept_tls(socket, tls, &handshakes).await else {
+    let Some(mut stream) = accept_tls(socket, tls, &handshakes).await else {
         return;
     };
     let Some(leaf) = stream
@@ -447,14 +390,34 @@ pub async fn serve(
     let Ok((generation, scope, lifetime)) = client_grant(leaf) else {
         return;
     };
-    if gateway.scope_name(scope).is_none() && gateway.tcp_upstream(scope).is_none() {
-        return;
-    }
     let approval = Approval {
         generation,
         allowed,
         deadline: Instant::now() + lifetime,
     };
+    if scope == FIXED_TCP_GRANT {
+        let Some(upstream) = &gateway.tcp.upstream else {
+            return;
+        };
+        let relay = async {
+            if let Ok(Ok(mut upstream)) = timeout(
+                Duration::from_secs(5),
+                TcpStream::connect(upstream.as_str()),
+            )
+            .await
+            {
+                let _ = upstream.set_nodelay(true);
+                let _ = copy_bidirectional(&mut stream, &mut upstream).await;
+            }
+        };
+        if approval.until_revoked(relay).await.is_none() {
+            let _ = timeout(Duration::from_millis(250), stream.shutdown()).await;
+        }
+        return;
+    }
+    if gateway.scope_name(scope).is_none() && gateway.tcp_upstream(scope).is_none() {
+        return;
+    }
     let handler_approval = approval.clone();
     let service = service_fn(move |request| {
         let gateway = gateway.clone();
@@ -588,7 +551,7 @@ async fn proxy(
                 socket
             }
             (None, None) => {
-                gateway.config.scopes[gateway.scope_name(scope).ok_or(StatusCode::FORBIDDEN)?]
+                gateway.scopes[gateway.scope_name(scope).ok_or(StatusCode::FORBIDDEN)?]
                     .dial(&host, port)
                     .await?
             }
@@ -598,8 +561,7 @@ async fn proxy(
         if tcp_target.is_some() {
             return Err(StatusCode::FORBIDDEN);
         }
-        let rules =
-            &gateway.config.scopes[gateway.scope_name(scope).ok_or(StatusCode::FORBIDDEN)?];
+        let rules = &gateway.scopes[gateway.scope_name(scope).ok_or(StatusCode::FORBIDDEN)?];
         if !rules.allows_http_port(port, connect) {
             return Err(StatusCode::FORBIDDEN);
         }

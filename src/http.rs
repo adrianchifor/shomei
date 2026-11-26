@@ -51,7 +51,7 @@ use crate::{
     config::{Config, Endpoint, HttpUpstreamConfig, ProtectedPath},
     session::{Sessions, session_value},
     tailscale::TailscaleSsh,
-    tls::{Issuer, csr_key},
+    tls::csr_key,
 };
 
 const PREFIX: &str = "/_shomei";
@@ -64,25 +64,18 @@ pub struct App {
     hosts: HashSet<Endpoint>,
     hostnames: HashSet<String>,
     forwarding: bool,
+    http_forwarding: bool,
     allow_unlisted_host: bool,
     upstreams: HashMap<Endpoint, HttpUpstream>,
     http_client: Client<HttpsConnector<HttpConnector>, Body>,
     tickets: Mutex<HashMap<Uuid, LoginTicket>>,
     approvals: approval::Approvals,
     ticket_limit: usize,
-    tcp: Option<TcpAccess>,
     forward: Option<ForwardAccess>,
     tailscale: Option<TailscaleSsh>,
     auth_workers: Arc<Semaphore>,
     http_requests: Arc<Semaphore>,
     https_tunnels: Arc<Semaphore>,
-}
-
-struct TcpAccess {
-    issuer: Issuer,
-    ttl: u64,
-    endpoint: String,
-    ssh_host: Option<String>,
 }
 
 struct ForwardAccess {
@@ -123,18 +116,13 @@ struct HttpUpstream {
 
 pub fn app(
     config: Config,
-    issuer: Option<Issuer>,
     forward: Option<Arc<crate::forward::Gateway>>,
 ) -> Result<(Router, Arc<App>)> {
-    let state = state(config, issuer, forward)?;
+    let state = state(config, forward)?;
     Ok((routes(state.clone()), state))
 }
 
-fn state(
-    config: Config,
-    issuer: Option<Issuer>,
-    forward: Option<Arc<crate::forward::Gateway>>,
-) -> Result<Arc<App>> {
+fn state(config: Config, forward: Option<Arc<crate::forward::Gateway>>) -> Result<Arc<App>> {
     let auth = Auth::new(
         &config.origin,
         &config.state_dir,
@@ -142,20 +130,16 @@ fn state(
         &config.limits,
         config.allow_yubikey_4,
     )?;
-    state_with_auth(config, issuer, auth, forward)
+    state_with_auth(config, auth, forward)
 }
 
 fn state_with_auth(
     config: Config,
-    issuer: Option<Issuer>,
     auth: Auth,
     forward: Option<Arc<crate::forward::Gateway>>,
 ) -> Result<Arc<App>> {
-    let forwarding = config.forwarding.unwrap_or_else(|| {
-        forward
-            .as_ref()
-            .is_some_and(|gateway| !gateway.config.scopes.is_empty())
-    });
+    let forwarding = config.forwarding;
+    let http_forwarding = forwarding && config.http_forwarding;
     let allow_unlisted_host = !forwarding && config.http_upstream_count() == 1;
     let hostname = config.origin.domain().context("missing proxy hostname")?;
     let port = config.origin.port_or_known_default();
@@ -246,12 +230,6 @@ fn state_with_auth(
         .http2_max_header_list_size(32 * 1024)
         .build(connector);
     let hostnames = hosts.iter().map(|host| host.host.clone()).collect();
-    let tcp = issuer.zip(config.tcp).map(|(issuer, tcp)| TcpAccess {
-        issuer,
-        ttl: tcp.cert_ttl_seconds,
-        endpoint: format!("{hostname}:{}", tcp.public_port.unwrap_or(tcp.bind.port())),
-        ssh_host: tcp.ssh_host,
-    });
     Ok(Arc::new(App {
         auth: Arc::new(auth),
         origin: config.origin.origin().ascii_serialization(),
@@ -259,18 +237,17 @@ fn state_with_auth(
         hosts,
         hostnames,
         forwarding,
+        http_forwarding,
         allow_unlisted_host,
         upstreams,
         http_client,
         tickets: Mutex::new(HashMap::new()),
         approvals: approval::Approvals::new(config.limits.pending_challenges),
         ticket_limit: config.limits.pending_challenges,
-        tcp,
         forward: forward
             .map(|gateway| -> Result<_> {
-                let http_sessions = if forwarding && gateway.config.http_enabled {
+                let http_sessions = if http_forwarding {
                     gateway
-                        .config
                         .scopes
                         .keys()
                         .map(|_| Sessions::new(config.session_ttl_seconds))
@@ -281,10 +258,7 @@ fn state_with_auth(
                 Ok(ForwardAccess {
                     endpoint: format!(
                         "{hostname}:{}",
-                        gateway
-                            .config
-                            .public_port
-                            .unwrap_or(gateway.config.bind.port())
+                        gateway.tcp.public_port.unwrap_or(gateway.tcp.bind.port())
                     ),
                     gateway,
                     http_sessions,
@@ -375,10 +349,7 @@ pub async fn serve(
                 let Some(endpoint) = Endpoint::from_authority(&authority, port) else {
                     return Ok(StatusCode::BAD_REQUEST.into_response());
                 };
-                let forward = state
-                    .forward
-                    .as_ref()
-                    .filter(|forward| state.forwarding && forward.gateway.config.http_enabled);
+                let forward = state.forward.as_ref().filter(|_| state.http_forwarding);
                 if state.hosts.contains(&endpoint) {
                     if request.method() == Method::CONNECT && forward.is_some() {
                         if !crate::forward::valid_connect(&request) {
@@ -856,9 +827,9 @@ async fn login_start(
             }
             if endpoint.port == 22
                 && app
-                    .tcp
+                    .forward
                     .as_ref()
-                    .and_then(|tcp| tcp.ssh_host.as_deref())
+                    .and_then(|forward| forward.gateway.tcp.ssh_host.as_deref())
                     .is_some_and(|host| host.eq_ignore_ascii_case(&endpoint.host))
             {
                 body.tcp_target = Some(endpoint.host);
@@ -880,8 +851,8 @@ async fn login_start(
                     StatusCode::FORBIDDEN,
                     "forward proxy scope is not configured",
                 ))?,
-                None if forward.gateway.config.scopes.len() == 1 => 0,
-                None if forward.gateway.config.scopes.is_empty() => {
+                None if forward.gateway.scopes.len() == 1 => 0,
+                None if forward.gateway.scopes.is_empty() => {
                     return Err(ApiError(
                         StatusCode::FORBIDDEN,
                         "no forward scope configured",
@@ -917,12 +888,15 @@ async fn login_start(
         let grant =
             match body.client_csr_pem {
                 Some(csr) => {
-                    let tcp = app
-                        .tcp
+                    let forward = app
+                        .forward
                         .as_ref()
+                        .filter(|forward| forward.gateway.tcp.upstream.is_some())
                         .ok_or(ApiError(StatusCode::BAD_REQUEST, "TCP relay is disabled"))?;
                     if let Some(host) = body.tcp_target
-                        && !tcp
+                        && !forward
+                            .gateway
+                            .tcp
                             .ssh_host
                             .as_deref()
                             .is_some_and(|allowed| allowed.eq_ignore_ascii_case(&host))
@@ -1011,18 +985,24 @@ async fn login_finish(
                 Ok(Json(serde_json::json!({ "redirect": redirect })).into_response())
             }
             Grant::Tcp(key) => {
-                let tcp = app
-                    .tcp
+                let forward = app
+                    .forward
                     .as_ref()
                     .ok_or_else(|| ApiError::internal("missing TCP issuer"))?;
-                let certificate = tcp
+                let certificate = forward
+                    .gateway
                     .issuer
-                    .issue(&key, tcp.ttl, generation, 0)
+                    .issue(
+                        &key,
+                        forward.gateway.tcp.cert_ttl_seconds,
+                        generation,
+                        crate::forward::FIXED_TCP_GRANT,
+                    )
                     .map_err(ApiError::internal)?;
                 Ok(Json(serde_json::json!({
                     "certificate_pem": certificate.certificate_pem,
                     "expires_at": certificate.expires_at,
-                    "tcp_endpoint": tcp.endpoint,
+                    "tcp_endpoint": forward.endpoint,
                 }))
                 .into_response())
             }
@@ -1040,7 +1020,7 @@ async fn login_finish(
                     .issuer
                     .issue(
                         &key,
-                        forward.gateway.config.cert_ttl_seconds,
+                        forward.gateway.tcp.cert_ttl_seconds,
                         generation,
                         scope,
                     )

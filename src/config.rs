@@ -23,7 +23,12 @@ pub struct Config {
     #[serde(default)]
     pub allow_yubikey_4: bool,
     pub http_upstream: Option<Url>,
-    pub forwarding: Option<bool>,
+    #[serde(default)]
+    pub forwarding: bool,
+    #[serde(default = "http_forwarding")]
+    pub http_forwarding: bool,
+    #[serde(default)]
+    pub scopes: BTreeMap<String, crate::forward::Scope>,
     #[serde(default)]
     pub hostnames: Vec<String>,
     #[serde(default)]
@@ -35,8 +40,8 @@ pub struct Config {
     pub browser_approval_ttl_seconds: u64,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
-    pub tcp: Option<TcpConfig>,
-    pub forward: Option<crate::forward::Config>,
+    #[serde(default)]
+    pub tcp: TcpConfig,
     pub tailscale_ssh: Option<TailscaleSshConfig>,
     #[serde(default)]
     pub limits: Limits,
@@ -143,15 +148,25 @@ impl Default for Limits {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct TcpConfig {
-    #[serde(default = "tcp_bind")]
     pub bind: SocketAddr,
-    pub upstream: String,
+    pub upstream: Option<String>,
     pub ssh_host: Option<String>,
     pub public_port: Option<u16>,
-    #[serde(default = "tcp_ttl")]
     pub cert_ttl_seconds: u64,
+}
+
+impl Default for TcpConfig {
+    fn default() -> Self {
+        Self {
+            bind: SocketAddr::from(([0, 0, 0, 0], 9443)),
+            upstream: None,
+            ssh_host: None,
+            public_port: None,
+            cert_ttl_seconds: tcp_ttl(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -168,8 +183,8 @@ pub struct TailscaleSshConfig {
 }
 
 impl Config {
-    pub fn forwarding_enabled(&self) -> bool {
-        self.forwarding.unwrap_or(self.forward.is_some())
+    pub fn tcp_enabled(&self) -> bool {
+        self.forwarding || self.tcp.upstream.is_some() || !self.tcp_upstreams.is_empty()
     }
 
     pub fn http_upstream_count(&self) -> usize {
@@ -185,11 +200,8 @@ impl Config {
             "YubiKey 4 support requires a localhost HTTPS origin"
         );
         ensure!(
-            config.http_upstream.is_some()
-                || !config.http_upstreams.is_empty()
-                || !config.tcp_upstreams.is_empty()
-                || config.tcp.is_some()
-                || config.forwarding_enabled()
+            config.http_upstream_count() != 0
+                || config.tcp_enabled()
                 || config.tailscale_ssh.is_some(),
             "configure an upstream, a forward proxy, or Tailscale SSH"
         );
@@ -218,15 +230,11 @@ impl Config {
             config.protected_paths.as_deref(),
             config.browser_approval_ttl_seconds,
         )?;
-        if config.forwarding_enabled() {
-            ensure!(
-                config
-                    .forward
-                    .as_ref()
-                    .is_some_and(|forward| !forward.scopes.is_empty()),
-                "forwarding requires at least one forward scope"
-            );
-        }
+        ensure!(
+            !config.forwarding || !config.scopes.is_empty(),
+            "forwarding requires at least one destination scope"
+        );
+        crate::forward::validate_scopes(&config.scopes)?;
         let port = config.origin.port_or_known_default();
         let canonical = Endpoint::parse(
             config.origin.domain().context("missing gateway hostname")?,
@@ -254,7 +262,7 @@ impl Config {
                 ensure!(!has_default, "only one HTTP upstream can omit hostname");
                 ensure!(
                     !config.hostnames.is_empty()
-                        || (!config.forwarding_enabled() && config.http_upstream_count() == 1),
+                        || (!config.forwarding && config.http_upstream_count() == 1),
                     "an HTTP upstream without hostname requires hostnames for routing"
                 );
                 has_default = true;
@@ -281,41 +289,37 @@ impl Config {
             );
             Endpoint::parse(upstream, None).context("invalid TCP upstream")?;
         }
-        if let Some(tcp) = &config.tcp {
-            let endpoint: axum::http::uri::Authority =
-                tcp.upstream.parse().context("parse TCP upstream")?;
+        let tcp = &config.tcp;
+        if let Some(upstream) = &tcp.upstream {
+            let endpoint: Authority = upstream.parse().context("parse fixed TCP upstream")?;
             ensure!(
-                !endpoint.host().is_empty()
-                    && !endpoint.as_str().contains('@')
+                !endpoint.as_str().contains('@')
                     && endpoint.port_u16().is_some_and(|port| port != 0),
                 "TCP upstream must have a host and port"
             );
-            ensure!(
-                (1..=86_400).contains(&tcp.cert_ttl_seconds),
-                "TCP certificate TTL must be 1 to 86400 seconds"
-            );
-            ensure!(
-                tcp.public_port.unwrap_or(tcp.bind.port()) != 0,
-                "TCP public port must be nonzero"
-            );
-            if let Some(host) = &tcp.ssh_host {
-                ensure!(
-                    host.parse::<std::net::IpAddr>().is_ok()
-                        || (!host.is_empty()
-                            && host.len() <= 253
-                            && !host.starts_with('-')
-                            && host.bytes().all(|byte| byte.is_ascii_alphanumeric()
-                                || matches!(byte, b'.' | b'-' | b'_'))),
-                    "invalid TCP SSH host alias"
-                );
-            }
         }
-        if let Some(forward) = config
-            .forward
-            .as_ref()
-            .filter(|_| config.forwarding_enabled() || !config.tcp_upstreams.is_empty())
-        {
-            forward.validate(!config.tcp_upstreams.is_empty())?;
+        ensure!(
+            (1..=86_400).contains(&tcp.cert_ttl_seconds),
+            "TCP certificate TTL must be 1 to 86400 seconds"
+        );
+        ensure!(
+            tcp.public_port.unwrap_or(tcp.bind.port()) != 0,
+            "TCP public port must be nonzero"
+        );
+        if let Some(host) = &tcp.ssh_host {
+            ensure!(
+                tcp.upstream.is_some(),
+                "TCP SSH host alias requires tcp.upstream"
+            );
+            ensure!(
+                host.parse::<IpAddr>().is_ok()
+                    || (!host.is_empty()
+                        && host.len() <= 253
+                        && !host.starts_with('-')
+                        && host.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'.' | b'-' | b'_'))),
+                "invalid TCP SSH host alias"
+            );
         }
         if let Some(tailscale) = &config.tailscale_ssh {
             ensure!(
@@ -474,8 +478,8 @@ fn https_bind() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 8443))
 }
 
-fn tcp_bind() -> SocketAddr {
-    SocketAddr::from(([0, 0, 0, 0], 9443))
+fn http_forwarding() -> bool {
+    true
 }
 
 fn session_ttl() -> u64 {
@@ -509,13 +513,13 @@ forwarding = false
 [[http_upstreams]]
 upstream = "http://app:8080"
 
-[forward.scopes.web]
+[scopes.web]
 cidrs = ["10.0.0.0/8"]
 ports = [443]
 "#;
         fs::write(&file, config).unwrap();
         let loaded = Config::load(&file).unwrap();
-        assert!(!loaded.forwarding_enabled());
+        assert!(!loaded.forwarding);
         let enabled = config.replace("forwarding = false", "forwarding = true");
         fs::write(&file, &enabled).unwrap();
         assert!(Config::load(&file).is_err());
@@ -569,21 +573,21 @@ tls_key = "tls-key.pem"
 state_dir = "state"
 identities_file = "identities"
 
-[forward]
+forwarding = true
+
+[tcp]
 cert_ttl_seconds = 300
 
-[forward.scopes.fleet]
+[scopes.fleet]
 dns_suffixes = ["internal.example.com"]
 cidrs = ["10.42.0.0/16", "fd00:42::/48"]
 ports = [22, 443]
 "#;
         fs::write(&file, config).unwrap();
-        assert_eq!(
-            Config::load(&file).unwrap().forward.unwrap().bind.port(),
-            9444
-        );
+        assert_eq!(Config::load(&file).unwrap().tcp.bind.port(), 9443);
         for invalid in [
-            config.replace("300", "3601"),
+            config.replace("300", "86401"),
+            config.replace("[scopes.fleet]", "[forward.scopes.fleet]"),
             config.replace("\"10.42.0.0/16\", \"fd00:42::/48\"", ""),
             config.replace("22, 443", "0, 443"),
             config.replace("internal.example.com", "*.example.com"),

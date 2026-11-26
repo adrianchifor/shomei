@@ -15,19 +15,25 @@ use crate::{
 };
 
 #[tokio::test]
-async fn uses_scoped_mtls_for_tcp_tunnels() {
+async fn fixed_named_and_scoped_tcp_share_an_mtls_listener() {
     let (identity, roots) = server_fixture();
     let https = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let named_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let named_backend = named_listener.local_addr().unwrap().to_string();
+    let fixed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixed_backend = fixed_listener.local_addr().unwrap().to_string();
     let https_addr = https.local_addr().unwrap();
     let addr = listener.local_addr().unwrap();
     let proxy = Arc::new(
         forward::Gateway::new(
+            crate::config::TcpConfig {
+                upstream: Some(fixed_backend.clone()),
+                ..Default::default()
+            },
             toml::from_str(&format!(
                 r#"
-        [scopes.fleet]
+        [fleet]
         cidrs = ["127.0.0.1/32"]
         ports = [{}]
     "#,
@@ -46,7 +52,7 @@ async fn uses_scoped_mtls_for_tcp_tunnels() {
         )
         .unwrap(),
     );
-    proxy.config.validate(false).unwrap();
+    forward::validate_scopes(&proxy.scopes).unwrap();
     let (generation, allowed) = watch::channel(0);
     let tls = identity.server(Some(&proxy.issuer)).unwrap();
     let handshakes = Arc::new(Semaphore::new(8));
@@ -160,6 +166,33 @@ async fn uses_scoped_mtls_for_tcp_tunnels() {
     let mut reply = [0; 5];
     named.read_exact(&mut reply).await.unwrap();
     assert_eq!(&reply, b"named");
+    echo.await.unwrap();
+    let fixed_target = destination(&fixed_backend).unwrap();
+    assert!(
+        tunnel
+            .open(fixed_target.clone())
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("403")
+    );
+    let issued = proxy
+        .issuer
+        .issue(&csr_key(&csr).unwrap(), 30, 0, forward::FIXED_TCP_GRANT)
+        .unwrap();
+    let mut fixed_creds = Credentials::read(&path).unwrap();
+    fixed_creds.metadata.expires_at = issued.expires_at;
+    fixed_creds.metadata.direct = true;
+    fixed_creds.certificate = issued.certificate_pem;
+    let fixed = Tunnel::new(fixed_creds, roots.clone()).unwrap();
+    let echo = tokio::spawn(async move {
+        let (mut socket, _) = fixed_listener.accept().await.unwrap();
+        socket.write_all(b"fixed").await.unwrap();
+    });
+    let mut stream = fixed.open(fixed_target).await.unwrap();
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"fixed");
     echo.await.unwrap();
     let client = tunnel
         .tls

@@ -15,8 +15,9 @@ use tokio_rustls::TlsConnector;
 
 use super::*;
 use crate::{
+    forward::{self, FIXED_TCP_GRANT, Gateway},
     listen,
-    tls::{self, Identity},
+    tls::Identity,
 };
 
 const CLIENTS: usize = 2_000;
@@ -62,21 +63,22 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
         identities_file,
         allow_yubikey_4: false,
         http_upstream: Some(upstream_name.parse().unwrap()),
-        forwarding: None,
+        forwarding: false,
+        http_forwarding: true,
+        scopes: Default::default(),
         hostnames: Default::default(),
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
         browser_approval_ttl_seconds: 0,
         session_ttl_seconds: 600,
-        tcp: None,
-        forward: None,
+        tcp: Default::default(),
         tailscale_ssh: None,
         limits: Default::default(),
     };
     let limit = config.limits.https_connections;
     let handshakes = Arc::new(Semaphore::new(config.limits.tls_handshakes));
-    let state = super::state(config, None, None).unwrap();
+    let state = super::state(config, None).unwrap();
     let router = routes(state.clone());
     let gateway_state = state.clone();
     let tls = identity.server(None).unwrap();
@@ -168,7 +170,7 @@ async fn http_exchange(
 
 async fn tcp_load(identity: &Identity, roots: RootCertStore) {
     let upstream = listen("127.0.0.1:0".parse().unwrap()).unwrap();
-    let upstream_addr: Arc<str> = upstream.local_addr().unwrap().to_string().into();
+    let upstream_addr = upstream.local_addr().unwrap().to_string();
     let backend = tokio::spawn(crate::serve(upstream, 4096, |mut socket, _| async move {
         socket.set_nodelay(true).unwrap();
         let mut bytes = [0; 4];
@@ -180,15 +182,26 @@ async fn tcp_load(identity: &Identity, roots: RootCertStore) {
     }));
     let listener = listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
-    let issuer = Issuer::new().unwrap();
+    let proxy = Arc::new(
+        Gateway::new(
+            crate::config::TcpConfig {
+                upstream: Some(upstream_addr),
+                ..Default::default()
+            },
+            Default::default(),
+            8192,
+        )
+        .unwrap(),
+    );
+    let issuer_proxy = proxy.clone();
     let handshakes = Arc::new(Semaphore::new(512));
     let (_generation, allowed) = tokio::sync::watch::channel(0);
-    let tls = identity.server(Some(&issuer)).unwrap();
+    let tls = identity.server(Some(&proxy.issuer)).unwrap();
     let gateway = tokio::spawn(crate::serve(listener, 4096, move |socket, _| {
-        tls::relay(
+        forward::serve(
             socket,
             tls.clone(),
-            upstream_addr.clone(),
+            proxy.clone(),
             handshakes.clone(),
             allowed.clone(),
         )
@@ -196,7 +209,10 @@ async fn tcp_load(identity: &Identity, roots: RootCertStore) {
 
     let client_key = KeyPair::generate().unwrap();
     let public = SubjectPublicKeyInfo::from_der(&client_key.subject_public_key_info()).unwrap();
-    let cert = issuer.issue(&public, 300, 0, 0).unwrap();
+    let cert = issuer_proxy
+        .issuer
+        .issue(&public, 300, 0, FIXED_TCP_GRANT)
+        .unwrap();
     let cert = CertificateDer::from_pem_slice(cert.certificate_pem.as_bytes()).unwrap();
     let private = PrivatePkcs8KeyDer::from(client_key.serialize_der()).into();
     let config = ClientConfig::builder()

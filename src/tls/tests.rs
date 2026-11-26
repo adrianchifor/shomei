@@ -5,16 +5,19 @@ use rustls::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
+    sync::{Semaphore, watch},
+    time::timeout,
 };
 use tokio_rustls::TlsConnector;
 
 use super::*;
+use crate::forward::{self, FIXED_TCP_GRANT, Gateway};
 
 #[tokio::test]
 async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr: Arc<str> = upstream.local_addr().unwrap().to_string().into();
+    let upstream_addr = upstream.local_addr().unwrap().to_string();
     let echo = tokio::spawn(async move {
         for _ in 0..2 {
             let (mut socket, _) = upstream.accept().await.unwrap();
@@ -26,19 +29,30 @@ async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let issuer = Issuer::new().unwrap();
+    let proxy = Arc::new(
+        Gateway::new(
+            crate::config::TcpConfig {
+                upstream: Some(upstream_addr),
+                ..Default::default()
+            },
+            Default::default(),
+            32,
+        )
+        .unwrap(),
+    );
+    let issuing_proxy = proxy.clone();
     let identity = server_identity();
     let mut roots = RootCertStore::empty();
     roots.add(identity.certs[0].clone()).unwrap();
-    let tls = identity.server(Some(&issuer)).unwrap();
+    let tls = identity.server(Some(&proxy.issuer)).unwrap();
     let handshakes = Arc::new(Semaphore::new(32));
     let (generation, allowed) = watch::channel(0);
     let gateway = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
-            tokio::spawn(relay(
+            tokio::spawn(forward::serve(
                 socket,
                 tls.clone(),
-                upstream_addr.clone(),
+                proxy.clone(),
                 handshakes.clone(),
                 allowed.clone(),
             ));
@@ -70,7 +84,10 @@ async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
         .serialize_request(&wrong_curve)
         .unwrap();
     assert!(csr_key(&wrong_csr.pem().unwrap()).is_err());
-    let granted = issuer.issue(&key, 3, 0, 0).unwrap();
+    let granted = issuing_proxy
+        .issuer
+        .issue(&key, 3, 0, FIXED_TCP_GRANT)
+        .unwrap();
     let cert = CertificateDer::from_pem_slice(granted.certificate_pem.as_bytes()).unwrap();
     let (_, parsed) = parse_x509_certificate(cert.as_ref()).unwrap();
     assert_eq!(
@@ -103,7 +120,10 @@ async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
     assert!(matches!(eof, Ok(0) | Err(_)));
     assert!(unix_seconds().unwrap() >= granted.expires_at);
 
-    let granted = issuer.issue(&key, 30, 0, 0).unwrap();
+    let granted = issuing_proxy
+        .issuer
+        .issue(&key, 30, 0, FIXED_TCP_GRANT)
+        .unwrap();
     let cert = CertificateDer::from_pem_slice(granted.certificate_pem.as_bytes()).unwrap();
     let mut verified = connect(
         builder()

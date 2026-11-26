@@ -17,19 +17,11 @@ use rustls::{
 };
 use serde::Serialize;
 use time::OffsetDateTime;
-use tokio::{
-    io::{AsyncWriteExt, copy_bidirectional},
-    net::TcpStream,
-    sync::{Semaphore, watch},
-    time::timeout,
-};
 use tokio_rustls::TlsAcceptor;
 use x509_parser::{
     certification_request::X509CertificationRequest, oid_registry::OID_SIG_ECDSA_WITH_SHA256,
     parse_x509_certificate, prelude::FromDer,
 };
-
-use crate::accept_tls;
 
 const CLIENT_NAME: &str = "Shomei TCP Client ";
 
@@ -53,6 +45,7 @@ impl Identity {
         Ok(TlsAcceptor::from(Arc::new(self.server_config(issuer)?)))
     }
 
+    #[cfg(test)]
     pub fn http1_server(&self) -> Result<TlsAcceptor> {
         let mut config = self.server_config(None)?;
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -168,45 +161,6 @@ pub fn csr_key(pem: &str) -> Result<SubjectPublicKeyInfo> {
 
 pub fn unix_seconds() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
-}
-
-pub async fn relay(
-    socket: TcpStream,
-    tls: TlsAcceptor,
-    upstream: Arc<str>,
-    handshakes: Arc<Semaphore>,
-    mut allowed_generation: watch::Receiver<u64>,
-) {
-    let Some(mut downstream) = accept_tls(socket, tls, &handshakes).await else {
-        return;
-    };
-    let Some(cert) = downstream
-        .get_ref()
-        .1
-        .peer_certificates()
-        .and_then(|chain| chain.first())
-    else {
-        return;
-    };
-    let Ok((generation, 0, lifetime)) = client_grant(cert) else {
-        return;
-    };
-    if *allowed_generation.borrow_and_update() != generation {
-        return;
-    }
-    let stop = tokio::select! {
-        biased;
-        _ = allowed_generation.wait_for(|allowed| *allowed != generation) => true,
-        result = timeout(lifetime, async {
-            if let Ok(Ok(mut upstream)) = timeout(Duration::from_secs(5), TcpStream::connect(upstream.as_ref())).await {
-                let _ = upstream.set_nodelay(true);
-                let _ = copy_bidirectional(&mut downstream, &mut upstream).await;
-            }
-        }) => result.is_err(),
-    };
-    if stop {
-        let _ = timeout(Duration::from_millis(250), downstream.shutdown()).await;
-    }
 }
 
 pub(crate) fn client_grant(cert: &CertificateDer<'_>) -> Result<(u64, usize, Duration)> {

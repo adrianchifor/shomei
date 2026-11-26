@@ -41,15 +41,16 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
         identities_file: identities_file.clone(),
         allow_yubikey_4: false,
         http_upstream: None,
-        forwarding: None,
+        forwarding: true,
+        http_forwarding: true,
+        scopes: Default::default(),
         hostnames: Default::default(),
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
         browser_approval_ttl_seconds: 0,
         session_ttl_seconds: 60,
-        tcp: None,
-        forward: None,
+        tcp: TcpConfig::default(),
         tailscale_ssh: None,
         limits: Default::default(),
     };
@@ -68,10 +69,10 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
     let addr = listener.local_addr().unwrap();
     let gateway = Arc::new(
         forward::Gateway::new(
+            TcpConfig::default(),
             toml::from_str(&format!(
                 r#"
-        http_bind = "{addr}"
-        [scopes.web]
+        [web]
         cidrs = ["127.0.0.1/32"]
         ports = [{}, {}]
         http_ports = [{}]
@@ -87,7 +88,7 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
         )
         .unwrap(),
     );
-    let state = state_with_auth(config, None, auth, Some(gateway.clone())).unwrap();
+    let state = state_with_auth(config, auth, Some(gateway.clone())).unwrap();
     let router = routes(state.clone());
     let (identity, roots) = server_fixture();
     let tls = identity.http1_server().unwrap();
@@ -305,15 +306,16 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
                 .parse()
                 .unwrap(),
         ),
-        forwarding: Some(false),
+        forwarding: false,
+        http_forwarding: true,
+        scopes: Default::default(),
         hostnames: Default::default(),
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: Some(vec![ProtectedPath::Path("/api/deploy".into())]),
         browser_approval_ttl_seconds: 0,
         session_ttl_seconds: 60,
-        tcp: None,
-        forward: None,
+        tcp: TcpConfig::default(),
         tailscale_ssh: None,
         limits: Default::default(),
     };
@@ -324,7 +326,7 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
         &config.limits,
         false,
     );
-    let state = state_with_auth(config, None, auth, None).unwrap();
+    let state = state_with_auth(config, auth, None).unwrap();
     let (cookie, _) = state.upstreams[&state.canonical]
         .sessions
         .issue(state.auth.generation())
@@ -448,7 +450,7 @@ async fn browser_approvals_are_scoped_and_follow_per_path_ttls() {
         &config.limits,
         false,
     );
-    let state = state_with_auth(config, None, auth, None).unwrap();
+    let state = state_with_auth(config, auth, None).unwrap();
     let router = routes(state.clone());
     let server = tokio::spawn(async move {
         axum::serve(
@@ -622,6 +624,11 @@ async fn routes_sites_by_authority_and_keeps_their_approvals_separate() {
         state_dir = {:?}
         identities_file = {:?}
         hostnames = ["app.example.test"]
+        forwarding = true
+
+        [scopes.web]
+        cidrs = ["127.0.0.1/32"]
+        ports = [443]
 
         [[http_upstreams]]
         hostname = "app.example.test"
@@ -639,7 +646,7 @@ async fn routes_sites_by_authority_and_keeps_their_approvals_separate() {
     );
     let config_file = dir.path().join("shomei.toml");
     std::fs::write(&config_file, config).unwrap();
-    let config = Config::load(&config_file).unwrap();
+    let mut config = Config::load(&config_file).unwrap();
     let (auth, signer) = test_auth(
         &config.origin,
         &config.state_dir,
@@ -649,12 +656,13 @@ async fn routes_sites_by_authority_and_keeps_their_approvals_separate() {
     );
     let gateway = Arc::new(
         forward::Gateway::new(
-            toml::from_str("[scopes.web]\ncidrs = [\"127.0.0.1/32\"]\nports = [443]").unwrap(),
+            std::mem::take(&mut config.tcp),
+            std::mem::take(&mut config.scopes),
             16,
         )
         .unwrap(),
     );
-    let state = state_with_auth(config, None, auth, Some(gateway)).unwrap();
+    let state = state_with_auth(config, auth, Some(gateway)).unwrap();
     let router = routes(state.clone());
     let servers = [(public, "public"), (private, "private")].map(|(listener, name)| {
         tokio::spawn(async move {
@@ -943,15 +951,16 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         identities_file: dir.path().join("identities.json"),
         allow_yubikey_4: false,
         http_upstream: None,
-        forwarding: None,
+        forwarding: false,
+        http_forwarding: true,
+        scopes: Default::default(),
         hostnames: Default::default(),
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
         browser_approval_ttl_seconds: 0,
         session_ttl_seconds: 60,
-        tcp: None,
-        forward: None,
+        tcp: TcpConfig::default(),
         tailscale_ssh: Some(TailscaleSshConfig {
             target: None,
             posture_attribute: "custom:shomei_ssh".into(),
@@ -972,7 +981,7 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         &config.limits,
         false,
     );
-    let mut state = state_with_auth(config, None, auth, None).unwrap();
+    let mut state = state_with_auth(config, auth, None).unwrap();
     Arc::get_mut(&mut state)
         .unwrap()
         .tailscale
@@ -1093,21 +1102,16 @@ async fn approves_one_request(u2f: bool) {
                 .parse()
                 .unwrap(),
         ),
-        forwarding: None,
+        forwarding: true,
+        http_forwarding: true,
+        scopes: Default::default(),
         hostnames: Default::default(),
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
         browser_approval_ttl_seconds: 0,
         session_ttl_seconds: 60,
-        tcp: Some(TcpConfig {
-            bind: "127.0.0.1:9443".parse().unwrap(),
-            upstream: "ssh-fixture:2222".into(),
-            ssh_host: Some("deploy".into()),
-            public_port: Some(9553),
-            cert_ttl_seconds: 120,
-        }),
-        forward: None,
+        tcp: TcpConfig::default(),
         tailscale_ssh: None,
         limits: Default::default(),
     };
@@ -1120,13 +1124,19 @@ async fn approves_one_request(u2f: bool) {
     );
     let forward = Arc::new(
         crate::forward::Gateway::new(
+            TcpConfig {
+                upstream: Some("ssh-fixture:2222".into()),
+                ssh_host: Some("deploy".into()),
+                public_port: Some(9553),
+                cert_ttl_seconds: 120,
+                ..Default::default()
+            },
             toml::from_str(
                 r#"
-            public_port = 9777
-            [scopes.api]
+            [api]
             cidrs = ["10.1.0.0/16"]
             ports = [443]
-            [scopes.fleet]
+            [fleet]
             cidrs = ["10.2.0.0/16"]
             ports = [22]
         "#,
@@ -1136,7 +1146,7 @@ async fn approves_one_request(u2f: bool) {
         )
         .unwrap(),
     );
-    let state = state_with_auth(config, Some(Issuer::new().unwrap()), auth, Some(forward)).unwrap();
+    let state = state_with_auth(config, auth, Some(forward)).unwrap();
     let router = routes(state.clone());
     let server = tokio::spawn(async move {
         let upstream_app = Router::new().fallback(|request: Request| async move {
@@ -1378,7 +1388,7 @@ async fn approves_one_request(u2f: bool) {
             assert_eq!(issued.status(), StatusCode::OK);
             assert!(!issued.headers().contains_key(SET_COOKIE));
             let certificate = json_body(issued).await;
-            assert_eq!(certificate["forward_endpoint"], "localhost:9777");
+            assert_eq!(certificate["forward_endpoint"], "localhost:9553");
             let leaf = CertificateDer::from_pem_slice(
                 certificate["certificate_pem"].as_str().unwrap().as_bytes(),
             )

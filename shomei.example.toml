@@ -7,6 +7,8 @@ identities_file = "/etc/shomei/identities.json"
 allow_yubikey_4 = false  # May be enabled for localhost origins.
 http_upstream = "http://host.docker.internal:8080"
 forwarding = false
+# Set false to allow only TCP forwarding when forwarding is enabled.
+# http_forwarding = true
 # Other public DNS names or IPs for the default upstream. A missing port uses the origin port.
 # hostnames = ["127.0.0.1", "app.example.com"]
 session_ttl_seconds = 600
@@ -28,31 +30,22 @@ session_ttl_seconds = 600
 # hostname = "dashboard.example.com:8443"
 # upstream = "http://dashboard:3000"
 
-# Named TCP routes share the mTLS listener on forward.bind.
+# Named TCP routes use the mTLS listener.
 # [tcp_upstreams]
 # "ssh.example.com:22" = "sshd:2222"
 # "db.example.com:5432" = "postgres:5432"
 
-[tcp]
-bind = "0.0.0.0:9443"
-upstream = "host.docker.internal:9000"
+# Shared mTLS settings. Set upstream for a fixed raw mTLS relay.
+# [tcp]
+# bind = "0.0.0.0:9443"
+# public_port = 9443
+# cert_ttl_seconds = 300
+# upstream = "host.docker.internal:9000"
 # ssh_host = "deploy"
-public_port = 9443
-cert_ttl_seconds = 300
 
 # Set forwarding = true above to use these scopes.
 # Replace the example DNS and IP ranges with your own.
-# [forward]
-# TCP and SSH use mTLS on this listener.
-# bind = "0.0.0.0:9444"
-# public_port = 9444
-# cert_ttl_seconds = 300
-# HTTP forwarding uses the main HTTPS listener. Set false for TCP-only forwarding.
-# http_enabled = true
-# Optional additional listener for HTTP/HTTPS proxy clients.
-# http_bind = "0.0.0.0:9445"
-
-# [forward.scopes.fleet]
+# [scopes.fleet]
 # dns_suffixes = ["internal.example.com"]
 # cidrs = ["10.42.0.0/16", "fd00:42::/48"]
 # ports = [22, 80, 443, 5432]
@@ -61,7 +54,7 @@ cert_ttl_seconds = 300
 # https_ports = [443]
 
 # Alternative to the scope above. Let the gateway's network policy limit destinations.
-# [forward.scopes.unrestricted]
+# [scopes.unrestricted]
 # allow_all = true
 # HTTPS CONNECT still uses https_ports, which defaults to [443].
 

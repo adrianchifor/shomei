@@ -68,11 +68,15 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 | `browser_approval_ttl_seconds` | Browser action approval lifetime. Defaults to `0` for a touch each time. |
 | `tcp.upstream` | Fixed TCP host and port. Set `tcp.ssh_host` to the alias used by `shomei ssh`. |
 | `[tcp_upstreams]` | Named reverse TCP targets keyed by client-facing host and port. |
-| `[forward]` | Forward listeners for signed HTTP traffic and mTLS TCP traffic, with named destination scopes. |
-| `forwarding` | Enable forwarding to unlisted destinations. Set to `false` for reverse-only mode. |
+| `[scopes.NAME]` | Destination and port rules for forward HTTP, HTTPS, and TCP. |
+| `forwarding` | Enable forwarding to unlisted destinations. Defaults to `false`. |
+| `http_forwarding` | Allow HTTP/HTTPS when forwarding is enabled. Defaults to `true`. |
 | `session_ttl_seconds` | HTTP session lifetime. Defaults to 600 seconds. |
+| `tcp.bind`, `tcp.public_port` | Shared mTLS listener and advertised port. Default to port 9443. |
 | `tcp.cert_ttl_seconds` | mTLS certificate lifetime. Defaults to 300 seconds. Active relays close at expiry. |
 | `[limits]` | Connection, request, and challenge limits. |
+
+When upgrading a gateway with `[forward]`, move its destination rules to `[scopes.NAME]` and set `forwarding = true` if the gateway should forward to unlisted destinations. Move the mTLS bind, public port, and certificate TTL to `[tcp]`. Update the published TCP port to 9443, or set `tcp.bind` and `tcp.public_port` to keep a custom port. Use `http_forwarding = false` in place of `http_enabled = false`. Remove `http_bind` and point HTTP proxy clients at the main HTTPS origin.
 
 Put one `shomei get-id` token per line in the identity file. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. All keys use the `shomei` account. Shomei decodes the compressed records in memory and verifies their hardware attestation. Existing JSON arrays also work. Use `shomei get-id --json` for JSON-based tooling. [Convert an existing allowlist](AGENTS.md#enroll-a-key)
 
@@ -142,11 +146,11 @@ Enroll once at `origin`. Browser sign-in for other app hosts opens that origin a
 
 ## Forward to a fleet
 
-Set `forwarding = true` and define `[forward.scopes.fleet]` with permitted CIDRs and ports. Add `dns_suffixes` to require matching DNS names in those ranges. Shomei resolves destinations on the gateway and connects only to matching addresses. Every enrolled YubiKey can approve any configured scope. [Example configuration](shomei.example.toml)
+Set `forwarding = true` and define `[scopes.fleet]` with permitted CIDRs and ports. Add `dns_suffixes` to require matching DNS names in those ranges. Shomei resolves destinations on the gateway and connects only to matching addresses. Every enrolled YubiKey can approve any configured scope. [Example configuration](shomei.example.toml)
 
 Shomei selects the scope automatically when there's only one. Specify `--scope NAME` when there are multiple. To rely on your gateway's outbound network policy, configure a scope with `allow_all = true` and omit `cidrs`, `ports`, and `dns_suffixes`. It permits any reachable destination and port for TCP and HTTP. HTTPS tunnels still check `https_ports`, which defaults to `[443]`.
 
-The gateway's HTTPS listener also accepts forward requests to other hosts. Set `forward.http_enabled = false` for TCP-only forwarding. Shomei uses the URL passed to `sign` to select reverse or forward approval. A forward assertion approves one HTTP request or HTTPS tunnel. Add `--session` to reuse the approval until `session_ttl_seconds` expires.
+The main HTTPS listener handles reverse and forward HTTP/HTTPS traffic on port 8443 by default. Shomei identifies reverse destinations by hostname and port and forwards other destinations when enabled. Set `http_forwarding = false` for TCP-only forwarding. Shomei uses the URL passed to `sign` to select reverse or forward approval. A forward assertion approves one HTTP request or HTTPS tunnel. Add `--session` to reuse the approval until `session_ttl_seconds` expires.
 
 ```sh
 gateway=https://shomei.example.com:8443
@@ -165,7 +169,7 @@ session="$(shomei sign --proxy "$gateway" --session "$target")" &&
 
 HTTPS stays encrypted through the tunnel. The proxy authorizes the destination when the tunnel opens. A deploy behind the reverse proxy can still ask for a fresh browser WebAuthn approval for each write. [curl proxy options](https://curl.se/docs/manpage.html#--proxy-header)
 
-For TCP and SSH, approve a reusable mTLS certificate for the scope.
+TCP and SSH share the mTLS listener on port 9443. Approve a reusable mTLS certificate for the scope.
 
 ```sh
 shomei mtls --proxy "$gateway" --out ./fleet-cert
