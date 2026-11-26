@@ -134,7 +134,7 @@ ttl_seconds = 300
 
 Enable Tailscale SSH on `deploy`. In the tailnet policy, allow your users to reach the approval endpoint and require the approval attribute on every grant that gives them TCP port 22 on `deploy`. Include your existing device checks in the same posture definition as the approval assertion. Entries in `srcPosture` are alternatives. Keep the SSH `check` rule for the caller’s existing login and re-authentication policy. [Tailscale posture rules](https://tailscale.com/docs/features/device-posture/postures-in-access-rules) · [Tailscale SSH policy](https://tailscale.com/docs/reference/syntax/policy-file#tailscale-ssh)
 
-This policy fragment uses `tag:shomei` for the gateway, `tag:deploy` for the target, and `group:ops` for eligible callers. Assign `tag:deploy` only to the configured target. Replace the example auto-update check with your existing posture assertions.
+Choose your caller group and destination tags in the tailnet policy. Replace the example `group:ops`, `tag:shomei`, and `tag:deploy` with your own selectors for the callers, gateway, and configured target. Scope the target selector to that device. Match the custom attribute to `posture_attribute` and replace the auto-update check with your existing posture assertions.
 
 ```json
 {
@@ -157,7 +157,7 @@ From the caller’s Tailscale device, use the configured target’s full MagicDN
 shomei ssh --tailscale --proxy https://shomei.example.ts.net:8443 ubuntu@deploy.example.ts.net
 ```
 
-The window applies to the device and can permit multiple connections. Tailscale enforces expiry. Removing a YubiKey from the Shomei allowlist blocks new approvals. To revoke an approval early, remove the device’s approval attribute in Tailscale.
+After a successful YubiKey approval, Shomei sets the device’s attribute to expire in `ttl_seconds` (default 300, range 1–3600). Each fresh approval starts a new window. Tailscale removes the attribute automatically at expiry. Removing a YubiKey from the Shomei allowlist blocks new approvals. To revoke an approval early, remove the device’s approval attribute in Tailscale. [Tailscale attribute expiry](https://tailscale.com/docs/features/tailscale-accessbot-jit#set-custom-posture-attributes-by-using-the-api)
 
 ## Verify the integration
 
