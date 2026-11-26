@@ -4,6 +4,25 @@ const prefix = "/_shomei";
 const header = "X-Shomei-Browser-Approval";
 let dialogOpen = false;
 
+// A page from another site could frame the app, hide the prompt and steer a
+// click onto the button that asks for approval.
+function framedByAnotherSite() {
+  try {
+    for (let frame = window; frame !== window.top; frame = frame.parent) {
+      if (frame.parent.location.origin !== location.origin) return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function describe(details, withHost) {
+  const path = details.request.path;
+  const host = withHost ? String(details.host).replace(/:443$/, "") : "";
+  return details.request.method + " " + host + (path.length > 160 ? path.slice(0, 159) + "…" : path);
+}
+
 async function authorize(details, signal) {
   if (!supportsWebAuthn()) throw new Error("Open Shomei over HTTPS in a browser with WebAuthn support.");
   const challenge = await prepareApproval({ browser_approval: details }, signal);
@@ -70,7 +89,7 @@ async function promptApproval(gateway, details, signal) {
     const root = overlay.attachShadow({ mode: "open" });
     root.innerHTML = await response.text();
     const dialog = root.querySelector("dialog");
-    dialog.querySelector("[data-shomei-request]").textContent = details.request.method + " " + details.request.path.split("?")[0];
+    dialog.querySelector("[data-shomei-request]").textContent = describe(details, false);
     dialog.querySelector("[data-shomei-cancel]").addEventListener("click", cancel);
     dialog.addEventListener("cancel", (event) => {
       event.preventDefault();
@@ -114,6 +133,7 @@ export async function approvedFetch(input, init) {
   const request = new Request(input, init);
   const target = new URL(request.url);
   if (target.origin !== location.origin) throw new Error("Shomei approval requires a same-origin request.");
+  if (framedByAnotherSite()) throw new Error("Shomei approval cannot run inside a frame from another site.");
   const details = { method: request.method, path: target.pathname + target.search };
   const key = "shomei.approval." + details.method + " ";
   let approval = remembered(key, target.pathname);
@@ -139,7 +159,7 @@ if (document.documentElement.hasAttribute("data-shomei-popup")) {
     const details = JSON.parse(query.get("details"));
     const opener = window.opener;
     if (!opener || !query.get("id")) throw new Error("Open this prompt from the application.");
-    document.querySelector("[data-shomei-request]").textContent = details.request.method + " " + details.request.path.split("?")[0];
+    document.querySelector("[data-shomei-request]").textContent = describe(details, true);
     verify.disabled = false;
     verify.addEventListener("click", async () => {
       verify.disabled = true;
