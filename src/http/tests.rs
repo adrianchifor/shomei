@@ -277,7 +277,7 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
         "tunneled"
     );
     assert!(!connected.is_finished());
-    std::fs::write(identities_file, "[]").unwrap();
+    std::fs::write(identities_file, "").unwrap();
     assert!(state.auth.reload().unwrap());
     timeout(Duration::from_secs(2), &mut connected)
         .await
@@ -795,7 +795,7 @@ async fn browser_and_cli_approvals_follow_protected_path_session_ttls() {
         StatusCode::UNAUTHORIZED
     );
 
-    std::fs::write(identities, "[]").unwrap();
+    std::fs::write(identities, "").unwrap();
     assert!(state.auth.reload().unwrap());
     assert_eq!(
         send(&router, deploy(Method::POST, site, path, token))
@@ -1852,7 +1852,7 @@ async fn approves_one_request(u2f: bool) {
         }
     }
 
-    std::fs::write(identities_file, "[]").unwrap();
+    std::fs::write(identities_file, "").unwrap();
     assert!(state.auth.reload().unwrap());
     assert_eq!(
         send(&router, reuse()).await.status(),

@@ -56,8 +56,7 @@ fn requires_genuine_attestation_and_binds_the_identity_to_account_and_origin() {
         .unwrap()
         .remove("attested_label")
         .unwrap();
-    let old: StaticIdentity = serde_json::from_value(old).unwrap();
-    old.verify_for(&origin, &webauthn, &policy).unwrap();
+    assert!(serde_json::from_value::<StaticIdentity>(old).is_err());
     let mut modified = serde_json::to_value(&record).unwrap();
     modified["attested_label"] = json!("other");
     let modified: StaticIdentity = serde_json::from_value(modified).unwrap();
@@ -178,7 +177,7 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     let fixture = Fixture::new();
     let dir = tempfile::tempdir().unwrap();
     let allowlist = dir.path().join("identities.json");
-    fs::write(&allowlist, "[]").unwrap();
+    fs::write(&allowlist, "").unwrap();
     let origin = Url::parse(ORIGIN).unwrap();
     let limits = Limits {
         pending_per_ip: 8,
@@ -189,6 +188,10 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     let mut epoch = auth.subscribe_generation();
     assert!(!auth.reload().unwrap());
     assert!(auth.start_login(Grant::Http, peer).is_err());
+    fs::write(&allowlist, "[]").unwrap();
+    let (changed, rejected) = auth.reload_identities().unwrap();
+    assert!(!changed);
+    assert!(format!("{:#}", rejected[0]).contains("expected a shomei-id-v1 token"));
 
     let operator = p256();
     let alice = p256();
@@ -262,7 +265,7 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     );
     assert_eq!(auth.generation(), 0);
 
-    fs::write(&allowlist, "[").unwrap();
+    fs::write(&allowlist, [0xff]).unwrap();
     assert!(auth.reload().is_err());
     assert!(!auth.reload().unwrap());
     assert_eq!(auth.generation(), 0);
@@ -275,11 +278,13 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     let challenge = auth.start_login(Grant::Http, peer).unwrap();
     let mut unsigned = serde_json::to_value(&alice_record).unwrap();
     unsigned["attested_label"] = json!("renamed");
-    fs::write(&allowlist, json!([alice_record, unsigned]).to_string()).unwrap();
+    let unsigned: StaticIdentity = serde_json::from_value(unsigned).unwrap();
+    let unsigned = encode_identity(&unsigned).unwrap();
+    fs::write(&allowlist, format!("{alice_token}\n{unsigned}\n")).unwrap();
     let (changed, rejected) = auth.reload_identities().unwrap();
     assert!(changed);
     assert_eq!(rejected.len(), 1);
-    assert!(format!("{:#}", rejected[0]).contains("identity entry 2"));
+    assert!(format!("{:#}", rejected[0]).contains("identity on line 2"));
     assert_eq!(*epoch.borrow_and_update(), 1);
     assert!(
         auth.finish_login(assertion(&challenge, &operator, 0x05, 4))
@@ -442,7 +447,11 @@ impl Fixture {
 }
 
 fn write_records(path: &Path, records: &[&StaticIdentity]) {
-    fs::write(path, serde_json::to_vec(records).unwrap()).unwrap();
+    let tokens: Vec<_> = records
+        .iter()
+        .map(|record| encode_identity(record).unwrap())
+        .collect();
+    fs::write(path, tokens.join("\n")).unwrap();
 }
 
 fn registration(

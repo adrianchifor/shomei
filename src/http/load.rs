@@ -53,7 +53,7 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
     let addr = listener.local_addr().unwrap();
     let origin = format!("https://localhost:{}", addr.port());
     let identities_file = dir.join("identities.json");
-    std::fs::write(&identities_file, "[]").unwrap();
+    std::fs::write(&identities_file, "").unwrap();
     let config = Config {
         origin: origin.parse().unwrap(),
         https_bind: addr,

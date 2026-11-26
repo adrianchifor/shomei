@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaticIdentity {
-    #[serde(default, alias = "account", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) attested_label: Option<String>,
     pub origin: Url,
     pub(super) nonce: String,

@@ -36,7 +36,7 @@ pub struct Config {
     #[serde(default)]
     pub tcp_upstreams: BTreeMap<String, String>,
     pub protected_paths: Option<Vec<ProtectedPath>>,
-    #[serde(default, alias = "browser_approval_ttl_seconds")]
+    #[serde(default)]
     pub protected_session_ttl_seconds: u64,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
@@ -53,7 +53,6 @@ pub struct HttpUpstreamConfig {
     pub hostname: Option<String>,
     pub upstream: Url,
     pub protected_paths: Option<Vec<ProtectedPath>>,
-    #[serde(alias = "browser_approval_ttl_seconds")]
     pub protected_session_ttl_seconds: Option<u64>,
 }
 
@@ -68,7 +67,6 @@ pub enum ProtectedPath {
 #[serde(deny_unknown_fields)]
 pub struct ProtectedPathRule {
     path: String,
-    #[serde(alias = "browser_approval_ttl_seconds")]
     session_ttl_seconds: Option<u64>,
 }
 
@@ -614,6 +612,10 @@ protected_paths = ["/api/deploy"]
         assert!(Config::load(&file).is_ok());
         for invalid in [
             config.replace("[\"/api/deploy\"]", "[]"),
+            config.replace(
+                "protected_paths",
+                "browser_approval_ttl_seconds = 60\nprotected_paths",
+            ),
             config.replace("[\"/api/deploy\"]", "[\"/api//deploy\"]"),
             config.replace("[\"/api/deploy\"]", "[\"/_SHOMEI\"]"),
             config.replace("http_upstream = \"http://app:8080\"", ""),
