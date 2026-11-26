@@ -1,82 +1,94 @@
 # Shomei
 
-Rust authentication proxy and CLI for hardware-attested YubiKeys. The default policy requires a supported YubiKey 5 Series key with firmware 5.7.4 or later, PIN, and touch. [Yubico attestation guidance](https://developers.yubico.com/U2F/Attestation_and_Metadata/)
+Shomei is a Rust authentication proxy for HTTP and TCP backed by hardware-attested YubiKeys.
 
-## Local setup
+- **HTTP** supports browser WebAuthn and one-use CLI assertions, with encrypted session cookies for follow-up requests.
+- **TCP** uses short-lived mTLS certificates. `shomei ssh` uses a certificate to tunnel OpenSSH to a fixed upstream.
 
-Set up localhost TLS and the identity file before starting either Compose example. [mkcert](https://github.com/FiloSottile/mkcert)
+All enrolled keys authenticate as `shomei`. The default policy requires a supported YubiKey 5 Series key with firmware 5.7.4 or later, PIN, and touch.
 
-```sh
-export SHOMEI_PROXY=https://localhost:8443
-export SHOMEI_UID="$(id -u)" SHOMEI_GID="$(id -g)"
-export CAROOT="$PWD/local/ca"
-export SHOMEI_CA_FILE="$CAROOT/rootCA.pem"
-umask 077
-mkdir -p local/config local/deploy-state local/ssh-state
-mkcert -install
-mkcert -ecdsa -cert-file local/config/tls.pem -key-file local/config/tls-key.pem localhost
-[ -e local/config/identities.json ] || printf '[]\n' > local/config/identities.json
-```
+## Install
 
-An empty allowlist lets the stack start and denies every authentication request. To approve requests, build the CLI with Rust 1.95 or newer and register a YubiKey. Linux builds need `pkg-config`, `libudev-dev`, and `libclang-dev`. Linux release binaries need `libudev.so.1`.
+Release builds target Linux amd64 and arm64, and macOS arm64. Linux binaries require `libudev.so.1`. [Releases](https://github.com/adrianchifor/shomei/releases)
+
+To build from source, use Rust 1.95 or newer. On Debian or Ubuntu, install `pkg-config`, `libudev-dev`, and `libclang-dev`.
 
 ```sh
 cargo build --locked --release
 export PATH="$PWD/target/release:$PATH"
+```
+
+## Local demos
+
+Use Docker Compose, `jq`, and a USB YubiKey. Run the commands from the repository root. Both demos use `https://localhost:8443`, so run one at a time.
+
+### Set up TLS and enroll a key
+
+Install `mkcert` to generate a trusted localhost certificate. [mkcert](https://github.com/FiloSottile/mkcert)
+
+```sh
+umask 077
+mkdir -p local/config local/deploy-state local/ssh-state
+export CAROOT="$PWD/local/ca"
+export SHOMEI_PROXY=https://localhost:8443
+export SHOMEI_CA_FILE="$CAROOT/rootCA.pem"
+export SHOMEI_UID="$(id -u)" SHOMEI_GID="$(id -g)"
+mkcert -install
+mkcert -ecdsa -cert-file local/config/tls.pem -key-file local/config/tls-key.pem localhost
+
 shomei init --identity-file local/key.json
 shomei get-id --identity-file local/key.json | jq -es 'select(length > 0)' > local/config/identities.next \
   && mv local/config/identities.next local/config/identities.json
 ```
 
-Use `shomei init --set-pin` when the key has no FIDO2 PIN. Both examples use the same HTTPS origin and identity file. Run one stack at a time.
+Add `--set-pin` to `shomei init` if your YubiKey 5 has no FIDO2 PIN. For a YubiKey 4, add `--u2f` instead. Both demos enable attested, touch-only U2F for localhost.
 
-### YubiKey 4 on localhost
-
-Both Compose examples enable `allow_yubikey_4` for localhost. YubiKey 4 enrollment verifies Yubico’s U2F attestation. The browser and CLI require a touch for approval. [YubiKey U2F PIN support](https://docs.yubico.com/yesdk/users-manual/application-u2f/u2f-pin.html)
-
-For a fresh demo allowlist, use this enrollment command after building the CLI.
-
-```sh
-shomei init --u2f --identity-file local/yubikey4.json
-shomei get-id --identity-file local/yubikey4.json | jq -es 'select(length > 0)' > local/config/identities.next \
-  && mv local/config/identities.next local/config/identities.json
-```
-
-## Click to deploy
+### Approve a deploy
 
 ```sh
 docker compose -f compose.deploy.yaml up --build --wait
 ```
 
-If the gateway exits during startup, run `docker compose -f compose.deploy.yaml logs shomei` for the cause.
+Select **Deploy service** and approve with your YubiKey. Each approval sends `POST /api/deploy` to the private demo API, which increments its revision. [Open the deploy page](https://localhost:8443/_shomei/action)
 
-Open [the deploy page](https://localhost:8443/_shomei/action), click **Deploy service**, and complete the YubiKey prompt. The page sends a one-use assertion with `POST /api/deploy`. Shomei verifies the assertion before the private demo API increments its revision. Each deployment requires a fresh assertion. The session cookie can read `/status`.
+The same API works from the CLI. Save the session cookie to read the revision later.
 
 ```sh
-curl --fail-with-body --cacert "$SHOMEI_CA_FILE" -c local/session.txt \
-  -H "Authorization: Shomei $(shomei sign)" -X POST "$SHOMEI_PROXY/api/deploy"
+approval="$(shomei sign)" && curl --fail-with-body --cacert "$SHOMEI_CA_FILE" \
+  -c local/session.txt -H "Authorization: Shomei $approval" -X POST "$SHOMEI_PROXY/api/deploy"
 curl --fail-with-body --cacert "$SHOMEI_CA_FILE" -b local/session.txt "$SHOMEI_PROXY/status"
 docker compose -f compose.deploy.yaml down
 ```
 
-## SSH into Ubuntu
+### SSH into Ubuntu
+
+Use the public key that matches your OpenSSH identity.
 
 ```sh
-sh fixtures/ssh/setup.sh ~/.ssh/id_ed25519.pub
+sh fixtures/ssh/setup.sh "$HOME/.ssh/id_ed25519.pub"
 docker compose -f compose.ssh.yaml up --build --wait
 shomei ssh --proxy tls://localhost:9443 \
   --ssh-arg=-o --ssh-arg="UserKnownHostsFile=$PWD/local/ssh/known_hosts" \
   --ssh-arg=-o --ssh-arg=StrictHostKeyChecking=yes ubuntu@deploy -- id -un
 ```
 
-The command should print `ubuntu`. Shomei checks the allowlisted alias `deploy` and the YubiKey assertion before issuing a client certificate. OpenSSH verifies the pinned host key and uses your regular SSH key. The Ubuntu container binds SSH to loopback in Shomei’s network namespace, with port 9443 exposed only through the mTLS relay. Pass `--auth-url` if the HTTPS listener uses a port other than 8443. [Compose network modes](https://docs.docker.com/reference/compose-file/container-spec/#network_mode)
+Approve with your YubiKey. The command prints `ubuntu`. Omit `-- id -un` for an interactive shell. The Ubuntu SSH listener is private to the gateway network namespace. Port 9443 accepts mTLS connections from Shomei clients.
 
-## Configuration
+Stop the demo with `docker compose -f compose.ssh.yaml down`.
 
-Each example ships its own configuration under `fixtures/`. Set `session_ttl_seconds` for HTTP cookies and `[tcp].cert_ttl_seconds` for mTLS grants. Defaults are 600 and 300 seconds. Active SSH connections close when their certificate expires. `[browser_action]` enables the action page and requires a fresh assertion for writes through that gateway.
+## Configure your own upstream
 
-All enrolled keys authenticate as `shomei`. Existing enrollment records work as-is. The allowlist is a JSON array of public records from `get-id`. Replace it atomically to update identities. Additions preserve grants. Removing or replacing a credential revokes existing grants. The gateway keeps the last valid file if a reload fails.
+Copy `shomei.example.toml` to `local/config/shomei.toml`, set your origin and upstreams, and create `local/state`. Keep upstream listeners private and start the gateway with `docker compose up --build`. To run without Docker, set the file paths for your host and run `shomei serve path/to/shomei.toml`. [Example configuration](shomei.example.toml)
 
-For your own upstream, create `local/state`, copy `shomei.example.toml` to `local/config/shomei.toml`, and start `compose.yaml`. For a native gateway, use local file paths and run `shomei serve path/to/shomei.toml`. `[limits]` sets connection and challenge capacity. Run the loopback benchmark with `cargo test --locked --release relay_load -- --ignored --nocapture`.
+| Setting | Purpose |
+| --- | --- |
+| `origin` | Public HTTPS origin, including a nondefault port. Enroll keys for this origin. |
+| `tls_cert`, `tls_key` | Gateway TLS certificate and private key. |
+| `http_upstream` | HTTP or HTTPS origin to forward to. |
+| `tcp.upstream` | Fixed TCP host and port. Set `tcp.ssh_host` to the alias used by `shomei ssh`. |
+| `session_ttl_seconds` | HTTP session lifetime. Defaults to 600 seconds. |
+| `tcp.cert_ttl_seconds` | mTLS certificate lifetime. Defaults to 300 seconds. Active relays close at expiry. |
+| `[browser_action]` | Exposes an approval page and requires a fresh assertion for HTTP writes. |
+| `[limits]` | Connection, request, and challenge limits. |
 
-Pushed tags build and publish SHA-256 checksums and binaries for Linux amd64, Linux arm64, and macOS arm64. The build uses the upstream RSA 0.10 compatibility fix. [Release workflow](.github/workflows/release.yml) · [Upstream dependency fix](https://github.com/kanidm/crypto-glue/pull/49)
+The identity file is a JSON array of public records from `shomei get-id`. Replace it atomically to reload the allowlist. Adding a key preserves existing grants. Removing or replacing a key revokes them. Restarting the proxy invalidates its session cookies.
