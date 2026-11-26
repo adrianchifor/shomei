@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use http_body_util::{BodyExt, Full};
 use hyper::{StatusCode, body::Incoming, service::service_fn};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::{Semaphore, watch},
 };
@@ -19,6 +19,8 @@ async fn uses_scoped_mtls_for_tcp_tunnels() {
     let (identity, roots) = server_fixture();
     let https = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let named_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let named_backend = named_listener.local_addr().unwrap().to_string();
     let https_addr = https.local_addr().unwrap();
     let addr = listener.local_addr().unwrap();
     let proxy = Arc::new(
@@ -34,9 +36,17 @@ async fn uses_scoped_mtls_for_tcp_tunnels() {
             .unwrap(),
             8,
         )
+        .unwrap()
+        .with_tcp_upstreams(
+            [
+                ("ops.example.test:22".into(), named_backend.clone()),
+                ("jobs.example.test:22".into(), named_backend),
+            ]
+            .into(),
+        )
         .unwrap(),
     );
-    proxy.config.validate().unwrap();
+    proxy.config.validate(false).unwrap();
     let (generation, allowed) = watch::channel(0);
     let tls = identity.server(Some(&proxy.issuer)).unwrap();
     let handshakes = Arc::new(Semaphore::new(8));
@@ -102,6 +112,7 @@ async fn uses_scoped_mtls_for_tcp_tunnels() {
             origin: https_origin("https://localhost:8443").unwrap(),
             endpoint: format!("localhost:{}", addr.port()),
             expires_at: issued.expires_at,
+            direct: false,
         },
         certificate: issued.certificate_pem,
         key: Zeroizing::new(key.serialize_pem()),
@@ -111,6 +122,45 @@ async fn uses_scoped_mtls_for_tcp_tunnels() {
     credentials.write(&path).unwrap();
     assert!(credentials.write(&path).is_err());
     let tunnel = Tunnel::new(Credentials::read(&path).unwrap(), roots.clone()).unwrap();
+    let named_target = destination("ops.example.test:22").unwrap();
+    assert!(
+        tunnel
+            .open(named_target.clone())
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("403")
+    );
+    let id = proxy
+        .tcp_id(&crate::config::Endpoint::from_authority(&named_target, None).unwrap())
+        .unwrap();
+    let issued = proxy
+        .issuer
+        .issue(&csr_key(&csr).unwrap(), 30, 0, id)
+        .unwrap();
+    let mut named_creds = Credentials::read(&path).unwrap();
+    named_creds.metadata.expires_at = issued.expires_at;
+    named_creds.certificate = issued.certificate_pem;
+    let named_tunnel = Tunnel::new(named_creds, roots.clone()).unwrap();
+    assert!(
+        named_tunnel
+            .open(destination("jobs.example.test:22").unwrap())
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("403")
+    );
+    let echo = tokio::spawn(async move {
+        let (mut socket, _) = named_listener.accept().await.unwrap();
+        socket.write_all(b"named").await.unwrap();
+    });
+    let mut named = named_tunnel.open(named_target).await.unwrap();
+    let mut reply = [0; 5];
+    named.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"named");
+    echo.await.unwrap();
     let client = tunnel
         .tls
         .connect(

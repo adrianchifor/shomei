@@ -125,6 +125,11 @@ enum Login {
 
 pub enum Grant {
     Http,
+    HttpHost(crate::config::Endpoint),
+    BrowserLogin {
+        host: crate::config::Endpoint,
+        next: String,
+    },
     Tcp(SubjectPublicKeyInfo),
     Forward {
         key: SubjectPublicKeyInfo,

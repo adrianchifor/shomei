@@ -153,14 +153,13 @@ struct Access {
 
 #[derive(Args)]
 struct SignArgs {
-    /// Approve a request through the HTTP forward proxy.
-    #[arg(long)]
-    forward: bool,
+    /// HTTP or HTTPS destination. Defaults to the gateway's own upstream.
+    destination: Option<Url>,
     /// Authorize HTTP forwarding within this configured scope.
-    #[arg(long)]
+    #[arg(long, requires = "destination")]
     scope: Option<String>,
     /// Exchange the assertion for a reusable HTTP forward session.
-    #[arg(long)]
+    #[arg(long, requires = "destination")]
     session: bool,
     #[command(flatten)]
     access: Access,
@@ -180,8 +179,16 @@ pub async fn run() -> Result<Option<PathBuf>> {
             let origin = sign_origin(args.access.proxy, args.access.identity)?;
             let roots = trust_roots(&origin, args.access.ca_file.as_deref())?;
             let gateway = Gateway::new(origin, roots)?;
-            let signed = if args.forward || args.session || args.scope.is_some() {
-                gateway.sign_forward(args.scope.as_deref(), None).await?
+            let signed = if let Some(url) = args.destination {
+                gateway
+                    .sign_challenge(
+                        "start",
+                        &serde_json::json!({
+                            "http_destination": url,
+                            "forward_scope": args.scope,
+                        }),
+                    )
+                    .await?
             } else {
                 gateway.sign(None).await?
             };

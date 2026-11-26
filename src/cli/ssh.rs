@@ -24,22 +24,21 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use url::Url;
 
-use super::{Access, Gateway, IdentityFile, forward, https_origin, tls_client, trust_roots};
+use super::{
+    Access, Gateway, IdentityFile, forward, https_origin, sign_origin, tls_client, trust_roots,
+};
 
 #[derive(Args)]
 pub(super) struct SshArgs {
     /// The gateway HTTPS origin or a tls://host:port TCP endpoint.
     #[arg(long, env = "SHOMEI_PROXY")]
-    proxy: Url,
+    proxy: Option<Url>,
     /// The HTTPS authorization origin for tls:// proxies. Defaults to port 8443.
     #[arg(long, value_parser = https_origin)]
     auth_url: Option<Url>,
     /// Approve SSH over Tailscale and connect directly from this device.
     #[arg(long, conflicts_with_all = ["auth_url", "scope", "credentials"])]
     tailscale: bool,
-    /// Use the TCP forward proxy and select the sole scope automatically.
-    #[arg(long = "forward", conflicts_with_all = ["auth_url", "tailscale"])]
-    forward_mode: bool,
     /// PEM trust roots. Localhost can use ~/.shomei/localhost-ca.pem.
     #[arg(long, env = "SHOMEI_CA_FILE")]
     ca_file: Option<PathBuf>,
@@ -72,33 +71,44 @@ pub(super) async fn run(mut args: SshArgs) -> Result<()> {
     let host = ssh_host(&args.destination)?;
     let status = if args.tailscale {
         open_tailscale(&args, host).await?
-    } else if args.forward_mode || args.forward.enabled() {
+    } else if args
+        .proxy
+        .as_ref()
+        .is_none_or(|proxy| proxy.scheme() != "tls")
+    {
         ensure!(
             args.auth_url.is_none(),
             "--auth-url is only used with tls:// proxies"
         );
-        let origin = https_origin(args.proxy.as_str())?;
+        let origin = args
+            .proxy
+            .as_ref()
+            .map(|proxy| https_origin(proxy.as_str()))
+            .transpose()?;
         let address = if host.contains(':') {
             format!("[{host}]:22")
         } else {
             format!("{host}:22")
         };
+        let address = forward::destination(&address)?;
         let tunnel = std::mem::take(&mut args.forward)
-            .tunnel(Access {
-                proxy: Some(origin),
-                ca_file: args.ca_file.clone(),
-                identity: IdentityFile {
-                    identity_file: None,
+            .tunnel(
+                Access {
+                    proxy: origin,
+                    ca_file: args.ca_file.clone(),
+                    identity: IdentityFile {
+                        identity_file: None,
+                    },
                 },
-            })
+                &address,
+            )
             .await?;
-        openssh(
-            &args,
-            host,
-            tunnel.open(forward::destination(&address)?).await?,
-        )
-        .await?
+        openssh(&args, host, tunnel.open(address).await?).await?
     } else {
+        ensure!(
+            !args.forward.enabled(),
+            "--scope and --credentials require an HTTPS proxy URL"
+        );
         open_relay(&args, host).await?
     };
     if !status.success() {
@@ -112,7 +122,17 @@ async fn open_tailscale(args: &SshArgs, host: &str) -> Result<ExitStatus> {
         crate::config::is_tailscale_target(host),
         "expected a MagicDNS hostname or Tailscale IP"
     );
-    let origin = https_origin(args.proxy.as_str())?;
+    let proxy = args
+        .proxy
+        .as_ref()
+        .map(|proxy| https_origin(proxy.as_str()))
+        .transpose()?;
+    let origin = sign_origin(
+        proxy,
+        IdentityFile {
+            identity_file: None,
+        },
+    )?;
     let roots = trust_roots(&origin, args.ca_file.as_deref())?;
     let gateway = Gateway::new(origin, roots)?;
     let request = serde_json::json!({ "target": host });
@@ -153,7 +173,8 @@ fn tailscale_openssh(args: &SshArgs, host: &str) -> Command {
 }
 
 async fn open_relay(args: &SshArgs, host: &str) -> Result<ExitStatus> {
-    let (origin, expected_port) = proxy_origins(&args.proxy, args.auth_url.clone())?;
+    let proxy = args.proxy.as_ref().context("missing TLS proxy URL")?;
+    let (origin, expected_port) = proxy_origins(proxy, args.auth_url.clone())?;
     let tls_host = origin
         .domain()
         .context("missing TLS server name")?
@@ -363,10 +384,9 @@ mod tests {
     fn tailscale_connects_directly_without_ssh_credentials() {
         let host = "deploy.example.ts.net";
         let args = SshArgs {
-            proxy: Url::parse("https://shomei.example.ts.net:8443").unwrap(),
+            proxy: Some(Url::parse("https://shomei.example.ts.net:8443").unwrap()),
             auth_url: None,
             tailscale: true,
-            forward_mode: false,
             ca_file: None,
             forward: Default::default(),
             ssh_arg: vec!["-v".into()],

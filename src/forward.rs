@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     convert::Infallible,
     future::Future,
     net::{IpAddr, SocketAddr},
@@ -27,6 +27,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::{
     accept_tls,
+    config::Endpoint,
     http::{App, approve_forward_http, relay_body, strip_hop_headers},
     tls::{Issuer, client_grant},
 };
@@ -38,9 +39,25 @@ pub struct Config {
     pub bind: SocketAddr,
     pub public_port: Option<u16>,
     pub http_bind: Option<SocketAddr>,
+    #[serde(default = "http_enabled")]
+    pub http_enabled: bool,
     #[serde(default = "cert_ttl")]
     pub cert_ttl_seconds: u64,
+    #[serde(default)]
     pub scopes: BTreeMap<String, Scope>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bind: bind(),
+            public_port: None,
+            http_bind: None,
+            http_enabled: false,
+            cert_ttl_seconds: cert_ttl(),
+            scopes: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -100,7 +117,7 @@ impl Network {
 }
 
 impl Config {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self, tcp_routes: bool) -> Result<()> {
         ensure!(
             self.public_port.unwrap_or(self.bind.port()) != 0,
             "forward public port must be nonzero"
@@ -110,8 +127,8 @@ impl Config {
             "forward certificate TTL must be 1 to 3600 seconds"
         );
         ensure!(
-            !self.scopes.is_empty(),
-            "configure at least one forward scope"
+            tcp_routes || !self.scopes.is_empty(),
+            "configure at least one forward scope or TCP upstream"
         );
         for (name, scope) in &self.scopes {
             ensure!(
@@ -158,6 +175,8 @@ pub struct Gateway {
     pub config: Config,
     pub issuer: Issuer,
     scope_names: Vec<String>,
+    tcp_targets: HashMap<Endpoint, usize>,
+    tcp_upstreams: Vec<Endpoint>,
     requests: Arc<Semaphore>,
 }
 
@@ -168,6 +187,8 @@ impl Gateway {
             config,
             issuer: Issuer::new()?,
             scope_names,
+            tcp_targets: HashMap::new(),
+            tcp_upstreams: Vec::new(),
             requests: Arc::new(Semaphore::new(requests)),
         })
     }
@@ -181,10 +202,34 @@ impl Gateway {
     pub fn scope_name(&self, id: usize) -> Option<&str> {
         self.scope_names.get(id).map(String::as_str)
     }
+
+    pub fn with_tcp_upstreams(mut self, routes: BTreeMap<String, String>) -> Result<Self> {
+        for (host, upstream) in routes {
+            let host = Endpoint::parse(&host, None)?;
+            let upstream = Endpoint::parse(&upstream, None)?;
+            self.tcp_targets
+                .insert(host, self.scope_names.len() + self.tcp_upstreams.len());
+            self.tcp_upstreams.push(upstream);
+        }
+        Ok(self)
+    }
+
+    pub fn tcp_id(&self, target: &Endpoint) -> Option<usize> {
+        self.tcp_targets.get(target).copied()
+    }
+
+    fn tcp_upstream(&self, id: usize) -> Option<&Endpoint> {
+        self.tcp_upstreams
+            .get(id.checked_sub(self.scope_names.len())?)
+    }
 }
 
 fn bind() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 9444))
+}
+
+fn http_enabled() -> bool {
+    true
 }
 
 fn cert_ttl() -> u64 {
@@ -291,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn unrestricted_scope_dials_an_unlisted_port() {
         let config: Config = toml::from_str("[scopes.all]\nallow_all = true").unwrap();
-        config.validate().unwrap();
+        config.validate(false).unwrap();
         let scope = &config.scopes["all"];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -308,7 +353,7 @@ mod tests {
             assert!(
                 toml::from_str::<Config>(invalid)
                     .unwrap()
-                    .validate()
+                    .validate(false)
                     .is_err()
             );
         }
@@ -402,7 +447,7 @@ pub async fn serve(
     let Ok((generation, scope, lifetime)) = client_grant(leaf) else {
         return;
     };
-    if gateway.scope_name(scope).is_none() {
+    if gateway.scope_name(scope).is_none() && gateway.tcp_upstream(scope).is_none() {
         return;
     }
     let approval = Approval {
@@ -428,62 +473,55 @@ pub async fn serve(
         .await;
 }
 
-pub async fn serve_http(
-    socket: TcpStream,
-    tls: TlsAcceptor,
+pub async fn proxy_http(
+    request: hyper::Request<Incoming>,
     gateway: Arc<Gateway>,
-    handshakes: Arc<Semaphore>,
     app: Arc<App>,
-) {
-    let Some(stream) = accept_tls(socket, tls, &handshakes).await else {
-        return;
-    };
+) -> Response<Body> {
     let allowed = app.auth.subscribe_generation();
-    let service = service_fn(move |request: hyper::Request<Incoming>| {
-        let app = app.clone();
-        let gateway = gateway.clone();
-        let allowed = allowed.clone();
-        async move {
-            let result = async {
-                let (scope, generation, lifetime) =
-                    approve_forward_http(app, request.headers()).await?;
-                let approval = Approval {
-                    generation,
-                    allowed,
-                    deadline: Instant::now() + lifetime,
-                };
-                approval
-                    .clone()
-                    .until_revoked(proxy(request, gateway, scope, approval, false))
-                    .await
-                    .unwrap_or(Err(StatusCode::PROXY_AUTHENTICATION_REQUIRED))
-            }
-            .await;
-            let mut response = result.unwrap_or_else(IntoResponse::into_response);
-            if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
-                && !response.headers().contains_key(header::PROXY_AUTHENTICATE)
-            {
-                response.headers_mut().insert(
-                    header::PROXY_AUTHENTICATE,
-                    header::HeaderValue::from_static("Shomei"),
-                );
-            }
-            Ok::<_, Infallible>(response)
-        }
-    });
-    let _ = http1()
-        .serve_connection(TokioIo::new(stream), service)
-        .with_upgrades()
-        .await;
+    let result = async {
+        let (scope, generation, lifetime) = approve_forward_http(app, request.headers()).await?;
+        let approval = Approval {
+            generation,
+            allowed,
+            deadline: Instant::now() + lifetime,
+        };
+        approval
+            .clone()
+            .until_revoked(proxy(request, gateway, scope, approval, false))
+            .await
+            .unwrap_or(Err(StatusCode::PROXY_AUTHENTICATION_REQUIRED))
+    }
+    .await;
+    let mut response = result.unwrap_or_else(IntoResponse::into_response);
+    if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        response.headers_mut().insert(
+            header::PROXY_AUTHENTICATE,
+            header::HeaderValue::from_static("Shomei"),
+        );
+    }
+    response
 }
 
-fn http1() -> hyper::server::conn::http1::Builder {
+pub(crate) fn http1() -> hyper::server::conn::http1::Builder {
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
         .timer(TokioTimer::new())
         .header_read_timeout(Duration::from_secs(10))
         .max_buf_size(32 * 1024);
     builder
+}
+
+pub(crate) fn valid_connect<B>(request: &hyper::Request<B>) -> bool {
+    request.uri().scheme().is_none()
+        && request.uri().path_and_query().is_none()
+        && !request.headers().contains_key(header::UPGRADE)
+        && !request.headers().contains_key(header::TRANSFER_ENCODING)
+        && request
+            .headers()
+            .get_all(header::CONTENT_LENGTH)
+            .iter()
+            .all(|length| length == "0")
 }
 
 async fn proxy(
@@ -503,15 +541,7 @@ async fn proxy(
         return Err(StatusCode::BAD_REQUEST);
     }
     if connect {
-        if uri.scheme().is_some()
-            || uri.path_and_query().is_some()
-            || request.headers().contains_key(header::TRANSFER_ENCODING)
-            || request
-                .headers()
-                .get_all(header::CONTENT_LENGTH)
-                .iter()
-                .any(|length| length != "0")
-        {
+        if !valid_connect(&request) {
             return Err(StatusCode::BAD_REQUEST);
         }
     } else if uri.scheme_str() != Some("http") {
@@ -519,6 +549,9 @@ async fn proxy(
     }
     let (host, port) =
         target(authority, (!connect).then_some(80)).ok_or(StatusCode::BAD_REQUEST)?;
+    let destination =
+        Endpoint::from_authority(authority, Some(port)).ok_or(StatusCode::BAD_REQUEST)?;
+    let tcp_target = gateway.tcp_id(&destination);
     let host = host.to_owned();
     let upstream_host =
         header::HeaderValue::from_str(authority.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -541,11 +574,37 @@ async fn proxy(
         .clone()
         .try_acquire_owned()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let rules = &gateway.config.scopes[gateway.scope_name(scope).ok_or(StatusCode::FORBIDDEN)?];
-    if !tcp_only && !rules.allows_http_port(port, connect) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let mut socket = rules.dial(&host, port).await?;
+    let mut socket = if tcp_only {
+        match (tcp_target, gateway.tcp_upstream(scope)) {
+            (Some(id), Some(upstream)) if id == scope => {
+                let socket = timeout(
+                    Duration::from_secs(5),
+                    TcpStream::connect((upstream.host.as_str(), upstream.port)),
+                )
+                .await
+                .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
+                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+                let _ = socket.set_nodelay(true);
+                socket
+            }
+            (None, None) => {
+                gateway.config.scopes[gateway.scope_name(scope).ok_or(StatusCode::FORBIDDEN)?]
+                    .dial(&host, port)
+                    .await?
+            }
+            _ => return Err(StatusCode::FORBIDDEN),
+        }
+    } else {
+        if tcp_target.is_some() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let rules =
+            &gateway.config.scopes[gateway.scope_name(scope).ok_or(StatusCode::FORBIDDEN)?];
+        if !rules.allows_http_port(port, connect) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        rules.dial(&host, port).await?
+    };
     if connect {
         let upgrade = hyper::upgrade::on(&mut request);
         tokio::spawn(approval.until_revoked(async move {

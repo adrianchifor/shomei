@@ -41,6 +41,10 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
         identities_file: identities_file.clone(),
         allow_yubikey_4: false,
         http_upstream: None,
+        forwarding: None,
+        hostnames: Default::default(),
+        http_upstreams: Default::default(),
+        tcp_upstreams: Default::default(),
         protected_paths: None,
         session_ttl_seconds: 60,
         tcp: None,
@@ -87,9 +91,18 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
     let (identity, roots) = server_fixture();
     let tls = identity.http1_server().unwrap();
     let app = state.clone();
+    let proxy_router = router.clone();
     let proxy = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        forward::serve_http(socket, tls, gateway, Arc::new(Semaphore::new(16)), app).await;
+        let (socket, peer) = listener.accept().await.unwrap();
+        super::serve(
+            socket,
+            peer,
+            tls,
+            proxy_router,
+            app,
+            Arc::new(Semaphore::new(16)),
+        )
+        .await;
     });
     let http_server = tokio::spawn(async move {
         let app = Router::new().fallback(move |request: Request| async move {
@@ -149,7 +162,10 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
     let challenge = async |counter| {
         let start = send(
             &router,
-            post_json("/_shomei/api/auth/start", json!({ "forward": true })),
+            post_json(
+                "/_shomei/api/auth/start",
+                json!({ "http_destination": format!("http://{plain_addr}/path?q=1") }),
+            ),
         )
         .await;
         assert_eq!(start.status(), StatusCode::OK);
@@ -206,7 +222,7 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
         &router,
         post_json(
             "/_shomei/api/auth/start",
-            json!({ "forward": true, "client_csr_pem": csr }),
+            json!({ "tcp_destination": secure_addr.to_string(), "client_csr_pem": csr }),
         ),
     )
     .await;
@@ -288,6 +304,10 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
                 .parse()
                 .unwrap(),
         ),
+        forwarding: Some(false),
+        hostnames: Default::default(),
+        http_upstreams: Default::default(),
+        tcp_upstreams: Default::default(),
         protected_paths: Some(vec!["/api/deploy".into()]),
         session_ttl_seconds: 60,
         tcp: None,
@@ -303,7 +323,10 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
         false,
     );
     let state = state_with_auth(config, None, auth, None).unwrap();
-    let (cookie, _) = state.sessions.issue(state.auth.generation()).unwrap();
+    let (cookie, _) = state.upstreams[&state.canonical]
+        .sessions
+        .issue(state.auth.generation())
+        .unwrap();
     let cookie = cookie.to_str().unwrap().split(';').next().unwrap();
     let router = routes(state);
     let server = tokio::spawn(async move {
@@ -314,6 +337,16 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
         });
         axum::serve(upstream, app).await.unwrap();
     });
+    let mut unlisted = request("/").body(Body::empty()).unwrap();
+    unlisted
+        .headers_mut()
+        .insert(HOST, HeaderValue::from_static("site.example.test"));
+    let response = send(&router, unlisted).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "GET /"
+    );
     for (method, path) in [
         (Method::GET, "/"),
         (Method::GET, "/assets/%6dain.js"),
@@ -378,6 +411,268 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
         StatusCode::UNAUTHORIZED
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn routes_sites_by_authority_and_keeps_their_approvals_separate() {
+    let public = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let private = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let config = format!(
+        r#"
+        origin = "https://localhost:8443"
+        tls_cert = "unused"
+        tls_key = "unused"
+        state_dir = {:?}
+        identities_file = {:?}
+        hostnames = ["app.example.test"]
+
+        [[http_upstreams]]
+        hostname = "app.example.test"
+        upstream = "http://{}"
+        protected_paths = ["/api/deploy"]
+
+        [[http_upstreams]]
+        hostname = "app.example.test:9447"
+        upstream = "http://{}"
+    "#,
+        dir.path(),
+        dir.path().join("identities"),
+        public.local_addr().unwrap(),
+        private.local_addr().unwrap()
+    );
+    let config_file = dir.path().join("shomei.toml");
+    std::fs::write(&config_file, config).unwrap();
+    let config = Config::load(&config_file).unwrap();
+    let (auth, signer) = test_auth(
+        &config.origin,
+        &config.state_dir,
+        &config.identities_file,
+        &config.limits,
+        false,
+    );
+    let gateway = Arc::new(
+        forward::Gateway::new(
+            toml::from_str("[scopes.web]\ncidrs = [\"127.0.0.1/32\"]\nports = [443]").unwrap(),
+            16,
+        )
+        .unwrap(),
+    );
+    let state = state_with_auth(config, None, auth, Some(gateway)).unwrap();
+    let router = routes(state.clone());
+    let servers = [(public, "public"), (private, "private")].map(|(listener, name)| {
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(move |req: Request| async move {
+                    format!("{name} {} {}", req.method(), req.uri())
+                }),
+            )
+            .await
+            .unwrap();
+        })
+    });
+    let hosted = |host: &str, path: &str| {
+        http::Request::builder()
+            .uri(path)
+            .header(HOST, host)
+            .extension(Peer("127.0.0.1".parse().unwrap()))
+    };
+    let public_host = "app.example.test:8443";
+    let private_host = "app.example.test:9447";
+    let payload = "https://app.example.test:8443/api/deploy";
+    let resp = send(
+        &router,
+        hosted(public_host, "/status").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        resp.into_body().collect().await.unwrap().to_bytes(),
+        "public GET /status"
+    );
+    let resp = send(
+        &router,
+        hosted(public_host, payload).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = send(
+        &router,
+        hosted(private_host, "/status?q=1")
+            .header(ACCEPT, "text/html")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(
+        resp.headers()[LOCATION]
+            .to_str()
+            .unwrap()
+            .starts_with("https://localhost:8443/_shomei/login?app=")
+    );
+
+    let start = async |body, counter| {
+        let response = send(&router, post_json("/_shomei/api/auth/start", body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        signed_answer(&signer, &json_body(response).await, counter)
+    };
+    let reverse = start(json!({ "http_destination": payload }), 1).await;
+    let approval = format!("Shomei {}", URL_SAFE_NO_PAD.encode(reverse.to_string()));
+    let crossed = send(
+        &router,
+        hosted(private_host, "/status")
+            .header(AUTHORIZATION, approval)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(crossed.status(), StatusCode::UNAUTHORIZED);
+
+    let action = start(json!({ "http_destination": payload }), 2).await;
+    let approval = format!("Shomei {}", URL_SAFE_NO_PAD.encode(action.to_string()));
+    let resp = send(
+        &router,
+        hosted(public_host, "/api/deploy")
+            .method(Method::POST)
+            .header(AUTHORIZATION, approval)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.into_body().collect().await.unwrap().to_bytes(),
+        "public POST /api/deploy"
+    );
+
+    let login = start(
+        json!({ "browser_login": { "app": private_host, "next": "/status?q=1" } }),
+        3,
+    )
+    .await;
+    let response = send(&router, post_json("/_shomei/api/auth/finish", login)).await;
+    let reply = json_body(response).await;
+    let target = url::Url::parse(reply["redirect"].as_str().unwrap()).unwrap();
+    assert_eq!(target.port(), Some(9447));
+    let path = &target[url::Position::BeforePath..];
+    assert_eq!(
+        send(
+            &router,
+            hosted(public_host, path).body(Body::empty()).unwrap()
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let complete = send(
+        &router,
+        hosted(private_host, path).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(complete.headers()[LOCATION], "/status?q=1");
+    let cookie = complete.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let resp = send(
+        &router,
+        hosted(private_host, "/status?q=1")
+            .header(COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        resp.into_body().collect().await.unwrap().to_bytes(),
+        "private GET /status?q=1"
+    );
+    assert_eq!(
+        send(
+            &router,
+            hosted(private_host, path).body(Body::empty()).unwrap()
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (identity, roots) = server_fixture();
+    let incoming_tls = identity.http1_server().unwrap();
+    let tls = TlsConnector::from(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ));
+    let proxy = tokio::spawn(async move {
+        let (socket, peer) = listener.accept().await.unwrap();
+        super::serve(
+            socket,
+            peer,
+            incoming_tls,
+            router,
+            state,
+            Arc::new(Semaphore::new(16)),
+        )
+        .await;
+    });
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let encrypted = tls
+        .connect(server_name.clone(), TcpStream::connect(addr).await.unwrap())
+        .await
+        .unwrap();
+    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(encrypted))
+        .await
+        .unwrap();
+    tokio::spawn(connection.with_upgrades());
+    let response = client
+        .send_request(
+            hyper::Request::builder()
+                .method(Method::CONNECT)
+                .uri(Uri::builder().authority(public_host).build().unwrap())
+                .header(HOST, public_host)
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inner = tls
+        .connect(
+            server_name,
+            TokioIo::new(hyper::upgrade::on(response).await.unwrap()),
+        )
+        .await
+        .unwrap();
+    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(inner))
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    for (host, path, status) in [
+        (public_host, "/status", StatusCode::OK),
+        (public_host, "/api/deploy", StatusCode::UNAUTHORIZED),
+        (private_host, "/status", StatusCode::MISDIRECTED_REQUEST),
+    ] {
+        let response = client
+            .send_request(
+                hyper::Request::get(path)
+                    .header(HOST, host)
+                    .body(Empty::<Bytes>::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        response.into_body().collect().await.unwrap();
+    }
+    connection.abort();
+    proxy.abort();
+    for server in servers {
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -452,6 +747,10 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         identities_file: dir.path().join("identities.json"),
         allow_yubikey_4: false,
         http_upstream: None,
+        forwarding: None,
+        hostnames: Default::default(),
+        http_upstreams: Default::default(),
+        tcp_upstreams: Default::default(),
         protected_paths: None,
         session_ttl_seconds: 60,
         tcp: None,
@@ -597,6 +896,10 @@ async fn approves_one_request(u2f: bool) {
                 .parse()
                 .unwrap(),
         ),
+        forwarding: None,
+        hostnames: Default::default(),
+        http_upstreams: Default::default(),
+        tcp_upstreams: Default::default(),
         protected_paths: None,
         session_ttl_seconds: 60,
         tcp: Some(TcpConfig {

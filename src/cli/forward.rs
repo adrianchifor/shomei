@@ -20,7 +20,7 @@ use rustls::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::copy_bidirectional,
+    io::{AsyncRead, AsyncWrite, copy_bidirectional},
     net::TcpStream,
     time::{Instant, sleep_until, timeout},
 };
@@ -72,7 +72,8 @@ pub(super) struct CredentialsArgs {
 struct Certificate {
     certificate_pem: String,
     expires_at: u64,
-    forward_endpoint: String,
+    forward_endpoint: Option<String>,
+    tcp_endpoint: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -80,6 +81,8 @@ struct CredentialMetadata {
     origin: Url,
     endpoint: String,
     expires_at: u64,
+    #[serde(default)]
+    direct: bool,
 }
 
 struct Credentials {
@@ -89,18 +92,42 @@ struct Credentials {
 }
 
 impl Credentials {
-    async fn approve(origin: Url, roots: RootCertStore, scope: Option<&str>) -> Result<Self> {
+    async fn approve(
+        origin: Url,
+        roots: RootCertStore,
+        scope: Option<&str>,
+        target: Option<&Authority>,
+    ) -> Result<Self> {
         let gateway = Gateway::new(origin.clone(), roots)?;
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let csr = CertificateParams::default()
             .serialize_request(&key)?
             .pem()?;
-        let signed = gateway.sign_forward(scope, Some(&csr)).await?;
+        let signed = if let Some(target) = target {
+            gateway
+                .sign_challenge(
+                    "start",
+                    &serde_json::json!({
+                        "tcp_destination": target.as_str(),
+                        "client_csr_pem": csr,
+                        "forward_scope": scope,
+                    }),
+                )
+                .await?
+        } else {
+            gateway.sign_forward(scope, Some(&csr)).await?
+        };
         let grant: Certificate = gateway.post("finish", &signed).await?;
+        let (endpoint, direct) = match (grant.forward_endpoint, grant.tcp_endpoint) {
+            (Some(endpoint), None) => (endpoint, false),
+            (None, Some(endpoint)) if target.is_some() => (endpoint, true),
+            _ => anyhow::bail!("gateway returned an invalid TCP approval"),
+        };
         let metadata = CredentialMetadata {
             origin,
-            endpoint: grant.forward_endpoint,
+            endpoint,
             expires_at: grant.expires_at,
+            direct,
         };
         Ok(Self {
             metadata,
@@ -165,7 +192,7 @@ impl Credentials {
             .expires_at
             .saturating_sub(crate::tls::unix_seconds()?);
         ensure!(
-            (1..=3600).contains(&lifetime),
+            (1..=if self.metadata.direct { 86_400 } else { 3600 }).contains(&lifetime),
             "the forward proxy certificate is expired or has an invalid lifetime"
         );
         Ok((host, port, Duration::from_secs(lifetime)))
@@ -186,7 +213,7 @@ impl CredentialsArgs {
         self.scope.is_some() || self.credentials.is_some()
     }
 
-    pub(super) async fn tunnel(self, access: Access) -> Result<Tunnel> {
+    pub(super) async fn tunnel(self, access: Access, target: &Authority) -> Result<Tunnel> {
         if let Some(dir) = self.credentials {
             let credentials = Credentials::read(&dir)
                 .with_context(|| format!("read credentials from {}", dir.display()))?;
@@ -202,7 +229,8 @@ impl CredentialsArgs {
         let origin = sign_origin(access.proxy, access.identity)?;
         let roots = trust_roots(&origin, access.ca_file.as_deref())?;
         let credentials =
-            Credentials::approve(origin, roots.clone(), self.scope.as_deref()).await?;
+            Credentials::approve(origin, roots.clone(), self.scope.as_deref(), Some(target))
+                .await?;
         Tunnel::new(credentials, roots)
     }
 }
@@ -214,7 +242,7 @@ pub(super) async fn export(args: MtlsArgs) -> Result<()> {
     );
     let origin = sign_origin(args.access.proxy, args.access.identity)?;
     let roots = trust_roots(&origin, args.access.ca_file.as_deref())?;
-    let credentials = Credentials::approve(origin, roots, args.scope.as_deref()).await?;
+    let credentials = Credentials::approve(origin, roots, args.scope.as_deref(), None).await?;
     let (_, _, lifetime) = credentials.endpoint()?;
     credentials.write(&args.out)?;
     eprintln!(
@@ -232,7 +260,11 @@ pub(super) struct Tunnel {
     host: Arc<str>,
     port: u16,
     deadline: Instant,
+    direct: bool,
 }
+
+pub(super) trait TunnelStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> TunnelStream for T {}
 
 impl Tunnel {
     fn new(credentials: Credentials, roots: RootCertStore) -> Result<Self> {
@@ -245,13 +277,11 @@ impl Tunnel {
             host: host.into(),
             port,
             deadline: Instant::now() + lifetime,
+            direct: credentials.metadata.direct,
         })
     }
 
-    pub(super) async fn open(
-        &self,
-        target: Authority,
-    ) -> Result<TokioIo<hyper::upgrade::Upgraded>> {
+    pub(super) async fn open(&self, target: Authority) -> Result<Box<dyn TunnelStream>> {
         ensure!(
             Instant::now() < self.deadline,
             "the forward proxy certificate has expired"
@@ -266,6 +296,9 @@ impl Tunnel {
                 .connect(ServerName::try_from(self.host.to_string())?, socket)
                 .await
                 .context("authenticate the forward proxy with mTLS")?;
+            if self.direct {
+                return Ok(Box::new(tls) as Box<dyn TunnelStream>);
+            }
             let (mut sender, connection) =
                 hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
             tokio::spawn(connection.with_upgrades());
@@ -284,7 +317,8 @@ impl Tunnel {
                 "forward proxy returned {}",
                 response.status()
             );
-            Ok(TokioIo::new(hyper::upgrade::on(response).await?))
+            Ok(Box::new(TokioIo::new(hyper::upgrade::on(response).await?))
+                as Box<dyn TunnelStream>)
         })
         .await
         .context("forward proxy connection timed out")?
@@ -297,7 +331,7 @@ pub(super) async fn connect(args: ConnectArgs) -> Result<()> {
         "the TCP bridge must listen on a loopback address"
     );
     let listener = crate::listen(args.listen).context("bind the local TCP bridge")?;
-    let tunnel = args.forward.tunnel(args.access).await?;
+    let tunnel = args.forward.tunnel(args.access, &args.target).await?;
     let deadline = tunnel.deadline;
     println!("{}", listener.local_addr()?);
     std::io::stdout().flush()?;

@@ -2,6 +2,7 @@ import { post, prepareApproval, signApproval, supportsWebAuthn } from "/_shomei/
 
 const notice = document.querySelector("#status");
 const query = new URLSearchParams(location.search);
+const app = query.get("app");
 const next = query.get("next") || "/";
 let busy = false;
 
@@ -16,11 +17,11 @@ async function run() {
   busy = true;
   try {
     notice.textContent = "Tap your YubiKey to continue.";
-    const approval = await prepareApproval();
+    const approval = await prepareApproval(app ? { browser_login: { app, next } } : {});
     const signed = await signApproval(approval);
     notice.textContent = "Verifying YubiKey approval…";
-    await post("/_shomei/api/auth/finish", signed);
-    location.assign(destination());
+    const result = await post("/_shomei/api/auth/finish", signed);
+    location.assign(result.redirect || destination());
   } catch (error) {
     notice.textContent = ["NotAllowedError", "AbortError"].includes(error.name)
       ? "Click the page or press Enter to open the YubiKey prompt."

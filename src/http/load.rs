@@ -62,6 +62,10 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
         identities_file,
         allow_yubikey_4: false,
         http_upstream: Some(upstream_name.parse().unwrap()),
+        forwarding: None,
+        hostnames: Default::default(),
+        http_upstreams: Default::default(),
+        tcp_upstreams: Default::default(),
         protected_paths: None,
         session_ttl_seconds: 600,
         tcp: None,
@@ -73,6 +77,7 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
     let handshakes = Arc::new(Semaphore::new(config.limits.tls_handshakes));
     let state = super::state(config, None, None).unwrap();
     let router = routes(state.clone());
+    let gateway_state = state.clone();
     let tls = identity.server(None).unwrap();
     let gateway = tokio::spawn(crate::serve(listener, limit, move |socket, peer| {
         super::serve(
@@ -80,6 +85,7 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
             peer,
             tls.clone(),
             router.clone(),
+            gateway_state.clone(),
             handshakes.clone(),
         )
     }));
@@ -96,7 +102,10 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
     for _ in 0..CLIENTS {
         let opening = opening.clone();
         let connector = connector.clone();
-        let (cookie, _) = state.sessions.issue(state.auth.generation()).unwrap();
+        let (cookie, _) = state.upstreams[&state.canonical]
+            .sessions
+            .issue(state.auth.generation())
+            .unwrap();
         let cookie =
             HeaderValue::from_str(cookie.to_str().unwrap().split_once(';').unwrap().0).unwrap();
         let uri = uri.clone();

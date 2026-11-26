@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
@@ -27,6 +28,7 @@ pub struct Sessions {
     started: Instant,
     epoch: u64,
     ttl: u64,
+    cookie_name: Cow<'static, str>,
 }
 
 impl Sessions {
@@ -43,14 +45,20 @@ impl Sessions {
             started: Instant::now(),
             epoch: unix_seconds()?,
             ttl,
+            cookie_name: Cow::Borrowed(COOKIE_NAME),
         })
+    }
+
+    pub fn for_port(mut self, port: u16) -> Self {
+        self.cookie_name = Cow::Owned(format!("{COOKIE_NAME}-{port}"));
+        self
     }
 
     pub fn issue(&self, generation: u64) -> Result<(HeaderValue, u64)> {
         let (token, expires) = self.issue_token(generation)?;
         let cookie = format!(
-            "{COOKIE_NAME}={token}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
-            self.ttl
+            "{}={token}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
+            self.cookie_name, self.ttl
         );
         Ok((HeaderValue::from_str(&cookie)?, expires))
     }
@@ -91,7 +99,10 @@ impl Sessions {
             .iter()
             .filter_map(|header| header.to_str().ok())
             .flat_map(|line| line.split(';'))
-            .filter_map(session_value);
+            .filter_map(|pair| {
+                let (name, token) = pair.trim().split_once('=')?;
+                (name.trim() == self.cookie_name).then_some(token)
+            });
         let Some(token) = tokens.next() else {
             return false;
         };
@@ -132,5 +143,6 @@ impl Sessions {
 
 pub fn session_value(pair: &str) -> Option<&str> {
     let (name, value) = pair.trim().split_once('=')?;
-    (name.trim() == COOKIE_NAME).then_some(value)
+    let name = name.trim();
+    (name == COOKIE_NAME || name.starts_with("__Host-shomei-")).then_some(value)
 }

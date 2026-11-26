@@ -1,10 +1,12 @@
 use std::{
+    collections::{BTreeMap, HashSet},
     fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
+use axum::http::uri::Authority;
 use serde::Deserialize;
 use url::Url;
 
@@ -21,6 +23,13 @@ pub struct Config {
     #[serde(default)]
     pub allow_yubikey_4: bool,
     pub http_upstream: Option<Url>,
+    pub forwarding: Option<bool>,
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+    #[serde(default)]
+    pub http_upstreams: Vec<HttpUpstreamConfig>,
+    #[serde(default)]
+    pub tcp_upstreams: BTreeMap<String, String>,
     pub protected_paths: Option<Vec<String>>,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
@@ -29,6 +38,49 @@ pub struct Config {
     pub tailscale_ssh: Option<TailscaleSshConfig>,
     #[serde(default)]
     pub limits: Limits,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpUpstreamConfig {
+    pub hostname: Option<String>,
+    pub upstream: Url,
+    pub protected_paths: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Endpoint {
+    pub fn parse(value: &str, default_port: Option<u16>) -> Result<Self> {
+        let authority = match value.parse::<std::net::Ipv6Addr>() {
+            Ok(ip) => format!("[{ip}]").parse()?,
+            Err(_) => value.parse()?,
+        };
+        Self::from_authority(&authority, default_port).context("invalid host or port")
+    }
+
+    pub fn from_authority(authority: &Authority, default_port: Option<u16>) -> Option<Self> {
+        let (host, port) = crate::forward::target(authority, default_port)?;
+        let host = match host.parse::<IpAddr>() {
+            Ok(ip) => ip.to_canonical().to_string(),
+            Err(_) => host.trim_end_matches('.').to_ascii_lowercase(),
+        };
+        Some(Self { host, port })
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(output, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(output, "{}:{}", self.host, self.port)
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -83,6 +135,14 @@ pub struct TailscaleSshConfig {
 }
 
 impl Config {
+    pub fn forwarding_enabled(&self) -> bool {
+        self.forwarding.unwrap_or(self.forward.is_some())
+    }
+
+    pub fn http_upstream_count(&self) -> usize {
+        self.http_upstreams.len() + usize::from(self.http_upstream.is_some())
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path).context("read config")?;
         let config: Self = toml::from_str(&contents).context("parse config")?;
@@ -93,8 +153,10 @@ impl Config {
         );
         ensure!(
             config.http_upstream.is_some()
+                || !config.http_upstreams.is_empty()
+                || !config.tcp_upstreams.is_empty()
                 || config.tcp.is_some()
-                || config.forward.is_some()
+                || config.forwarding_enabled()
                 || config.tailscale_ssh.is_some(),
             "configure an upstream, a forward proxy, or Tailscale SSH"
         );
@@ -122,6 +184,64 @@ impl Config {
             config.http_upstream.as_ref(),
             config.protected_paths.as_deref(),
         )?;
+        if config.forwarding_enabled() {
+            ensure!(
+                config
+                    .forward
+                    .as_ref()
+                    .is_some_and(|forward| !forward.scopes.is_empty()),
+                "forwarding requires at least one forward scope"
+            );
+        }
+        let port = config.origin.port_or_known_default();
+        let canonical = Endpoint::parse(
+            config.origin.domain().context("missing gateway hostname")?,
+            port,
+        )?;
+        let mut names = HashSet::new();
+        for host in &config.hostnames {
+            let host = Endpoint::parse(host, port)
+                .with_context(|| format!("invalid hostname {host:?}"))?;
+            if host != canonical {
+                ensure!(names.insert(host), "duplicate gateway hostname");
+            }
+        }
+        let mut upstream_names = HashSet::new();
+        let mut has_default = config.http_upstream.is_some();
+        for site in &config.http_upstreams {
+            if let Some(host) = &site.hostname {
+                let host = Endpoint::parse(host, port)
+                    .with_context(|| format!("invalid HTTP hostname {host:?}"))?;
+                ensure!(
+                    upstream_names.insert(host),
+                    "duplicate reverse HTTP hostname"
+                );
+            } else {
+                ensure!(!has_default, "only one HTTP upstream can omit hostname");
+                ensure!(
+                    !config.hostnames.is_empty()
+                        || (!config.forwarding_enabled() && config.http_upstream_count() == 1),
+                    "an HTTP upstream without hostname requires hostnames for routing"
+                );
+                has_default = true;
+            }
+            validate_http_site(Some(&site.upstream), site.protected_paths.as_deref())?;
+        }
+        if has_default {
+            ensure!(
+                !upstream_names.contains(&canonical)
+                    || names.iter().any(|host| !upstream_names.contains(host)),
+                "the default HTTP upstream needs a hostname without a named upstream"
+            );
+        }
+        let mut tcp_names = HashSet::new();
+        for (host, upstream) in &config.tcp_upstreams {
+            ensure!(
+                tcp_names.insert(Endpoint::parse(host, None)?),
+                "duplicate reverse TCP destination"
+            );
+            Endpoint::parse(upstream, None).context("invalid TCP upstream")?;
+        }
         if let Some(tcp) = &config.tcp {
             let endpoint: axum::http::uri::Authority =
                 tcp.upstream.parse().context("parse TCP upstream")?;
@@ -151,8 +271,12 @@ impl Config {
                 );
             }
         }
-        if let Some(forward) = &config.forward {
-            forward.validate()?;
+        if let Some(forward) = config
+            .forward
+            .as_ref()
+            .filter(|_| config.forwarding_enabled() || !config.tcp_upstreams.is_empty())
+        {
+            forward.validate(!config.tcp_upstreams.is_empty())?;
         }
         if let Some(tailscale) = &config.tailscale_ssh {
             ensure!(
@@ -312,6 +436,44 @@ fn tailscale_socket() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostless_http_upstreams_need_aliases_when_forwarding_or_multi_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shomei.toml");
+        let config = r#"
+origin = "https://localhost:8443"
+tls_cert = "tls.pem"
+tls_key = "tls-key.pem"
+state_dir = "state"
+identities_file = "identities"
+forwarding = false
+
+[[http_upstreams]]
+upstream = "http://app:8080"
+
+[forward.scopes.web]
+cidrs = ["10.0.0.0/8"]
+ports = [443]
+"#;
+        fs::write(&file, config).unwrap();
+        let loaded = Config::load(&file).unwrap();
+        assert!(!loaded.forwarding_enabled());
+        let enabled = config.replace("forwarding = false", "forwarding = true");
+        fs::write(&file, &enabled).unwrap();
+        assert!(Config::load(&file).is_err());
+        fs::write(
+            &file,
+            enabled.replace(
+                "forwarding = true",
+                "forwarding = true\nhostnames = [\"app.example.test\"]",
+            ),
+        )
+        .unwrap();
+        assert!(Config::load(&file).is_ok());
+        fs::write(&file, format!("{config}\n[[http_upstreams]]\nhostname = \"other.example.test\"\nupstream = \"http://other:8080\"\n")).unwrap();
+        assert!(Config::load(&file).is_err());
+    }
 
     #[test]
     fn selective_paths_require_an_http_upstream_and_valid_paths() {

@@ -6,10 +6,27 @@ state_dir = "/var/lib/shomei"
 identities_file = "/etc/shomei/identities.json"
 allow_yubikey_4 = false  # May be enabled for localhost origins.
 http_upstream = "http://host.docker.internal:8080"
+forwarding = false
+# Other public DNS names or IPs for the default upstream. A missing port uses the origin port.
+# hostnames = ["127.0.0.1", "app.example.com"]
 session_ttl_seconds = 600
 
 # Require fresh approval for these paths and leave other paths public.
 # protected_paths = ["/api/deploy"]
+
+# Additional reverse sites, selected by their public hostname and port.
+# [[http_upstreams]]
+# hostname = "deploy.example.com"
+# upstream = "http://deploy:8080"
+# protected_paths = ["/api/deploy"]
+# [[http_upstreams]]
+# hostname = "dashboard.example.com:8443"
+# upstream = "http://dashboard:3000"
+
+# Named TCP routes share the mTLS listener on forward.bind.
+# [tcp_upstreams]
+# "ssh.example.com:22" = "sshd:2222"
+# "db.example.com:5432" = "postgres:5432"
 
 [tcp]
 bind = "0.0.0.0:9443"
@@ -18,13 +35,16 @@ upstream = "host.docker.internal:9000"
 public_port = 9443
 cert_ttl_seconds = 300
 
-# Forward proxy. Replace the example DNS and IP ranges with your own.
+# Set forwarding = true above to use these scopes.
+# Replace the example DNS and IP ranges with your own.
 # [forward]
 # TCP and SSH use mTLS on this listener.
 # bind = "0.0.0.0:9444"
 # public_port = 9444
 # cert_ttl_seconds = 300
-# HTTP and HTTPS use signed approvals or sessions over TLS. Omit to disable.
+# HTTP forwarding uses the main HTTPS listener. Set false for TCP-only forwarding.
+# http_enabled = true
+# Optional additional listener for HTTP/HTTPS proxy clients.
 # http_bind = "0.0.0.0:9445"
 
 # [forward.scopes.fleet]
