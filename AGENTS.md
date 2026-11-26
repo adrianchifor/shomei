@@ -72,7 +72,7 @@ Open the authentication page as a top-level navigation. Shomei sets `frame-ances
 
 ### Require approval for a website action
 
-Add `protected_paths` at the top level or in the named HTTP upstream to leave the rest of the site public. Listed paths and descendants require approval. Matching is case-insensitive, and ambiguous paths always require fresh approval. Include any application route aliases that reach the protected handler.
+Add `protected_paths` at the top level or in the named HTTP upstream to leave the rest of the site public. Listed paths, descendants, and format suffixes such as `/api/deploy.json` require approval. Matching is case-insensitive, and ambiguous paths always require fresh approval. Include any application route aliases that reach the protected handler.
 
 ```toml
 protected_paths = ["/api/deploy"]
@@ -80,7 +80,7 @@ protected_paths = ["/api/deploy"]
 
 The app owns the button, request method, and payload. Import `approvedFetch` from `/_shomei/approval.js` and call it with the same URL and options you would give `fetch`. It loads the overlay HTML and CSS from the app origin and sends the request after approval. On an app hostname separate from `origin`, the overlay uses a gateway popup for WebAuthn. [Deploy demo script](fixtures/deploy/deploy.js)
 
-Set `protected_session_ttl_seconds` on the gateway or HTTP upstream. Override it with `{ path = "/api/deploy", session_ttl_seconds = 0 }` in `protected_paths`. The default is `0` for a fresh approval each time. Positive TTLs reuse approval for the same host, method, and rule. The overlay reuses approval in the tab. For curl, save the cookie with `-c local/session.txt` on the signed request and send it with `-b local/session.txt` afterward. Both expire on allowlist revocation or gateway restart. [Protected path configuration](README.md#protect-selected-endpoints)
+Set `protected_session_ttl_seconds` on the gateway or HTTP upstream. Override it with `{ path = "/api/deploy", session_ttl_seconds = 0 }` in `protected_paths`. The default is `0` for a fresh approval each time. Positive TTLs, up to 3600 seconds, reuse approval for the same host, method, and rule. The overlay reuses approval in the tab. For curl, save the cookie with `-c local/session.txt` on the signed request and send it with `-b local/session.txt` afterward. Both expire on allowlist revocation or gateway restart. [Protected path configuration](README.md#protect-selected-endpoints)
 
 For a custom WebAuthn client, `POST {}` as JSON to `/_shomei/api/auth/start`. Pass the returned `publicKey` options to `navigator.credentials.get` after decoding the challenge and credential IDs. Serialize the result as WebAuthn JSON. Submit `{challenge_id, credential}` to `/_shomei/api/auth/finish` to create a session, or send that JSON as base64url without padding in `Authorization: Shomei <assertion>` on the intended upstream request. Each challenge can be used once. [WebAuthn helper](assets/webauthn.js)
 
@@ -183,7 +183,7 @@ From the caller's Tailscale device, pass the destination as the SSH host. Shomei
 shomei ssh --tailscale --proxy https://shomei.example.ts.net:8443 ubuntu@deploy.example.ts.net
 ```
 
-After a successful YubiKey approval, Shomei sets the calling device's attribute for `ttl_seconds` (default 300, range 1–3600) and starts OpenSSH directly to the requested destination. The approval applies to all matching tailnet grants during that window. Removing a YubiKey from the Shomei allowlist blocks new approvals. To revoke an approval early, remove the device's attribute in Tailscale. [Tailscale attribute expiry](https://tailscale.com/docs/features/tailscale-accessbot-jit#set-custom-posture-attributes-by-using-the-api)
+After a successful YubiKey approval, Shomei sets the calling device's attribute for `ttl_seconds` (default 300, range 1 to 3600) and starts OpenSSH directly to the requested destination. The approval applies to all matching tailnet grants during that window. Removing a YubiKey from the Shomei allowlist blocks new approvals. To revoke an approval early, remove the device's attribute in Tailscale. [Tailscale attribute expiry](https://tailscale.com/docs/features/tailscale-accessbot-jit#set-custom-posture-attributes-by-using-the-api)
 
 ## Verify the integration
 
