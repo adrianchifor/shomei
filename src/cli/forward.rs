@@ -237,10 +237,7 @@ impl CredentialsArgs {
 }
 
 pub(super) async fn export(args: MtlsArgs) -> Result<()> {
-    ensure!(
-        !args.out.try_exists()?,
-        "credential output directory already exists"
-    );
+    check_output_dir(&args.out)?;
     let origin = sign_origin(args.access.proxy, args.access.identity)?;
     let roots = trust_roots(&origin, args.access.ca_file.as_deref())?;
     let credentials = Credentials::approve(origin, roots, args.scope.as_deref(), None).await?;
@@ -251,6 +248,23 @@ pub(super) async fn export(args: MtlsArgs) -> Result<()> {
         args.out.display(),
         credentials.metadata.endpoint,
         lifetime.as_secs()
+    );
+    Ok(())
+}
+
+fn check_output_dir(out: &Path) -> Result<()> {
+    ensure!(
+        !out.try_exists()?,
+        "credential output directory already exists"
+    );
+    let parent = match out.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    ensure!(
+        parent.is_dir(),
+        "the parent directory of {} does not exist",
+        out.display()
     );
     Ok(())
 }
