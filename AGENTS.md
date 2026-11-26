@@ -35,6 +35,12 @@ fi
 
 For an existing allowlist, merge the exported record into the array and replace the file atomically. The gateway reloads it automatically. Removing or replacing a key revokes existing grants.
 
+## Share a gateway across services
+
+Use one public HTTPS origin for related sites and APIs. Set `http_upstream` to a private router that sends paths such as `/dashboard` and `/api/deploy` to their respective services. Configure `[tcp]` on the same gateway to reuse the enrollment for SSH.
+
+Use a separate Shomei configuration and enrollment for each distinct HTTPS origin, including when the port differs. The same physical YubiKey can enroll at each origin. [Shared gateway overview](README.md#share-a-gateway-across-services)
+
 ## Integrate a website
 
 Set `http_upstream` to the application’s HTTP or HTTPS origin, without a path. Set these keys at the top level of the TOML file, before any tables. Route the application and `/_shomei` through the same Shomei HTTPS origin.
