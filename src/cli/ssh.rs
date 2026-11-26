@@ -34,7 +34,7 @@ pub(super) struct SshArgs {
     /// The HTTPS authorization origin for tls:// proxies. Defaults to port 8443.
     #[arg(long, value_parser = https_origin)]
     auth_url: Option<Url>,
-    /// PEM trust roots for the gateway. Defaults to public WebPKI roots.
+    /// PEM trust roots. Localhost can use ~/.shomei/localhost-ca.pem.
     #[arg(long, env = "SHOMEI_CA_FILE")]
     ca_file: Option<PathBuf>,
     /// Pass one option or value to OpenSSH. Repeat with --ssh-arg=<value>.
@@ -62,7 +62,7 @@ pub(super) async fn run(args: SshArgs) -> Result<()> {
         .domain()
         .context("missing TLS server name")?
         .to_owned();
-    let roots = trust_roots(args.ca_file.as_deref())?;
+    let roots = trust_roots(&origin, args.ca_file.as_deref())?;
     let gateway = Gateway::new(origin, roots.clone())?;
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
     let mut params = CertificateParams::default();

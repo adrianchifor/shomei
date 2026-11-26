@@ -28,13 +28,14 @@ Install `mkcert` to generate a trusted localhost certificate. [mkcert](https://g
 
 ```sh
 umask 077
-mkdir -p local/config local/deploy-state local/ssh-state
+mkdir -p local/config local/deploy-state local/ssh-state "$HOME/.shomei"
 export CAROOT="$PWD/local/ca"
 export SHOMEI_PROXY=https://localhost:8443
 export SHOMEI_CA_FILE="$CAROOT/rootCA.pem"
 export SHOMEI_UID="$(id -u)" SHOMEI_GID="$(id -g)"
 mkcert -install
 mkcert -ecdsa -cert-file local/config/tls.pem -key-file local/config/tls-key.pem localhost
+install -m 0600 "$CAROOT/rootCA.pem" "$HOME/.shomei/localhost-ca.pem"
 
 shomei init
 if [ ! -e local/config/identities.json ]; then
@@ -45,7 +46,9 @@ fi
 
 Add `--set-pin` to `shomei init` if your YubiKey 5 has no FIDO2 PIN. For a YubiKey 4, add `--u2f` instead. Both demos enable attested, touch-only U2F for localhost.
 
-The CLI stores the public identity in `~/.shomei/identity.json`. `shomei init` defaults to `https://localhost:8443`. For another gateway, set `SHOMEI_PROXY` or pass `--proxy` during enrollment. `shomei sign` can use the saved origin.
+The CLI stores the public identity in `~/.shomei/identity.json`. `shomei init` defaults to `https://localhost:8443`. For another gateway, set `SHOMEI_PROXY` or pass `--proxy` during enrollment. `shomei sign` can use the saved origin. `sign` and `ssh` use `~/.shomei/localhost-ca.pem` for localhost unless you specify a CA with `--ca-file` or `SHOMEI_CA_FILE`.
+
+Run `shomei clear` to delete the local identity after confirmation. Remove its entry from the gateway’s allowlist to revoke access.
 
 ### Approve a deploy
 
@@ -76,7 +79,9 @@ shomei ssh --proxy tls://localhost:9443 \
   --ssh-arg=-o --ssh-arg=StrictHostKeyChecking=yes ubuntu@deploy -- id -un
 ```
 
-Approve with your YubiKey. The command prints `ubuntu`. Omit `-- id -un` for an interactive shell. The Ubuntu SSH listener is private to the gateway network namespace. Port 9443 accepts mTLS connections from Shomei clients.
+`ubuntu` is the OpenSSH login user. `deploy` matches `tcp.ssh_host` in the gateway config, and `tcp.upstream` sets the actual SSH destination. In this demo that destination is `127.0.0.1:2222` inside the gateway network namespace. [SSH demo configuration](fixtures/ssh/shomei.toml)
+
+Approve with your YubiKey. The command prints `ubuntu`. Omit `-- id -un` for an interactive shell.
 
 Stop the demo with `docker compose -f compose.ssh.yaml down`.
 
@@ -95,7 +100,7 @@ Copy `shomei.example.toml` to `local/config/shomei.toml`, set your origin and up
 | `[browser_action]` | Exposes an approval page and requires a fresh assertion for HTTP writes. |
 | `[limits]` | Connection, request, and challenge limits. |
 
-Put one `shomei get-id` token per line in the identity file. Blank lines and `#` comments are allowed. Shomei decodes the compressed records in memory and verifies their hardware attestation. Existing JSON arrays also work. Use `shomei get-id --json` for JSON-based tooling. [Convert an existing allowlist](AGENTS.md#enroll-a-key)
+Put one `shomei get-id` token per line in the identity file. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. All keys use the `shomei` account. Shomei decodes the compressed records in memory and verifies their hardware attestation. Existing JSON arrays also work. Use `shomei get-id --json` for JSON-based tooling. [Convert an existing allowlist](AGENTS.md#enroll-a-key)
 
 Replace the identity file atomically to reload the allowlist. Adding a key preserves existing grants. Removing or replacing a key revokes them. Restarting the proxy invalidates its session cookies.
 

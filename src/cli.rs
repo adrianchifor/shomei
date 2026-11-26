@@ -3,7 +3,8 @@ mod ssh;
 
 use std::{
     env, fs,
-    io::{BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -55,6 +56,8 @@ enum Command {
     Init(InitArgs),
     /// Print the saved public identity as a compact allowlist token.
     GetId(GetIdArgs),
+    /// Delete the local public identity after confirmation.
+    Clear(IdentityFile),
     /// Print a one-use Shomei authorization assertion.
     Sign(Access),
     /// Connect to an allowlisted SSH host through Shomei.
@@ -84,14 +87,18 @@ impl IdentityFile {
         if let Some(path) = self.identity_file {
             return Ok(path);
         }
-        let home = env::var_os("HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
+        let home = home_directory();
         let config = env::var_os("XDG_CONFIG_HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
         default_identity_path(home.as_deref(), config.as_deref())
     }
+}
+
+fn home_directory() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn default_identity_path(home: Option<&Path>, config: Option<&Path>) -> Result<PathBuf> {
@@ -132,7 +139,7 @@ struct Access {
     /// The gateway HTTPS origin. Defaults to the origin in the local identity.
     #[arg(long, env = "SHOMEI_PROXY", value_parser = https_origin)]
     proxy: Option<Url>,
-    /// PEM trust roots for this gateway. Defaults to public WebPKI roots.
+    /// PEM trust roots. Localhost can use ~/.shomei/localhost-ca.pem.
     #[arg(long, env = "SHOMEI_CA_FILE")]
     ca_file: Option<PathBuf>,
     #[command(flatten)]
@@ -146,9 +153,13 @@ pub async fn run() -> Result<Option<PathBuf>> {
         Some(Command::Serve { config }) => return Ok(Some(config_path(config))),
         Some(Command::Init(args)) => init(args).await?,
         Some(Command::GetId(args)) => get_id(args)?,
+        Some(Command::Clear(args)) => {
+            clear_identity(&args.resolve()?, io::stdin().lock(), io::stderr().lock())?;
+        }
         Some(Command::Sign(args)) => {
             let origin = sign_origin(args.proxy, args.identity)?;
-            let gateway = Gateway::new(origin, trust_roots(args.ca_file.as_deref())?)?;
+            let roots = trust_roots(&origin, args.ca_file.as_deref())?;
+            let gateway = Gateway::new(origin, roots)?;
             let signed = gateway.sign(None).await?;
             println!("{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&signed)?));
         }
@@ -215,6 +226,37 @@ fn get_id(args: GetIdArgs) -> Result<()> {
     Ok(())
 }
 
+fn clear_identity(path: &Path, mut input: impl BufRead, mut output: impl Write) -> Result<()> {
+    let original = fs::symlink_metadata(path)
+        .with_context(|| format!("locate identity at {}", path.display()))?;
+    ensure!(
+        original.is_file() || original.is_symlink(),
+        "identity path must point to a file"
+    );
+    write!(
+        output,
+        "Delete the local identity at {}? [y/N] ",
+        path.display()
+    )?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer).context("read confirmation")?;
+    let answer = answer.trim();
+    if !answer.eq_ignore_ascii_case("y") && !answer.eq_ignore_ascii_case("yes") {
+        writeln!(output, "Kept the local identity.")?;
+        return Ok(());
+    }
+    let current = fs::symlink_metadata(path)
+        .with_context(|| format!("locate identity at {}", path.display()))?;
+    ensure!(
+        (original.dev(), original.ino()) == (current.dev(), current.ino()),
+        "the identity changed during confirmation. Run shomei clear again"
+    );
+    fs::remove_file(path).with_context(|| format!("remove identity at {}", path.display()))?;
+    writeln!(output, "Deleted the local identity.")?;
+    Ok(())
+}
+
 fn read_identity(args: IdentityFile) -> Result<StaticIdentity> {
     let path = args.resolve()?;
     let file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
@@ -239,14 +281,29 @@ fn sign_origin(proxy: Option<Url>, args: IdentityFile) -> Result<Url> {
     Ok(identity.origin)
 }
 
-fn trust_roots(path: Option<&Path>) -> Result<RootCertStore> {
-    let Some(path) = path else {
+fn localhost_ca(origin: &Url, home: Option<&Path>) -> Result<Option<PathBuf>> {
+    let Some(home) = home.filter(|_| origin.domain() == Some("localhost")) else {
+        return Ok(None);
+    };
+    let path = home.join(".shomei/localhost-ca.pem");
+    Ok(path.try_exists()?.then_some(path))
+}
+
+fn trust_roots(origin: &Url, path: Option<&Path>) -> Result<RootCertStore> {
+    let local = if path.is_none() {
+        localhost_ca(origin, home_directory().as_deref())?
+    } else {
+        None
+    };
+    let Some(path) = path.or(local.as_deref()) else {
         return Ok(RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         });
     };
     let mut store = RootCertStore::empty();
-    for certificate in CertificateDer::pem_file_iter(path).context("open gateway CA file")? {
+    for certificate in CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("open gateway CA file {}", path.display()))?
+    {
         store
             .add(certificate?)
             .context("invalid gateway trust root")?;
@@ -372,6 +429,38 @@ impl Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_the_identity_requires_an_explicit_yes() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = directory.path().join("identity.json");
+        let ca = directory.path().join("localhost-ca.pem");
+        fs::write(&identity, "identity").unwrap();
+        fs::write(&ca, "ca").unwrap();
+
+        for answer in ["", "\n", "no\n"] {
+            let mut output = Vec::new();
+            clear_identity(&identity, answer.as_bytes(), &mut output).unwrap();
+            assert!(identity.exists());
+            assert!(String::from_utf8(output).unwrap().contains("[y/N]"));
+        }
+        clear_identity(&identity, &b"yes\n"[..], io::sink()).unwrap();
+        assert!(!identity.exists());
+        assert!(ca.exists());
+    }
+
+    #[test]
+    fn the_local_ca_is_only_selected_for_localhost() {
+        let home = tempfile::tempdir().unwrap();
+        let local = https_origin("https://localhost:8443").unwrap();
+        let remote = https_origin("https://gateway.example.com:8443").unwrap();
+        assert_eq!(localhost_ca(&local, Some(home.path())).unwrap(), None);
+        let ca = home.path().join(".shomei/localhost-ca.pem");
+        fs::create_dir_all(ca.parent().unwrap()).unwrap();
+        fs::write(&ca, "ca").unwrap();
+        assert_eq!(localhost_ca(&local, Some(home.path())).unwrap(), Some(ca));
+        assert_eq!(localhost_ca(&remote, Some(home.path())).unwrap(), None);
+    }
 
     #[test]
     fn prefers_the_home_store_and_falls_back_to_the_previous_default() {

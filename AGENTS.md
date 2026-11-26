@@ -18,11 +18,13 @@ export SHOMEI_PROXY=https://gateway.example.com:8443
 shomei init
 ```
 
-Use `--set-pin` for a YubiKey 5 with no FIDO2 PIN. For a localhost YubiKey 4 demo, use `--u2f` and set `allow_yubikey_4 = true` in the gateway config. Set `SHOMEI_CA_FILE` or pass `--ca-file` on access commands when the gateway uses a private CA.
+Use `--set-pin` for a YubiKey 5 with no FIDO2 PIN. For a localhost YubiKey 4 demo, use `--u2f` and set `allow_yubikey_4 = true` in the gateway config. For localhost, `sign` and `ssh` can read the public CA certificate from `~/.shomei/localhost-ca.pem`. Set `SHOMEI_CA_FILE` or pass `--ca-file` to select a different CA.
 
 The default public identity is `~/.shomei/identity.json`. `init` defaults to `https://localhost:8443` when the proxy is unspecified. `get-id` reads the local identity and `sign` can use its recorded origin from any working directory. Use `--identity-file` to select a separate identity.
 
-The gateway accepts one `shomei-id-v1:` token per line from `shomei get-id`, with optional `#` labels. To create a new Compose allowlist, run:
+Use `shomei clear` to delete a local identity after operator confirmation. Revoke gateway access by removing its entry from the allowlist.
+
+The gateway accepts one `shomei-id-v1:` token per line from `shomei get-id`. Use an inline `#` comment for the operator’s username. To create a new Compose allowlist, run:
 
 ```sh
 umask 077
