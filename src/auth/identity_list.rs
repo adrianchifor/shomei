@@ -114,16 +114,24 @@ fn decode_identity(token: &str, buffer: &mut [u8]) -> Result<(StaticIdentity, us
     Ok((identity, written))
 }
 
+/// Calls `visit` for each record and `reject` for each record that fails to
+/// decode or that `visit` refuses. A file that cannot be split into records
+/// fails as a whole.
 pub(super) fn visit_identities(
     contents: &[u8],
     mut visit: impl FnMut(StaticIdentity) -> Result<()>,
+    mut reject: impl FnMut(anyhow::Error) -> Result<()>,
 ) -> Result<()> {
     let text = std::str::from_utf8(contents).context("identities file must be UTF-8")?;
     if text.trim_start().starts_with('[') {
         let records: Vec<StaticIdentity> =
             serde_json::from_str(text).context("parse identities JSON array")?;
         for (index, record) in records.into_iter().enumerate() {
-            visit(record).with_context(|| format!("identity entry {}", index + 1))?;
+            if let Err(error) =
+                visit(record).with_context(|| format!("identity entry {}", index + 1))
+            {
+                reject(error)?;
+            }
         }
         return Ok(());
     }
@@ -136,12 +144,15 @@ pub(super) fn visit_identities(
             continue;
         }
         let limit = remaining.min(buffer.len());
-        decode_identity(token, &mut buffer[..limit])
+        if let Err(error) = decode_identity(token, &mut buffer[..limit])
             .and_then(|(record, bytes)| {
                 remaining -= bytes;
                 visit(record)
             })
-            .with_context(|| format!("identity on line {}", index + 1))?;
+            .with_context(|| format!("identity on line {}", index + 1))
+        {
+            reject(error)?;
+        }
     }
     Ok(())
 }
