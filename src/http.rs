@@ -268,7 +268,15 @@ fn state_with_auth(
             .transpose()?,
         tailscale: config
             .tailscale_ssh
-            .map(|tailscale| TailscaleSsh::new(tailscale, config.limits.auth_workers))
+            .map(|tailscale| {
+                // With forwarding on, a client could reach this listener
+                // through the proxy and appear as the gateway's own device.
+                TailscaleSsh::new(
+                    tailscale,
+                    forwarding.then(|| config.https_bind.ip()),
+                    config.limits.auth_workers,
+                )
+            })
             .transpose()?,
         auth_workers: Arc::new(Semaphore::new(config.limits.auth_workers)),
         http_requests: Arc::new(Semaphore::new(config.limits.http_requests)),
@@ -1071,16 +1079,19 @@ async fn tailscale_start(
     Json(body): Json<TailscaleStart>,
 ) -> Result<impl IntoResponse, ApiError> {
     let tailscale = app.tailscale.as_ref().ok_or(TAILSCALE_DISABLED)?;
+    let without_dot = |name: &str| name.strip_suffix('.').unwrap_or(name).to_owned();
     if !crate::config::is_tailscale_target(&body.target)
-        || tailscale
-            .target
-            .as_ref()
-            .is_some_and(|target| !target.eq_ignore_ascii_case(&body.target))
+        || tailscale.target.as_ref().is_some_and(|target| {
+            !without_dot(target).eq_ignore_ascii_case(&without_dot(&body.target))
+        })
     {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
             "Tailscale SSH target is not allowed",
         ));
+    }
+    if !tailscale.accepts_peer(peer.0) {
+        return Err(TAILSCALE_PEER_REQUIRED);
     }
     let _permit = tailscale
         .requests
@@ -1105,6 +1116,9 @@ async fn tailscale_finish(
     Json(signed): Json<SignedChallenge<PublicKeyCredential>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let tailscale = app.tailscale.as_ref().ok_or(TAILSCALE_DISABLED)?;
+    if !tailscale.accepts_peer(peer.0) {
+        return Err(TAILSCALE_PEER_REQUIRED);
+    }
     let _permit = tailscale
         .requests
         .try_acquire()
@@ -1128,12 +1142,12 @@ async fn tailscale_finish(
     let authorization = tailscale
         .authorization()
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(tailscale_api_error)?;
     check_generation(&app, generation)?;
     let expires_at = tailscale
         .approve(&device, authorization)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(tailscale_api_error)?;
     Ok(Json(serde_json::json!({ "expires_at": expires_at })))
 }
 
@@ -1144,6 +1158,19 @@ const TAILSCALE_PEER_REQUIRED: ApiError = ApiError(
     StatusCode::FORBIDDEN,
     "a user-owned Tailscale device is required",
 );
+const TAILSCALE_API_TIMEOUT: ApiError = ApiError(
+    StatusCode::GATEWAY_TIMEOUT,
+    "Tailscale API timed out; the approval may or may not have taken effect, so retry",
+);
+
+fn tailscale_api_error(error: anyhow::Error) -> ApiError {
+    if error.is::<tokio::time::error::Elapsed>() {
+        eprintln!("Tailscale API request timed out");
+        TAILSCALE_API_TIMEOUT
+    } else {
+        ApiError::internal(error)
+    }
+}
 
 fn check_generation(app: &App, generation: u64) -> Result<(), ApiError> {
     if app.auth.generation() == generation {
