@@ -4,14 +4,31 @@ tls_cert = "/etc/shomei/tls.pem"
 tls_key = "/etc/shomei/tls-key.pem"
 state_dir = "/var/lib/shomei"
 identities_file = "/etc/shomei/identities.json"
+allow_yubikey_4 = false  # May be enabled for localhost origins.
 http_upstream = "http://host.docker.internal:8080"
 session_ttl_seconds = 600
+
+# With http_upstream above, this approves POST http://host.docker.internal:8080/api/deploy.
+# Enabling this requires fresh approval for HTTP writes.
+# [browser_action]
+# path = "/api/deploy"
+# label = "Deploy service"
 
 [tcp]
 bind = "0.0.0.0:9443"
 upstream = "host.docker.internal:9000"
+# ssh_host = "deploy"
 public_port = 9443
 cert_ttl_seconds = 300
+
+# Use the gateway's MagicDNS origin and TLS certificate, and bind https_bind to its Tailscale IP.
+# [tailscale_ssh]
+# target = "deploy.example.ts.net"
+# posture_attribute = "custom:shomei_ssh_deploy"
+# oauth_client_id = "your-oauth-client-id"
+# oauth_client_secret_file = "/etc/shomei/tailscale-oauth-secret"
+# socket = "/var/run/tailscale/tailscaled.sock"
+# ttl_seconds = 300
 
 [limits]
 https_connections = 4096
