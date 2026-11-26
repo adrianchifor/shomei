@@ -507,15 +507,15 @@ fn read_identities(path: &Path) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-struct Challenges {
-    values: HashMap<Uuid, (Instant, IpAddr, Pending)>,
+struct Challenges<T = Pending> {
+    values: HashMap<Uuid, (Instant, IpAddr, T)>,
     expirations: BTreeSet<(Instant, Uuid)>,
-    peers: HashMap<IpAddr, usize>,
+    peers: HashMap<IpAddr, BTreeSet<(Instant, Uuid)>>,
     limit: usize,
     per_ip: usize,
 }
 
-impl Challenges {
+impl<T> Challenges<T> {
     fn new(limits: &Limits) -> Self {
         Self {
             values: HashMap::new(),
@@ -527,6 +527,16 @@ impl Challenges {
     }
 
     fn check_capacity(&mut self, peer: IpAddr) -> Result<(), ApiError> {
+        self.reserve(peer).map(drop)
+    }
+
+    /// Admits one more challenge for `peer`. When the store is full, returns
+    /// the challenge to evict: the oldest one of the peer holding the most.
+    /// A peer that already holds the most is refused, so filling the store
+    /// only costs a client its own challenges.
+    fn reserve(&mut self, peer: IpAddr) -> Result<Option<Uuid>, ApiError> {
+        const BUSY: ApiError =
+            ApiError(StatusCode::TOO_MANY_REQUESTS, "too many pending challenges");
         let now = Instant::now();
         while let Some(&(expires, id)) = self.expirations.first() {
             if expires > now {
@@ -534,40 +544,47 @@ impl Challenges {
             }
             self.remove(id);
         }
-        if self.values.len() >= self.limit
-            || self.peers.get(&peer).copied().unwrap_or(0) >= self.per_ip
-        {
-            return Err(ApiError(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many pending challenges",
-            ));
+        let held = self.peers.get(&peer).map_or(0, BTreeSet::len);
+        if held >= self.per_ip {
+            return Err(BUSY);
         }
-        Ok(())
+        if self.values.len() < self.limit {
+            return Ok(None);
+        }
+        self.peers
+            .values()
+            .filter(|pending| pending.len() > held)
+            .filter_map(|pending| Some((pending.len(), *pending.first()?)))
+            .max_by_key(|&(count, (expires, _))| (count, std::cmp::Reverse(expires)))
+            .map(|(_, (_, id))| Some(id))
+            .ok_or(BUSY)
     }
 
-    fn insert(&mut self, peer: IpAddr, pending: Pending) -> Result<Uuid, ApiError> {
-        self.check_capacity(peer)?;
+    fn insert(&mut self, peer: IpAddr, pending: T) -> Result<Uuid, ApiError> {
+        if let Some(evicted) = self.reserve(peer)? {
+            self.remove(evicted);
+        }
         let id = Uuid::new_v4();
         let expires = Instant::now() + CHALLENGE_TTL;
         self.values.insert(id, (expires, peer, pending));
         self.expirations.insert((expires, id));
-        *self.peers.entry(peer).or_default() += 1;
+        self.peers.entry(peer).or_default().insert((expires, id));
         Ok(id)
     }
 
-    fn remove(&mut self, id: Uuid) -> Option<(Instant, Pending)> {
+    fn remove(&mut self, id: Uuid) -> Option<(Instant, T)> {
         let (expires, peer, pending) = self.values.remove(&id)?;
         self.expirations.remove(&(expires, id));
-        if let Some(count) = self.peers.get_mut(&peer) {
-            *count -= 1;
-            if *count == 0 {
+        if let Some(held) = self.peers.get_mut(&peer) {
+            held.remove(&(expires, id));
+            if held.is_empty() {
                 self.peers.remove(&peer);
             }
         }
         Some((expires, pending))
     }
 
-    fn take(&mut self, id: Uuid) -> Result<Pending, ApiError> {
+    fn take(&mut self, id: Uuid) -> Result<T, ApiError> {
         self.remove(id)
             .filter(|(expires, _)| *expires > Instant::now())
             .map(|(_, pending)| pending)

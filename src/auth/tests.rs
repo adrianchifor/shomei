@@ -313,6 +313,40 @@ fn reloads_identities_and_consumes_single_use_challenges() {
         .unwrap();
 }
 
+#[test]
+fn a_full_challenge_store_evicts_from_the_peer_holding_the_most() {
+    let limits = Limits {
+        pending_challenges: 4,
+        pending_per_ip: 3,
+        ..Limits::default()
+    };
+    let mut challenges = Challenges::<()>::new(&limits);
+    let [flood, operator, other]: [IpAddr; 3] =
+        ["192.0.2.1", "192.0.2.2", "192.0.2.3"].map(|ip| ip.parse().unwrap());
+    let oldest = challenges.insert(flood, ()).unwrap();
+    let kept = [(); 2].map(|()| challenges.insert(flood, ()).unwrap());
+    assert_eq!(
+        challenges.check_capacity(flood).unwrap_err().0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let pending = challenges.insert(operator, ()).unwrap();
+
+    challenges.check_capacity(other).unwrap();
+    assert_eq!(challenges.values.len(), 4);
+    let admitted = challenges.insert(other, ()).unwrap();
+    assert_eq!(challenges.values.len(), 4);
+    assert!(challenges.take(oldest).is_err());
+
+    assert_eq!(
+        challenges.insert(flood, ()).unwrap_err().0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    for id in [pending, admitted, kept[0], kept[1]] {
+        challenges.take(id).unwrap();
+    }
+    assert!(challenges.peers.is_empty() && challenges.expirations.is_empty());
+}
+
 struct Fixture {
     root: Certificate,
     intermediate: Certificate,
