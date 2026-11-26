@@ -150,6 +150,8 @@ fn routes(state: Arc<App>) -> Router {
         .route("/action", get(action_page))
         .route("/auth.js", get(script))
         .route("/auth.css", get(styles))
+        .route("/seal.png", get(seal))
+        .route("/geist.woff2", get(font))
         .route("/api/auth/start", post(login_start))
         .route("/api/auth/finish", post(login_finish))
         .route("/api/action", get(action_details))
@@ -255,7 +257,7 @@ async fn protect_auth(State(app): State<Arc<App>>, request: Request, next: Next)
     let headers = response.headers_mut();
     headers.insert(CACHE_CONTROL, NO_STORE);
     headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
-        "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
     ));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -298,6 +300,20 @@ async fn styles() -> impl IntoResponse {
     )
 }
 
+async fn seal() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "image/png")],
+        include_bytes!("../assets/seal.png").as_slice(),
+    )
+}
+
+async fn font() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "font/woff2")],
+        include_bytes!("../assets/geist.woff2").as_slice(),
+    )
+}
+
 async fn auth_work<T: Send + 'static>(
     app: Arc<App>,
     operation: impl FnOnce(&App) -> Result<T, ApiError> + Send + 'static,
@@ -320,7 +336,6 @@ async fn auth_work<T: Send + 'static>(
 #[serde(deny_unknown_fields)]
 struct LoginStart {
     client_csr_pem: Option<String>,
-    account: Option<String>,
     tcp_target: Option<String>,
 }
 
@@ -364,11 +379,7 @@ async fn login_start(
                 }
                 None => Grant::Http,
             };
-        Ok(Json(app.auth.start_login(
-            body.account.as_deref(),
-            grant,
-            peer,
-        )?))
+        Ok(Json(app.auth.start_login(grant, peer)?))
     })
     .await
 }

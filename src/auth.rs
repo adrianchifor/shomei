@@ -31,17 +31,18 @@ use serde::{Deserialize, Serialize};
 use serde_cbor_2::Value;
 use tokio::sync::watch;
 use webauthn_rs::prelude::*;
+use webauthn_rs_proto::UserVerificationPolicy;
 use x509_parser::{oid_registry::*, parse_x509_certificate};
 
 use crate::config::{Limits, validate_origin};
 use u2f::U2fPolicy;
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(120);
-const DEFAULT_ACCOUNT: &str = "operator";
+pub const ACCOUNT: &str = "shomei";
 const ES256: i64 = -7;
 const MAX_IDENTITIES_BYTES: u64 = 64 * 1024 * 1024;
 const UNAUTHORIZED: ApiError = ApiError(StatusCode::UNAUTHORIZED, "YubiKey verification failed");
-const NOT_ALLOWED: ApiError = ApiError(StatusCode::FORBIDDEN, "YubiKey account is not allowed");
+const NOT_ALLOWED: ApiError = ApiError(StatusCode::FORBIDDEN, "No YubiKey is enrolled");
 
 #[derive(Debug)]
 pub struct ApiError(pub StatusCode, pub &'static str);
@@ -68,7 +69,7 @@ pub struct Auth {
     yubikeys: YubikeyPolicy,
     identities_file: PathBuf,
     counters_dir: PathBuf,
-    accounts: RwLock<HashMap<String, Arc<Account>>>,
+    devices: RwLock<HashMap<CredentialID, Arc<Device>>>,
     last_digest: Mutex<[u8; 32]>,
     generation: AtomicU64,
     changes: watch::Sender<u64>,
@@ -76,7 +77,7 @@ pub struct Auth {
     _lock: File,
 }
 
-struct Account {
+struct Device {
     key: DeviceKey,
     digest: [u8; 32],
     counter_file: PathBuf,
@@ -84,13 +85,11 @@ struct Account {
 }
 
 struct VerifiedIdentity {
-    name: String,
     key: DeviceKey,
     fingerprint: [u8; 32],
 }
 
 struct Pending {
-    account: Arc<Account>,
     authentication: Login,
     grant: Grant,
     generation: u64,
@@ -119,7 +118,7 @@ impl DeviceKey {
 
 enum Login {
     Fido2(AttestedPasskeyAuthentication),
-    U2f(SecurityKeyAuthentication),
+    SecurityKeys(SecurityKeyAuthentication),
 }
 
 pub enum Grant {
@@ -183,7 +182,7 @@ impl Auth {
             yubikeys,
             identities_file: identities_file.into(),
             counters_dir,
-            accounts: RwLock::new(HashMap::new()),
+            devices: RwLock::new(HashMap::new()),
             last_digest: Mutex::new([0; 32]),
             generation: AtomicU64::new(0),
             changes,
@@ -192,7 +191,7 @@ impl Auth {
         };
         let bytes = read_identities(identities_file)?;
         let verified = auth.verify_identities(&bytes)?;
-        auth.accounts = RwLock::new(auth.load_accounts(verified, &HashMap::new())?);
+        auth.devices = RwLock::new(auth.load_devices(verified, &HashMap::new())?);
         auth.last_digest = Mutex::new(sha256(&bytes));
         Ok(auth)
     }
@@ -219,22 +218,22 @@ impl Auth {
             .verify_identities(&bytes)
             .inspect_err(|_| *last = checksum)?;
         let previous = self
-            .accounts
+            .devices
             .read()
             .map_err(|_| anyhow::anyhow!("identity table poisoned"))?
             .clone();
-        let next = self.load_accounts(verified, &previous)?;
-        let revoked = previous.iter().any(|(name, account)| {
-            next.get(name)
-                .is_none_or(|retained| !Arc::ptr_eq(account, retained))
+        let next = self.load_devices(verified, &previous)?;
+        let revoked = previous.iter().any(|(id, device)| {
+            next.get(id)
+                .is_none_or(|retained| !Arc::ptr_eq(device, retained))
         });
         let changed = revoked || previous.len() != next.len();
         if changed {
-            let mut accounts = self
-                .accounts
+            let mut devices = self
+                .devices
                 .write()
                 .map_err(|_| anyhow::anyhow!("identity table poisoned"))?;
-            *accounts = next;
+            *devices = next;
             if revoked {
                 let generation = self.generation.fetch_add(1, Ordering::Release) + 1;
                 self.changes.send_replace(generation);
@@ -247,54 +246,41 @@ impl Auth {
     fn verify_identities(&self, contents: &[u8]) -> Result<Vec<VerifiedIdentity>> {
         let records: Vec<StaticIdentity> =
             serde_json::from_slice(contents).context("parse identities JSON array")?;
-        let mut names = HashSet::new();
         let mut credential_ids = HashSet::new();
         let mut verified = Vec::with_capacity(records.len());
-        for record in records {
-            ensure!(
-                names.insert(record.account.clone()),
-                "duplicate identity account"
-            );
+        for (index, record) in records.into_iter().enumerate() {
             let key = record
                 .verify_for(&self.origin, &self.webauthn, &self.yubikeys)
-                .with_context(|| format!("verify YubiKey identity for {:?}", record.account))?;
+                .with_context(|| format!("verify YubiKey identity {}", index + 1))?;
             ensure!(
                 credential_ids.insert(key.cred_id().clone()),
                 "duplicate YubiKey credential ID"
             );
             let public_key = key.credential().cred;
             let fingerprint = sha256(&serde_json::to_vec(&(key.cred_id(), public_key))?);
-            verified.push(VerifiedIdentity {
-                name: record.account,
-                key,
-                fingerprint,
-            });
+            verified.push(VerifiedIdentity { key, fingerprint });
         }
         Ok(verified)
     }
 
-    fn load_accounts(
+    fn load_devices(
         &self,
         verified: Vec<VerifiedIdentity>,
-        previous: &HashMap<String, Arc<Account>>,
-    ) -> Result<HashMap<String, Arc<Account>>> {
-        let mut accounts = HashMap::with_capacity(verified.len());
-        for VerifiedIdentity {
-            name,
-            key,
-            fingerprint,
-        } in verified
-        {
-            let account = match previous
-                .get(&name)
-                .filter(|account| account.digest == fingerprint)
-            {
-                Some(account) => account.clone(),
-                None => Arc::new(Account::load(&self.counters_dir, key, fingerprint)?),
+        previous: &HashMap<CredentialID, Arc<Device>>,
+    ) -> Result<HashMap<CredentialID, Arc<Device>>> {
+        let mut devices = HashMap::with_capacity(verified.len());
+        for VerifiedIdentity { key, fingerprint } in verified {
+            let id = key.cred_id().clone();
+            let device = match previous.get(&id).filter(|device| {
+                device.digest == fingerprint
+                    && std::mem::discriminant(&device.key) == std::mem::discriminant(&key)
+            }) {
+                Some(device) => device.clone(),
+                None => Arc::new(Device::load(&self.counters_dir, key, fingerprint)?),
             };
-            accounts.insert(name, account);
+            devices.insert(id, device);
         }
-        Ok(accounts)
+        Ok(devices)
     }
 
     pub fn check_challenge_capacity(&self, peer: IpAddr) -> Result<(), ApiError> {
@@ -303,39 +289,49 @@ impl Auth {
 
     pub fn start_login(
         &self,
-        name: Option<&str>,
         grant: Grant,
         peer: IpAddr,
     ) -> Result<Challenge<RequestChallengeResponse>, ApiError> {
-        let name = name.unwrap_or(DEFAULT_ACCOUNT);
-        if !valid_account_name(name) {
-            return Err(ApiError(StatusCode::BAD_REQUEST, "invalid account name"));
-        }
-        let (account, generation) = {
-            let accounts = self
-                .accounts
+        let (options, authentication, generation) = {
+            let devices = self
+                .devices
                 .read()
                 .map_err(|_| ApiError::internal("identity table poisoned"))?;
-            (
-                accounts.get(name).ok_or(NOT_ALLOWED)?.clone(),
-                self.generation(),
-            )
+            if devices.is_empty() {
+                return Err(NOT_ALLOWED);
+            }
+            let strict: Vec<_> = devices
+                .values()
+                .filter_map(|device| match &device.key {
+                    DeviceKey::Fido2(key) => Some(key.clone()),
+                    DeviceKey::U2f(_) => None,
+                })
+                .collect();
+            let (options, authentication) = if strict.len() == devices.len() {
+                self.webauthn
+                    .start_attested_passkey_authentication(&strict)
+                    .map(|(options, login)| (options, Login::Fido2(login)))
+            } else {
+                let keys: Vec<_> = devices
+                    .values()
+                    .map(|device| device.key.credential().into())
+                    .collect();
+                self.webauthn
+                    .start_securitykey_authentication(&keys)
+                    .map(|(mut options, login)| {
+                        if !strict.is_empty() {
+                            options.public_key.user_verification =
+                                UserVerificationPolicy::Preferred;
+                        }
+                        (options, Login::SecurityKeys(login))
+                    })
+            }
+            .map_err(ApiError::internal)?;
+            (options, authentication, self.generation())
         };
-        let (options, authentication) = match &account.key {
-            DeviceKey::Fido2(key) => self
-                .webauthn
-                .start_attested_passkey_authentication(std::slice::from_ref(key))
-                .map(|(options, login)| (options, Login::Fido2(login))),
-            DeviceKey::U2f(key) => self
-                .webauthn
-                .start_securitykey_authentication(std::slice::from_ref(key))
-                .map(|(options, login)| (options, Login::U2f(login))),
-        }
-        .map_err(ApiError::internal)?;
         let challenge_id = lock(&self.challenges)?.insert(
             peer,
             Pending {
-                account,
                 authentication,
                 grant,
                 generation,
@@ -352,7 +348,6 @@ impl Auth {
         signed: SignedChallenge<PublicKeyCredential>,
     ) -> Result<(Grant, u64), ApiError> {
         let Pending {
-            account,
             authentication,
             grant,
             generation,
@@ -370,27 +365,30 @@ impl Auth {
             Login::Fido2(login) => self
                 .webauthn
                 .finish_attested_passkey_authentication(&signed.credential, login),
-            Login::U2f(login) => self
+            Login::SecurityKeys(login) => self
                 .webauthn
                 .finish_securitykey_authentication(&signed.credential, login),
         }
         .map_err(|_| UNAUTHORIZED)?;
         let flags = signed.credential.response.authenticator_data.get(32);
         if !flags.is_some_and(|flags| flags & 0x01 == 0x01)
-            || (matches!(authentication, Login::Fido2(_)) && !result.user_verified())
             || result.backup_eligible()
             || result.backup_state()
         {
             return Err(UNAUTHORIZED);
         }
-        let _accounts = self
-            .accounts
+        let devices = self
+            .devices
             .read()
             .map_err(|_| ApiError::internal("identity table poisoned"))?;
         if self.generation() != generation {
             return Err(UNAUTHORIZED);
         }
-        account.update_counter(result.counter())?;
+        let device = devices.get(result.cred_id()).ok_or(UNAUTHORIZED)?;
+        if matches!(&device.key, DeviceKey::Fido2(_)) && !result.user_verified() {
+            return Err(UNAUTHORIZED);
+        }
+        device.update_counter(result.counter())?;
         Ok((grant, generation))
     }
 }
@@ -403,7 +401,7 @@ struct ClientContext {
     top_origin: Option<String>,
 }
 
-impl Account {
+impl Device {
     fn load(directory: &Path, key: DeviceKey, digest: [u8; 32]) -> Result<Self> {
         let counter_file = directory.join(B64.encode(digest));
         let initial = key.credential().counter;
@@ -461,7 +459,7 @@ fn build_webauthn(origin: &Url) -> Result<Webauthn> {
     )
 }
 
-fn valid_account_name(name: &str) -> bool {
+fn valid_attested_label(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.bytes().all(|byte| {

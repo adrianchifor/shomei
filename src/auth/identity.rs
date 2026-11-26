@@ -5,7 +5,8 @@ use serde::de::DeserializeOwned;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaticIdentity {
-    pub account: String,
+    #[serde(default, alias = "account", skip_serializing_if = "Option::is_none")]
+    attested_label: Option<String>,
     pub origin: Url,
     nonce: String,
     attestation: RegisterPublicKeyCredential,
@@ -21,10 +22,9 @@ pub struct IdentitySetup {
 
 pub fn prepare_identity(
     origin: &Url,
-    account: &str,
     u2f: bool,
 ) -> Result<(CreationChallengeResponse, IdentitySetup)> {
-    IdentitySetup::prepare(origin, account, YubikeyPolicy::new(u2f)?)
+    IdentitySetup::prepare(origin, ACCOUNT, YubikeyPolicy::new(u2f)?)
 }
 
 impl IdentitySetup {
@@ -33,7 +33,7 @@ impl IdentitySetup {
         account: &str,
         policy: YubikeyPolicy,
     ) -> Result<(CreationChallengeResponse, Self)> {
-        ensure!(valid_account_name(account), "invalid account name");
+        ensure!(valid_attested_label(account), "invalid attested label");
         let webauthn = build_webauthn(origin)?;
         let nonce = generate::<[u8; 32]>(&SystemRandom::new())
             .map_err(|_| anyhow::anyhow!("generate identity nonce"))?
@@ -59,7 +59,7 @@ impl IdentitySetup {
             "unexpected YubiKey attestation format"
         );
         let mut identity = StaticIdentity {
-            account: self.account,
+            attested_label: (self.account != ACCOUNT).then_some(self.account),
             origin: self.origin,
             nonce: B64.encode(self.nonce),
             attestation,
@@ -106,7 +106,8 @@ impl StaticIdentity {
             self.origin == *origin,
             "identity belongs to a different HTTPS origin"
         );
-        ensure!(valid_account_name(&self.account), "invalid account name");
+        let label = self.attested_label.as_deref().unwrap_or(ACCOUNT);
+        ensure!(valid_attested_label(label), "invalid attested label");
         let nonce: [u8; 32] = B64
             .decode(&self.nonce)?
             .try_into()
@@ -116,14 +117,14 @@ impl StaticIdentity {
                 .u2f
                 .as_ref()
                 .context("YubiKey 4 support is disabled")?;
-            let (_, registration) = u2f_registration(webauthn, u2f, origin, &self.account, &nonce)?;
+            let (_, registration) = u2f_registration(webauthn, u2f, origin, label, &nonce)?;
             let key = webauthn
                 .finish_securitykey_registration(&self.attestation, &registration)
                 .context("verify signed FIDO U2F registration")?;
             u2f.verify(&key)?;
             return Ok(DeviceKey::U2f(key));
         }
-        let (_, registration) = registration(webauthn, policy, origin, &self.account, &nonce)?;
+        let (_, registration) = registration(webauthn, policy, origin, label, &nonce)?;
         let mut proof = self.attestation.clone();
         policy.complete_chain(&mut proof)?;
         let key = webauthn

@@ -1,27 +1,86 @@
+@font-face {
+  font-family: Geist;
+  src: url("/_shomei/geist.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
 :root {
-  color-scheme: light dark;
-  font: 1rem/1.5 system-ui, sans-serif;
+  color-scheme: dark;
+  font-family: Geist, system-ui, sans-serif;
+  background: #202022;
+  color: #eae8e5;
+}
+
+body {
+  min-block-size: 100svh;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(ellipse at 50% 40%, #28282b 0%, #202022 72%);
 }
 
 main {
-  max-width: 26rem;
-  margin: 15vh auto;
-  padding: 0 1rem;
+  box-sizing: border-box;
+  width: min(100%, 34rem);
+  padding: 3rem 1.5rem;
+  text-align: center;
+}
+
+.seal {
+  width: 5.625rem;
+  height: 5.625rem;
+  display: block;
+  margin: 0 auto 1.5rem;
 }
 
 h1 {
-  font-size: 1.75rem;
-  line-height: 1.2;
+  margin: 0;
+  font-size: clamp(1.9rem, 8vw, 2.75rem);
+  line-height: 1.1;
+  font-weight: 570;
+  letter-spacing: -0.055em;
 }
 
-input, button {
-  font: inherit;
-  padding: .55rem .75rem;
-}
-
-input {
+#status, noscript {
   display: block;
-  width: 100%;
-  box-sizing: border-box;
-  margin: .35rem 0 1rem;
+  margin: 1rem 0 0;
+  line-height: 1.5;
+  color: #c5c0bb;
+}
+
+.source {
+  display: inline-block;
+  margin-top: 2.5rem;
+  color: #b4afab;
+  font-size: 0.875rem;
+  text-decoration-color: #716b69;
+  text-underline-offset: 0.22em;
+}
+
+.source span {
+  display: inline-block;
+  margin-left: 0.16em;
+}
+
+.source:hover { color: #f6f4f2; }
+
+button {
+  margin-top: 1.5rem;
+  border: 1px solid #d77b70;
+  border-radius: 0.5rem;
+  padding: 0.65rem 1rem;
+  background: #653831;
+  color: #f6f0ed;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:enabled { background: #793e35; }
+button:disabled { cursor: wait; opacity: 0.65; }
+
+:focus-visible {
+  outline: 2px solid #ee9288;
+  outline-offset: 4px;
 }

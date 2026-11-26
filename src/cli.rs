@@ -29,7 +29,7 @@ use url::Url;
 use uuid::Uuid;
 use webauthn_rs::prelude::{PublicKeyCredential, RequestChallengeResponse};
 
-use crate::auth::{StaticIdentity, prepare_identity};
+use crate::auth::{ACCOUNT, StaticIdentity, prepare_identity};
 
 #[derive(Parser)]
 #[command(
@@ -89,9 +89,6 @@ struct InitArgs {
     /// The gateway HTTPS origin, including its port if nonstandard.
     #[arg(long, env = "SHOMEI_PROXY", value_parser = https_origin)]
     proxy: Url,
-    /// Account to bind to this YubiKey credential.
-    #[arg(long, env = "SHOMEI_ACCOUNT", default_value = "operator")]
-    account: String,
     /// Set a FIDO2 PIN on a YubiKey that has never had one.
     #[arg(long)]
     set_pin: bool,
@@ -107,9 +104,6 @@ struct Access {
     /// The gateway HTTPS origin, including its port if nonstandard.
     #[arg(long, env = "SHOMEI_PROXY", value_parser = https_origin)]
     proxy: Url,
-    /// The enrolled account.
-    #[arg(long, env = "SHOMEI_ACCOUNT", default_value = "operator")]
-    account: String,
     /// PEM trust roots for this gateway. Defaults to public WebPKI roots.
     #[arg(long, env = "SHOMEI_CA_FILE")]
     ca_file: Option<PathBuf>,
@@ -124,7 +118,7 @@ pub async fn run() -> Result<Option<PathBuf>> {
         Some(Command::GetId(args)) => get_id(args)?,
         Some(Command::Sign(args)) => {
             let gateway = Gateway::new(args.proxy, trust_roots(args.ca_file.as_deref())?)?;
-            let signed = gateway.sign(&args.account, None).await?;
+            let signed = gateway.sign(None).await?;
             println!("{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&signed)?));
         }
         Some(Command::Ssh(args)) => ssh::run(args).await?,
@@ -159,10 +153,9 @@ async fn init(args: InitArgs) -> Result<()> {
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(dir).context("create the local identity directory")?;
-    let (options, setup) = prepare_identity(&args.proxy, &args.account, args.u2f)?;
+    let (options, setup) = prepare_identity(&args.proxy, args.u2f)?;
     eprintln!(
-        "Creating a YubiKey identity for {} at {}.",
-        args.account,
+        "Creating a YubiKey identity for {ACCOUNT} at {}.",
         args.proxy.origin().ascii_serialization()
     );
     let registration = hardware::register(args.proxy, options, args.set_pin, args.u2f).await?;
@@ -254,8 +247,8 @@ impl Gateway {
         Ok(Self { origin, client })
     }
 
-    async fn sign(&self, account: &str, tcp: Option<(&str, &str)>) -> Result<Signed> {
-        let mut body = serde_json::json!({ "account": account });
+    async fn sign(&self, tcp: Option<(&str, &str)>) -> Result<Signed> {
+        let mut body = serde_json::json!({});
         if let Some((target, csr)) = tcp {
             body["tcp_target"] = target.into();
             body["client_csr_pem"] = csr.into();
@@ -266,7 +259,7 @@ impl Gateway {
             "gateway returned a different WebAuthn relying party"
         );
         eprintln!(
-            "Authenticating {account} at {}.",
+            "Authenticating {ACCOUNT} at {}.",
             self.origin.origin().ascii_serialization()
         );
         let credential = hardware::authenticate(self.origin.clone(), started.options).await?;

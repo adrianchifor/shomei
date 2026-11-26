@@ -115,6 +115,23 @@ async fn approves_one_deploy(u2f: bool) {
     )
     .await;
     assert_eq!(external.status(), StatusCode::FORBIDDEN);
+    let account = send(
+        &router,
+        post_json("/_shomei/api/auth/start", json!({"account":"other"})),
+    )
+    .await;
+    assert_eq!(account.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let login = send(
+        &router,
+        request("/_shomei/login").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(login.status(), StatusCode::OK);
+    let html = login.into_body().collect().await.unwrap().to_bytes();
+    let html = std::str::from_utf8(&html).unwrap();
+    assert!(html.contains("Tap your YubiKey to continue."));
+    assert!(!html.contains("<button"));
 
     let page = send(
         &router,

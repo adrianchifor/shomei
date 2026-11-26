@@ -50,8 +50,16 @@ fn requires_genuine_attestation_and_binds_the_identity_to_account_and_origin() {
     let webauthn = build_webauthn(&origin).unwrap();
     let policy = fixture.policy();
     record.verify_for(&origin, &webauthn, &policy).unwrap();
+    let mut old = serde_json::to_value(&record).unwrap();
+    old["account"] = old
+        .as_object_mut()
+        .unwrap()
+        .remove("attested_label")
+        .unwrap();
+    let old: StaticIdentity = serde_json::from_value(old).unwrap();
+    old.verify_for(&origin, &webauthn, &policy).unwrap();
     let mut modified = serde_json::to_value(&record).unwrap();
-    modified["account"] = json!("other");
+    modified["attested_label"] = json!("other");
     let modified: StaticIdentity = serde_json::from_value(modified).unwrap();
     assert!(modified.verify_for(&origin, &webauthn, &policy).is_err());
     let alternate = Url::parse("https://shomei.example:9443").unwrap();
@@ -124,7 +132,7 @@ fn u2f_requires_localhost_a_trusted_yubikey_4_and_a_fresh_touch() {
     )
     .unwrap();
     let peer = "127.0.0.1".parse().unwrap();
-    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    let challenge = auth.start_login(Grant::Http, peer).unwrap();
     let response = |flags| SignedChallenge {
         challenge_id: challenge.challenge_id,
         credential: assertion_at(
@@ -137,6 +145,32 @@ fn u2f_requires_localhost_a_trusted_yubikey_4_and_a_fresh_touch() {
     };
     assert!(auth.finish_login(response(0)).is_err());
     assert!(auth.finish_login(response(1)).is_err());
+
+    let fido2 = p256();
+    let fido2_record = fixture.provision(&origin, ACCOUNT, &fido2);
+    write_records(&identities_file, &[&record, &fido2_record]);
+    assert!(auth.reload().unwrap());
+    let approve = |key, flags| {
+        let challenge = auth.start_login(Grant::Http, peer).unwrap();
+        assert_eq!(
+            challenge.options.public_key.user_verification,
+            UserVerificationPolicy::Preferred
+        );
+        assert_eq!(challenge.options.public_key.allow_credentials.len(), 2);
+        auth.finish_login(SignedChallenge {
+            challenge_id: challenge.challenge_id,
+            credential: assertion_at(
+                &origin,
+                &challenge.options.public_key.challenge,
+                key,
+                flags,
+                1,
+            ),
+        })
+    };
+    assert!(approve(&fido2, 0x01).is_err());
+    assert!(approve(&fido2, 0x05).is_ok());
+    assert!(approve(&key, 0x01).is_ok());
 }
 
 #[test]
@@ -154,17 +188,17 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     let auth = Auth::load(&origin, dir.path(), &allowlist, &limits, fixture.policy()).unwrap();
     let mut epoch = auth.subscribe_generation();
     assert!(!auth.reload().unwrap());
-    assert!(auth.start_login(None, Grant::Http, peer).is_err());
+    assert!(auth.start_login(Grant::Http, peer).is_err());
 
     let operator = p256();
     let alice = p256();
     let operator_record = fixture.provision(&origin, "operator", &operator);
-    let alice_record = fixture.provision(&origin, "alice", &alice);
+    let alice_record = fixture.provision(&origin, ACCOUNT, &alice);
     write_records(&allowlist, &[&operator_record]);
     assert!(auth.reload().unwrap());
     assert_eq!(auth.generation(), 0);
 
-    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    let challenge = auth.start_login(Grant::Http, peer).unwrap();
     assert!(
         auth.finish_login(assertion(&challenge, &operator, 0x01, 1))
             .is_err()
@@ -173,12 +207,10 @@ fn reloads_identities_and_consumes_single_use_challenges() {
         auth.finish_login(assertion(&challenge, &operator, 0x05, 1))
             .is_err()
     );
-    let previous = auth.start_login(None, Grant::Http, peer).unwrap();
+    let previous = auth.start_login(Grant::Http, peer).unwrap();
     let tcp_key = p256();
     let public_key = SubjectPublicKeyInfo::from_der(&tcp_key.subject_public_key_info()).unwrap();
-    let challenge = auth
-        .start_login(None, Grant::Tcp(public_key), peer)
-        .unwrap();
+    let challenge = auth.start_login(Grant::Tcp(public_key), peer).unwrap();
     let (Grant::Tcp(granted), 0) = auth
         .finish_login(assertion(&challenge, &operator, 0x05, 2))
         .unwrap()
@@ -191,7 +223,7 @@ fn reloads_identities_and_consumes_single_use_challenges() {
             .is_err()
     );
 
-    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    let challenge = auth.start_login(Grant::Http, peer).unwrap();
     write_records(&allowlist, &[&operator_record, &alice_record]);
     assert!(auth.reload().unwrap());
     assert_eq!(auth.generation(), 0);
@@ -203,18 +235,18 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     assert!(!auth.reload().unwrap());
 
     let mut unsigned = serde_json::to_value(&alice_record).unwrap();
-    unsigned["account"] = json!("renamed");
+    unsigned["attested_label"] = json!("renamed");
     fs::write(&allowlist, json!([unsigned]).to_string()).unwrap();
     assert!(auth.reload().is_err());
     assert!(!auth.reload().unwrap());
     assert_eq!(auth.generation(), 0);
-    let challenge = auth.start_login(Some("alice"), Grant::Http, peer).unwrap();
+    let challenge = auth.start_login(Grant::Http, peer).unwrap();
     assert!(matches!(
         auth.finish_login(assertion(&challenge, &alice, 0x05, 1)),
         Ok((Grant::Http, 0))
     ));
 
-    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    let challenge = auth.start_login(Grant::Http, peer).unwrap();
     write_records(&allowlist, &[&alice_record]);
     assert!(auth.reload().unwrap());
     assert_eq!(*epoch.borrow_and_update(), 1);
@@ -222,18 +254,23 @@ fn reloads_identities_and_consumes_single_use_challenges() {
         auth.finish_login(assertion(&challenge, &operator, 0x05, 4))
             .is_err()
     );
-    assert!(auth.start_login(None, Grant::Http, peer).is_err());
+    let challenge = auth.start_login(Grant::Http, peer).unwrap();
+    assert_eq!(challenge.options.public_key.allow_credentials.len(), 1);
+    assert!(
+        auth.finish_login(assertion(&challenge, &operator, 0x05, 4))
+            .is_err()
+    );
 
     write_records(&allowlist, &[&alice_record, &operator_record]);
     assert!(auth.reload().unwrap());
     assert_eq!(auth.generation(), 1);
-    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    let challenge = auth.start_login(Grant::Http, peer).unwrap();
     assert!(
         auth.finish_login(assertion(&challenge, &operator, 0x05, 3))
             .is_err()
     );
 
-    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    let challenge = auth.start_login(Grant::Http, peer).unwrap();
     let mut response = assertion(&challenge, &operator, 0x05, 4);
     let client = json!({"type": "webauthn.get", "origin": ORIGIN, "crossOrigin": true,
         "challenge": B64.encode(&challenge.options.public_key.challenge)});
@@ -242,14 +279,14 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     response.credential.response.client_data_json = client;
     assert!(auth.finish_login(response).is_err());
 
-    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    let challenge = auth.start_login(Grant::Http, peer).unwrap();
     assert!(
         auth.finish_login(assertion(&challenge, &operator, 0x15, 4))
             .is_err()
     );
 
     for _ in 0..limits.pending_per_ip {
-        auth.start_login(None, Grant::Http, peer).unwrap();
+        auth.start_login(Grant::Http, peer).unwrap();
     }
     assert_eq!(
         auth.check_challenge_capacity(peer).unwrap_err().0,

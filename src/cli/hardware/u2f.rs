@@ -78,18 +78,23 @@ pub(super) fn authenticate(
     options: RequestChallengeResponse,
 ) -> Result<PublicKeyCredential> {
     let options = options.public_key;
-    let [credential] = options.allow_credentials.as_slice() else {
-        anyhow::bail!("a YubiKey 4 challenge must name exactly one credential");
-    };
+    let allowed = options.allow_credentials;
+    ensure!(
+        !allowed.is_empty(),
+        "the U2F challenge must name an enrolled credential"
+    );
     let client_data = client_data(&origin, "webauthn.get", &options.challenge)?;
     let args = SignArgs {
         client_data_hash: hash(&client_data),
         origin: origin.origin().ascii_serialization(),
         relying_party_id: options.rp_id,
-        allow_list: vec![PublicKeyCredentialDescriptor {
-            id: credential.id.clone(),
-            transports: vec![Transport::USB],
-        }],
+        allow_list: allowed
+            .iter()
+            .map(|credential| PublicKeyCredentialDescriptor {
+                id: credential.id.clone(),
+                transports: vec![Transport::USB],
+            })
+            .collect(),
         user_verification_req: UserVerificationRequirement::Discouraged,
         user_presence_req: true,
         extensions: Default::default(),
@@ -104,15 +109,20 @@ pub(super) fn authenticate(
         auth_data.get(32) == Some(&1),
         "the U2F response must prove touch"
     );
-    if let Some(returned) = assertion.credentials {
-        ensure!(
-            returned.id.as_slice() == credential.id.as_slice(),
-            "unexpected U2F credential"
-        );
-    }
+    let id = match (assertion.credentials, allowed.as_slice()) {
+        (Some(returned), _)
+            if allowed
+                .iter()
+                .any(|credential| credential.id == returned.id) =>
+        {
+            returned.id
+        }
+        (None, [credential]) => credential.id.clone(),
+        _ => anyhow::bail!("unexpected U2F credential"),
+    };
     Ok(PublicKeyCredential {
-        id: URL_SAFE_NO_PAD.encode(&credential.id),
-        raw_id: credential.id.clone(),
+        id: URL_SAFE_NO_PAD.encode(&id),
+        raw_id: id,
         response: AuthenticatorAssertionResponseRaw {
             authenticator_data: auth_data,
             client_data_json: client_data,

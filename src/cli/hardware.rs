@@ -25,6 +25,9 @@ use zeroize::Zeroizing;
 
 use crate::auth::provisioning_model;
 
+const CONNECT_FIDO2: &str =
+    "connect a supported YubiKey 5 over USB with FIDO2 enabled and check USB device permissions";
+
 #[derive(Debug, Default)]
 struct Terminal {
     touch_prompted: AtomicBool,
@@ -55,7 +58,7 @@ impl UiCallback for Terminal {
     fn cable_status_update(&self, _: CableState) {}
 }
 
-async fn usb_key(ui: &Terminal) -> Result<CtapAuthenticator<'_, USBToken, Terminal>> {
+async fn usb_key(ui: &Terminal) -> Result<Option<CtapAuthenticator<'_, USBToken, Terminal>>> {
     let transport = USBTransport::new()
         .await
         .context("initialize USB FIDO2 transport")?;
@@ -75,7 +78,7 @@ async fn usb_key(ui: &Terminal) -> Result<CtapAuthenticator<'_, USBToken, Termin
             key = Some(candidate);
         }
     }
-    key.context("connect a supported YubiKey 5 over USB with FIDO2 enabled and check USB device permissions")
+    Ok(key)
 }
 
 pub async fn register(
@@ -88,7 +91,7 @@ pub async fn register(
         return block_in_place(|| u2f::register(origin, options));
     }
     let ui = Terminal::default();
-    let mut key = usb_key(&ui).await?;
+    let mut key = usb_key(&ui).await?.context(CONNECT_FIDO2)?;
     if key.get_info().get_option("clientPin") == Some(false) {
         ensure!(
             set_pin,
@@ -113,7 +116,7 @@ pub async fn register(
 
 pub async fn authenticate(
     origin: Url,
-    options: RequestChallengeResponse,
+    mut options: RequestChallengeResponse,
 ) -> Result<PublicKeyCredential> {
     if options.public_key.user_verification == UserVerificationPolicy::Discouraged_DO_NOT_USE {
         ensure!(
@@ -123,11 +126,23 @@ pub async fn authenticate(
         return block_in_place(|| u2f::authenticate(origin, options));
     }
     ensure!(
-        options.public_key.user_verification == UserVerificationPolicy::Required,
+        matches!(
+            options.public_key.user_verification,
+            UserVerificationPolicy::Required | UserVerificationPolicy::Preferred
+        ),
         "unexpected WebAuthn user verification policy"
     );
     let ui = Terminal::default();
-    let mut key = usb_key(&ui).await?;
+    let key = usb_key(&ui).await?;
+    if key.is_none() && options.public_key.user_verification == UserVerificationPolicy::Preferred {
+        ensure!(
+            origin.domain() == Some("localhost"),
+            "YubiKey 4 support requires localhost HTTPS"
+        );
+        return block_in_place(|| u2f::authenticate(origin, options));
+    }
+    let mut key = key.context(CONNECT_FIDO2)?;
+    options.public_key.user_verification = UserVerificationPolicy::Required;
     let response = block_in_place(|| key.do_authentication(origin, options))
         .context("sign the gateway challenge with your YubiKey")?;
     let flags = response

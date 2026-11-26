@@ -1,17 +1,22 @@
 <!doctype html>
 <html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Shomei approval</title>
-<link rel="stylesheet" href="/_shomei/auth.css">
-<script type="module" src="/_shomei/auth.js"></script>
-<main>
-  <h1>Approve with your YubiKey</h1>
-  <form data-action>
-    <label>Account <input id="account" type="text" autocomplete="username" autocapitalize="none" placeholder="operator" maxlength="64"></label>
-    <button type="submit" disabled aria-describedby="status">Approve request</button>
-  </form>
-  <p id="status" role="status">Preparing approval…</p>
-  <noscript>Enable JavaScript to approve the request with your YubiKey.</noscript>
-</main>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Shomei approval</title>
+  <link rel="icon" href="/_shomei/seal.png" type="image/png">
+  <link rel="stylesheet" href="/_shomei/auth.css">
+  <script type="module" src="/_shomei/auth.js"></script>
+</head>
+<body>
+  <main>
+    <img class="seal" src="/_shomei/seal.png" alt="" width="90" height="90">
+    <h1>Shomei auth proxy</h1>
+    <button type="button" data-action aria-describedby="status" disabled>Approve request</button>
+    <p id="status" role="status">Preparing YubiKey approval…</p>
+    <noscript>Enable JavaScript to use your YubiKey.</noscript>
+    <a class="source" href="https://github.com/adrianchifor/shomei">GitHub <span aria-hidden="true">↗</span></a>
+  </main>
+</body>
 </html>

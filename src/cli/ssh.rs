@@ -34,9 +34,6 @@ pub(super) struct SshArgs {
     /// The HTTPS authorization origin for tls:// proxies. Defaults to port 8443.
     #[arg(long, value_parser = https_origin)]
     auth_url: Option<Url>,
-    /// The enrolled account.
-    #[arg(long, env = "SHOMEI_ACCOUNT", default_value = "operator")]
-    account: String,
     /// PEM trust roots for the gateway. Defaults to public WebPKI roots.
     #[arg(long, env = "SHOMEI_CA_FILE")]
     ca_file: Option<PathBuf>,
@@ -73,7 +70,7 @@ pub(super) async fn run(args: SshArgs) -> Result<()> {
         .distinguished_name
         .push(DnType::CommonName, "Shomei SSH client");
     let csr = params.serialize_request(&key)?.pem()?;
-    let signed = gateway.sign(&args.account, Some((host, &csr))).await?;
+    let signed = gateway.sign(Some((host, &csr))).await?;
     let grant: ClientCertificate = gateway.post("finish", &signed).await?;
     ensure!(
         grant.expires_at > crate::tls::unix_seconds()?,

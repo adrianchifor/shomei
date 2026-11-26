@@ -23,8 +23,8 @@ An empty allowlist lets the stack start and denies every authentication request.
 ```sh
 cargo build --locked --release
 export PATH="$PWD/target/release:$PATH"
-shomei init --account operator --identity-file local/operator.json
-shomei get-id --identity-file local/operator.json | jq -es 'select(length > 0)' > local/config/identities.next \
+shomei init --identity-file local/key.json
+shomei get-id --identity-file local/key.json | jq -es 'select(length > 0)' > local/config/identities.next \
   && mv local/config/identities.next local/config/identities.json
 ```
 
@@ -37,8 +37,8 @@ Both Compose examples enable `allow_yubikey_4` for localhost. YubiKey 4 enrollme
 For a fresh demo allowlist, use this enrollment command after building the CLI.
 
 ```sh
-shomei init --u2f --account operator --identity-file local/yubikey4-operator.json
-shomei get-id --identity-file local/yubikey4-operator.json | jq -es 'select(length > 0)' > local/config/identities.next \
+shomei init --u2f --identity-file local/yubikey4.json
+shomei get-id --identity-file local/yubikey4.json | jq -es 'select(length > 0)' > local/config/identities.next \
   && mv local/config/identities.next local/config/identities.json
 ```
 
@@ -75,7 +75,7 @@ The command should print `ubuntu`. Shomei checks the allowlisted alias `deploy` 
 
 Each example ships its own configuration under `fixtures/`. Set `session_ttl_seconds` for HTTP cookies and `[tcp].cert_ttl_seconds` for mTLS grants. Defaults are 600 and 300 seconds. Active SSH connections close when their certificate expires. `[browser_action]` enables the action page and requires a fresh assertion for writes through that gateway.
 
-The allowlist is a JSON array of public records from `get-id`. Replace it atomically to update identities. Additions preserve grants. Removing or replacing a credential revokes existing grants. The gateway keeps the last valid file if a reload fails.
+All enrolled keys authenticate as `shomei`. Existing enrollment records work as-is. The allowlist is a JSON array of public records from `get-id`. Replace it atomically to update identities. Additions preserve grants. Removing or replacing a credential revokes existing grants. The gateway keeps the last valid file if a reload fails.
 
 For your own upstream, create `local/state`, copy `shomei.example.toml` to `local/config/shomei.toml`, and start `compose.yaml`. For a native gateway, use local file paths and run `shomei serve path/to/shomei.toml`. `[limits]` sets connection and challenge capacity. Run the loopback benchmark with `cargo test --locked --release relay_load -- --ignored --nocapture`.
 
