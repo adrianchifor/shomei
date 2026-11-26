@@ -70,7 +70,7 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
-        browser_approval_ttl_seconds: 0,
+        protected_session_ttl_seconds: 0,
         session_ttl_seconds: 600,
         tcp: Default::default(),
         tailscale_ssh: None,

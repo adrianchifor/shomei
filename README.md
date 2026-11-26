@@ -65,7 +65,7 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 | `hostnames` | Additional reverse hostnames or IPs for the default upstream. |
 | `[[http_upstreams]]` | Reverse sites with a public `hostname` and a private `upstream`. |
 | `protected_paths` | Require approval for selected reverse-proxy paths and leave others public. |
-| `browser_approval_ttl_seconds` | Browser action approval lifetime. Defaults to `0` for a touch each time. |
+| `protected_session_ttl_seconds` | Default session lifetime for protected paths. Defaults to `0` for one approval per request. |
 | `tcp.upstream` | Fixed TCP host and port. Set `tcp.ssh_host` to the alias used by `shomei ssh`. |
 | `[tcp_upstreams]` | Named reverse TCP targets keyed by client-facing host and port. |
 | `[scopes.NAME]` | Destination and port rules for forward HTTP, HTTPS, and TCP. |
@@ -93,6 +93,16 @@ protected_paths = ["/api/deploy"]
 
 CLI clients can run `shomei sign` and send the result in `Authorization: Shomei <assertion>`.
 
+Set `protected_session_ttl_seconds` on the gateway or HTTP upstream. Override it on a path with `session_ttl_seconds`. The most specific rule wins. The default of `0` requires a fresh approval each time. A positive TTL allows reuse for the same host, method, and protected rule, up to 3600 seconds. The browser overlay keeps its approval in the tab. With curl, save the session cookie with `-c cookies.txt` on the signed request and send it with `-b cookies.txt` on subsequent requests.
+
+```toml
+protected_session_ttl_seconds = 300
+protected_paths = [
+  "/api/jobs",
+  { path = "/api/jobs/production", session_ttl_seconds = 0 },
+]
+```
+
 Omit `protected_paths` to require authentication across the site. Unauthenticated HTML GETs open the login page, and unauthenticated API requests receive `401`. A valid session authorizes subsequent site requests.
 
 ### Add a browser approval overlay
@@ -110,16 +120,6 @@ await approvedFetch("/api/jobs/example/run", {
 ```
 
 Serve the app through Shomei and protect the action path. On the WebAuthn origin, the overlay opens the key prompt directly. On another configured app host, it opens a small gateway window for the prompt. [Deploy demo script](fixtures/deploy/deploy.js)
-
-```toml
-browser_approval_ttl_seconds = 300
-protected_paths = [
-  "/api/jobs",
-  { path = "/api/jobs/production", browser_approval_ttl_seconds = 0 },
-]
-```
-
-Browser approvals can be reused in the tab for the configured TTL, up to 3600 seconds. The most specific path rule wins. Use `0` for a fresh touch on every request. A named upstream can set its own default TTL. API assertions from `shomei sign` remain single-use.
 
 ### Share a gateway across services
 

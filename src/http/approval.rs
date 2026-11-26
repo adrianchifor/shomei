@@ -8,12 +8,14 @@ use axum::{
     Extension, Json,
     extract::{Request, State},
     http::{
-        HeaderMap, Method, StatusCode,
-        header::{CONTENT_TYPE, ORIGIN},
+        HeaderMap, HeaderValue, Method, StatusCode,
+        header::{CONTENT_TYPE, COOKIE, ORIGIN},
         uri::PathAndQuery,
     },
     response::{Html, IntoResponse},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ring::digest;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -26,6 +28,7 @@ use crate::{
 pub(super) const HEADER: &str = "x-shomei-browser-approval";
 pub(super) const CHECK_PATH: &str = "/api/auth/browser/check";
 
+#[derive(Clone, Copy)]
 pub(super) struct Policy<'a> {
     rule: Option<&'a str>,
     ttl: u64,
@@ -50,7 +53,7 @@ pub(super) fn policy<'a>(site: &'a HttpUpstream, path: &str) -> Option<Policy<'a
         .max_by_key(|rule| rule.path().len())
         .map(|rule| Policy {
             rule: Some(rule.path()),
-            ttl: rule.browser_ttl(site.browser_approval_ttl_seconds),
+            ttl: rule.session_ttl(site.protected_session_ttl_seconds),
         })
 }
 
@@ -122,6 +125,20 @@ impl Intent {
                 self.rule == request.rule && request.ttl > 0
             }
     }
+
+    fn cookie_name(&self) -> String {
+        let key = format!(
+            "{} {} {}",
+            self.host,
+            self.method,
+            self.rule.as_deref().unwrap_or("")
+        );
+        let hash = digest::digest(&digest::SHA256, key.as_bytes());
+        format!(
+            "__Host-shomei-action-{}",
+            URL_SAFE_NO_PAD.encode(&hash.as_ref()[..16])
+        )
+    }
 }
 
 pub(super) fn intent(app: &App, body: Start) -> Result<Intent, ApiError> {
@@ -154,6 +171,18 @@ impl Approvals {
         intent: Intent,
         generation: u64,
     ) -> Result<axum::response::Response, ApiError> {
+        let reusable = intent.ttl > 0;
+        let origin = site_origin(&intent.host);
+        let id = self.store(intent, generation)?;
+        Ok(Json(serde_json::json!({
+            "approval": id,
+            "reusable": reusable,
+            "site_origin": origin,
+        }))
+        .into_response())
+    }
+
+    fn store(&self, intent: Intent, generation: u64) -> Result<Uuid, ApiError> {
         let mut permits = self.permits.lock().map_err(ApiError::internal)?;
         let now = Instant::now();
         if permits.len() >= self.limit {
@@ -162,13 +191,11 @@ impl Approvals {
         if permits.len() >= self.limit {
             return Err(ApiError(
                 StatusCode::TOO_MANY_REQUESTS,
-                "too many browser approvals",
+                "too many protected path approvals",
             ));
         }
         let id = Uuid::new_v4();
-        let reusable = intent.ttl > 0;
-        let seconds = if reusable { intent.ttl } else { 30 };
-        let origin = site_origin(&intent.host);
+        let seconds = if intent.ttl > 0 { intent.ttl } else { 30 };
         permits.insert(
             id,
             Permit {
@@ -177,12 +204,7 @@ impl Approvals {
                 deadline: now + Duration::from_secs(seconds),
             },
         );
-        Ok(Json(serde_json::json!({
-            "approval": id,
-            "reusable": reusable,
-            "site_origin": origin,
-        }))
-        .into_response())
+        Ok(id)
     }
 
     fn accepts(
@@ -247,30 +269,79 @@ pub(super) fn authorize(
     request: &Request,
     policy: Policy<'_>,
 ) -> Result<bool, ApiError> {
-    let mut values = request.headers().get_all(HEADER).iter();
-    let Some(id) = values
-        .next()
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-    else {
-        return Ok(false);
-    };
-    if values.next().is_some()
-        || reverse_endpoint(request).as_ref() != Some(host)
-        || !same_origin_browser(
-            request.headers(),
-            host,
-            !matches!(*request.method(), Method::GET | Method::HEAD),
-        )
-    {
-        return Ok(false);
-    }
     let Some(path) = request.uri().path_and_query().cloned() else {
         return Ok(false);
     };
-    let intent = Intent::new(host.clone(), request.method().clone(), path, policy);
-    app.approvals
-        .accepts(id, &intent, app.auth.generation(), true)
+    let authority = reverse_endpoint(request);
+    let generation = app.auth.generation();
+    let mut values = request.headers().get_all(HEADER).iter();
+    let require_origin = !matches!(*request.method(), Method::GET | Method::HEAD);
+    if let Some(value) = values.next() {
+        let Some(id) = value.to_str().ok().and_then(|value| value.parse().ok()) else {
+            return Ok(false);
+        };
+        if values.next().is_some()
+            || authority.as_ref() != Some(host)
+            || !same_origin_browser(request.headers(), host, require_origin)
+        {
+            return Ok(false);
+        }
+        let intent = Intent::new(host.clone(), request.method().clone(), path, policy);
+        return app.approvals.accepts(id, &intent, generation, true);
+    }
+    let Some(authority) = authority.filter(|_| policy.ttl > 0) else {
+        return Ok(false);
+    };
+    let headers = request.headers();
+    if !headers.contains_key(COOKIE) {
+        return Ok(false);
+    }
+    if (headers.contains_key("sec-fetch-site") || headers.contains_key(ORIGIN))
+        && !same_origin_browser(headers, &authority, require_origin)
+    {
+        return Ok(false);
+    }
+    let intent = Intent::new(authority, request.method().clone(), path, policy);
+    let name = intent.cookie_name();
+    let mut tokens = headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| {
+            let (key, value) = pair.trim().split_once('=')?;
+            (key.trim() == name).then_some(value)
+        });
+    let Some(id) = tokens.next().and_then(|value| value.parse().ok()) else {
+        return Ok(false);
+    };
+    if tokens.next().is_some() {
+        return Ok(false);
+    }
+    app.approvals.accepts(id, &intent, generation, false)
+}
+
+pub(super) fn issue_cookie(
+    app: &App,
+    request: &Request,
+    policy: Policy<'_>,
+    generation: u64,
+) -> Result<Option<HeaderValue>, ApiError> {
+    let ttl = policy.ttl;
+    if ttl == 0 {
+        return Ok(None);
+    }
+    let (Some(host), Some(path)) = (reverse_endpoint(request), request.uri().path_and_query())
+    else {
+        return Ok(None);
+    };
+    let intent = Intent::new(host, request.method().clone(), path.clone(), policy);
+    let name = intent.cookie_name();
+    let id = app.approvals.store(intent, generation)?;
+    let cookie = format!("{name}={id}; Path=/; Max-Age={ttl}; Secure; HttpOnly; SameSite=Strict");
+    HeaderValue::from_str(&cookie)
+        .map(Some)
+        .map_err(ApiError::internal)
 }
 
 pub(super) async fn check(
@@ -320,7 +391,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expired_browser_approval_cannot_be_reused() {
+    fn expired_protected_path_approval_cannot_be_reused() {
         let approvals = Approvals::new(1);
         let policy = || Policy {
             rule: Some("/api/jobs"),

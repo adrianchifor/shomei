@@ -48,7 +48,7 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
-        browser_approval_ttl_seconds: 0,
+        protected_session_ttl_seconds: 0,
         session_ttl_seconds: 60,
         tcp: TcpConfig::default(),
         tailscale_ssh: None,
@@ -313,7 +313,7 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: Some(vec![ProtectedPath::Path("/api/deploy".into())]),
-        browser_approval_ttl_seconds: 0,
+        protected_session_ttl_seconds: 0,
         session_ttl_seconds: 60,
         tcp: TcpConfig::default(),
         tailscale_ssh: None,
@@ -418,7 +418,7 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
 }
 
 #[tokio::test]
-async fn browser_approvals_are_scoped_and_follow_per_path_ttls() {
+async fn browser_and_cli_approvals_follow_protected_path_session_ttls() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let identities = dir.path().join("identities");
@@ -432,10 +432,10 @@ async fn browser_approvals_are_scoped_and_follow_per_path_ttls() {
         state_dir = {:?}
         identities_file = {identities:?}
         http_upstream = "http://{}"
-        browser_approval_ttl_seconds = 60
+        protected_session_ttl_seconds = 60
         protected_paths = [
           "/api/jobs",
-          {{ path = "/api/jobs/production", browser_approval_ttl_seconds = 0 }},
+          {{ path = "/api/jobs/production", session_ttl_seconds = 0 }},
         ]
     "#,
         dir.path(),
@@ -457,6 +457,7 @@ async fn browser_approvals_are_scoped_and_follow_per_path_ttls() {
             upstream,
             Router::new().fallback(|req: Request| async move {
                 assert!(!req.headers().contains_key(approval::HEADER));
+                assert!(!req.headers().contains_key(COOKIE));
                 axum::body::to_bytes(req.into_body(), 4096).await.unwrap()
             }),
         )
@@ -594,9 +595,74 @@ async fn browser_approvals_are_scoped_and_follow_per_path_ttls() {
             .body(Body::from("job payload"))
             .unwrap()
     };
-    assert_eq!(send(&router, cli()).await.status(), StatusCode::OK);
+    let approved = send(&router, cli()).await;
+    assert_eq!(approved.status(), StatusCode::OK);
+    assert!(!approved.headers().contains_key(SET_COOKIE));
     assert_eq!(
         send(&router, cli()).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let start = send(
+        &router,
+        post_json(
+            "/_shomei/api/auth/start",
+            json!({ "http_destination": format!("{site_origin}{path}") }),
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let signed = signed_answer(&signer, &json_body(start).await, 4);
+    let assertion = format!("Shomei {}", URL_SAFE_NO_PAD.encode(signed.to_string()));
+    let cli_request = |method: Method, host: &str, path: &str| {
+        let mut req = request(path).method(method);
+        req.headers_mut()
+            .unwrap()
+            .insert(HOST, HeaderValue::from_str(host).unwrap());
+        req
+    };
+    let approved = send(
+        &router,
+        cli_request(Method::POST, site, path)
+            .header(AUTHORIZATION, assertion)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(approved.status(), StatusCode::OK);
+    let set_cookie = approved.headers()[SET_COOKIE].to_str().unwrap();
+    assert!(set_cookie.starts_with("__Host-shomei-action-"));
+    assert!(set_cookie.contains("Max-Age=60"));
+    assert!(set_cookie.contains("SameSite=Strict"));
+    let cookie = set_cookie.split_once(';').unwrap().0;
+    let use_cookie = |method, host, path| {
+        cli_request(method, host, path)
+            .header(COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+    for path in [path, "/api/jobs/another/run"] {
+        let response = send(&router, use_cookie(Method::POST, site, path)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(SET_COOKIE));
+    }
+    for (method, host, path) in [
+        (Method::GET, site, path),
+        (Method::POST, "localhost:8443", path),
+        (Method::POST, site, production),
+        (Method::POST, site, "/api/jobs/%2e/production"),
+    ] {
+        assert_eq!(
+            send(&router, use_cookie(method, host, path)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let mut cross_origin = context(use_cookie(Method::POST, site, path), gateway);
+    cross_origin
+        .headers_mut()
+        .insert("sec-fetch-site", HeaderValue::from_static("same-site"));
+    assert_eq!(
+        send(&router, cross_origin).await.status(),
         StatusCode::UNAUTHORIZED
     );
 
@@ -604,6 +670,12 @@ async fn browser_approvals_are_scoped_and_follow_per_path_ttls() {
     assert!(state.auth.reload().unwrap());
     assert_eq!(
         send(&router, deploy(Method::POST, site, path, token))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(&router, use_cookie(Method::POST, site, path))
             .await
             .status(),
         StatusCode::UNAUTHORIZED
@@ -958,7 +1030,7 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
-        browser_approval_ttl_seconds: 0,
+        protected_session_ttl_seconds: 0,
         session_ttl_seconds: 60,
         tcp: TcpConfig::default(),
         tailscale_ssh: Some(TailscaleSshConfig {
@@ -1109,7 +1181,7 @@ async fn approves_one_request(u2f: bool) {
         http_upstreams: Default::default(),
         tcp_upstreams: Default::default(),
         protected_paths: None,
-        browser_approval_ttl_seconds: 0,
+        protected_session_ttl_seconds: 0,
         session_ttl_seconds: 60,
         tcp: TcpConfig::default(),
         tailscale_ssh: None,

@@ -110,7 +110,7 @@ impl Peer {
 struct HttpUpstream {
     origin: Uri,
     protected_paths: Option<Vec<ProtectedPath>>,
-    browser_approval_ttl_seconds: u64,
+    protected_session_ttl_seconds: u64,
     sessions: Sessions,
 }
 
@@ -163,15 +163,15 @@ fn state_with_auth(
             hostname: None,
             upstream: origin,
             protected_paths: config.protected_paths,
-            browser_approval_ttl_seconds: None,
+            protected_session_ttl_seconds: None,
         });
     }
     sites.sort_by_key(|site| site.hostname.is_some());
     for site in sites {
         let origin = site.upstream.as_str().parse::<Uri>()?;
-        let browser_approval_ttl_seconds = site
-            .browser_approval_ttl_seconds
-            .unwrap_or(config.browser_approval_ttl_seconds);
+        let protected_session_ttl_seconds = site
+            .protected_session_ttl_seconds
+            .unwrap_or(config.protected_session_ttl_seconds);
         if let Some(host) = site.hostname {
             let host = Endpoint::parse(&host, port)?;
             hosts.insert(host.clone());
@@ -182,7 +182,7 @@ fn state_with_auth(
                         HttpUpstream {
                             origin: origin.clone(),
                             protected_paths: site.protected_paths.clone(),
-                            browser_approval_ttl_seconds,
+                            protected_session_ttl_seconds,
                             sessions: sessions(alias)?,
                         },
                     );
@@ -194,7 +194,7 @@ fn state_with_auth(
                 HttpUpstream {
                     origin,
                     protected_paths: site.protected_paths,
-                    browser_approval_ttl_seconds,
+                    protected_session_ttl_seconds,
                     sessions,
                 },
             );
@@ -205,7 +205,7 @@ fn state_with_auth(
                     HttpUpstream {
                         origin: origin.clone(),
                         protected_paths: site.protected_paths.clone(),
-                        browser_approval_ttl_seconds,
+                        protected_session_ttl_seconds,
                         sessions: sessions(host)?,
                     },
                 );
@@ -1254,8 +1254,9 @@ async fn reverse(
         Ok(signed) => signed,
         Err(error) => return error.into_response(),
     };
+    let approval_policy = approval::policy(upstream, request.uri().path());
     if signed.is_none()
-        && let Some(policy) = approval::policy(upstream, request.uri().path())
+        && let Some(policy) = approval_policy
     {
         match approval::authorize(&app, &host, &request, policy) {
             Ok(true) => {}
@@ -1317,21 +1318,28 @@ async fn reverse(
                     "HTTP authorization required",
                 ));
             }
-            check_generation(app, generation)?;
-            let (cookie, _) = app.upstreams[&approved_host]
-                .sessions
-                .issue(generation)
-                .map_err(ApiError::internal)?;
-            Ok((cookie, generation))
+            Ok(generation)
         })
         .await;
         match result {
-            Ok((cookie, generation)) => {
+            Ok(generation) => {
                 if let Err(error) = check_generation(&app, generation) {
                     return error.into_response();
                 }
+                let cookie = if let Some(policy) = approval_policy {
+                    approval::issue_cookie(&app, &request, policy, generation)
+                } else {
+                    upstream
+                        .sessions
+                        .issue(generation)
+                        .map(|(cookie, _)| Some(cookie))
+                        .map_err(ApiError::internal)
+                };
                 request.headers_mut().remove(AUTHORIZATION);
-                Some(cookie)
+                match cookie {
+                    Ok(cookie) => cookie,
+                    Err(error) => return error.into_response(),
+                }
             }
             Err(error) => return error.into_response(),
         }

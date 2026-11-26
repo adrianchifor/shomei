@@ -36,8 +36,8 @@ pub struct Config {
     #[serde(default)]
     pub tcp_upstreams: BTreeMap<String, String>,
     pub protected_paths: Option<Vec<ProtectedPath>>,
-    #[serde(default)]
-    pub browser_approval_ttl_seconds: u64,
+    #[serde(default, alias = "browser_approval_ttl_seconds")]
+    pub protected_session_ttl_seconds: u64,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
     #[serde(default)]
@@ -53,7 +53,8 @@ pub struct HttpUpstreamConfig {
     pub hostname: Option<String>,
     pub upstream: Url,
     pub protected_paths: Option<Vec<ProtectedPath>>,
-    pub browser_approval_ttl_seconds: Option<u64>,
+    #[serde(alias = "browser_approval_ttl_seconds")]
+    pub protected_session_ttl_seconds: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -67,7 +68,8 @@ pub enum ProtectedPath {
 #[serde(deny_unknown_fields)]
 pub struct ProtectedPathRule {
     path: String,
-    browser_approval_ttl_seconds: Option<u64>,
+    #[serde(alias = "browser_approval_ttl_seconds")]
+    session_ttl_seconds: Option<u64>,
 }
 
 impl ProtectedPath {
@@ -78,10 +80,10 @@ impl ProtectedPath {
         }
     }
 
-    pub fn browser_ttl(&self, default: u64) -> u64 {
+    pub fn session_ttl(&self, default: u64) -> u64 {
         match self {
             Self::Path(_) => default,
-            Self::Rule(rule) => rule.browser_approval_ttl_seconds.unwrap_or(default),
+            Self::Rule(rule) => rule.session_ttl_seconds.unwrap_or(default),
         }
     }
 }
@@ -228,7 +230,7 @@ impl Config {
         validate_http_site(
             config.http_upstream.as_ref(),
             config.protected_paths.as_deref(),
-            config.browser_approval_ttl_seconds,
+            config.protected_session_ttl_seconds,
         )?;
         ensure!(
             !config.forwarding || !config.scopes.is_empty(),
@@ -270,8 +272,8 @@ impl Config {
             validate_http_site(
                 Some(&site.upstream),
                 site.protected_paths.as_deref(),
-                site.browser_approval_ttl_seconds
-                    .unwrap_or(config.browser_approval_ttl_seconds),
+                site.protected_session_ttl_seconds
+                    .unwrap_or(config.protected_session_ttl_seconds),
             )?;
         }
         if has_default {
@@ -356,11 +358,11 @@ impl Config {
 fn validate_http_site(
     upstream: Option<&Url>,
     paths: Option<&[ProtectedPath]>,
-    browser_ttl: u64,
+    default_ttl: u64,
 ) -> Result<()> {
     ensure!(
-        browser_ttl <= 3600,
-        "browser approval TTL must be 0 to 3600 seconds"
+        default_ttl <= 3600,
+        "protected path session TTL must be 0 to 3600 seconds"
     );
     if let Some(upstream) = upstream {
         ensure!(
@@ -398,8 +400,8 @@ fn validate_http_site(
                 "duplicate protected path {path:?}"
             );
             ensure!(
-                rule.browser_ttl(browser_ttl) <= 3600,
-                "browser approval TTL must be 0 to 3600 seconds"
+                rule.session_ttl(default_ttl) <= 3600,
+                "protected path session TTL must be 0 to 3600 seconds"
             );
         }
     }

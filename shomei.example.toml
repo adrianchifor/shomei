@@ -15,17 +15,17 @@ session_ttl_seconds = 600
 
 # Require fresh approval for these paths and leave other paths public.
 # protected_paths = ["/api/deploy"]
-# Browser approvals default to one use. Set a TTL to reuse them in the browser.
-# browser_approval_ttl_seconds = 300
+# Protected paths default to one approval per request.
+# protected_session_ttl_seconds = 300
 # Override the TTL for a path by using a table entry.
-# protected_paths = ["/api/jobs", { path = "/api/jobs/production", browser_approval_ttl_seconds = 0 }]
+# protected_paths = ["/api/jobs", { path = "/api/jobs/production", session_ttl_seconds = 0 }]
 
 # Additional reverse sites, selected by their public hostname and port.
 # [[http_upstreams]]
 # hostname = "deploy.example.com"
 # upstream = "http://deploy:8080"
 # protected_paths = ["/api/deploy"]
-# browser_approval_ttl_seconds = 60
+# protected_session_ttl_seconds = 60
 # [[http_upstreams]]
 # hostname = "dashboard.example.com:8443"
 # upstream = "http://dashboard:3000"
