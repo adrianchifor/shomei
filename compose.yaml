@@ -1,3 +1,9 @@
+# Runs the gateway from the local/ directory next to this file.
+#   local/config  mounted read-only at /etc/shomei: shomei.toml, the TLS certificate and key,
+#                 and the allowlist
+#   local/state   mounted at /var/lib/shomei: signature counters, writable by SHOMEI_UID
+# SHOMEI_IMAGE pins a release tag or digest. SHOMEI_UID and SHOMEI_GID default to 10001.
+# Both listeners are published on loopback. Change the host addresses to expose them.
 services:
   shomei:
     image: "${SHOMEI_IMAGE:-ghcr.io/adrianchifor/shomei:latest}"
