@@ -1,13 +1,15 @@
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use axum::http;
 use rcgen::{CertificateParams, KeyPair};
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixListener};
 use tower::ServiceExt;
 
 use super::*;
 use crate::{
     auth::tests::{TestSigner, test_auth},
-    config::TcpConfig,
+    config::{TailscaleSshConfig, TcpConfig},
 };
 
 #[tokio::test]
@@ -18,6 +20,205 @@ async fn approves_one_deploy_and_allows_only_reads_with_its_cookie() {
 #[tokio::test]
 async fn attested_yubikey_4_approves_deploy_and_tcp_grants() {
     approves_one_deploy(true).await;
+}
+
+#[tokio::test]
+async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
+    const LOCAL: &str = "fd7a:115c:a1e0::51";
+    const OTHER: &str = "fd7a:115c:a1e0::52";
+    const TARGET: &str = "deploy.example.ts.net";
+    const START: &str = "/_shomei/api/auth/tailscale/start";
+    const FINISH: &str = "/_shomei/api/auth/tailscale/finish";
+    let dir = tempfile::Builder::new()
+        .prefix("shomei-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = dir.path().join("tailscale.sock");
+    let secret = dir.path().join("secret");
+    std::fs::write(&secret, "test-secret\n").unwrap();
+    let local = UnixListener::bind(&socket).unwrap();
+    let local_server = tokio::spawn(async move {
+        while let Ok((connection, _)) = local.accept().await {
+            tokio::spawn(async move {
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(connection), service_fn(|request: hyper::Request<Incoming>| async move {
+                        assert_eq!(request.headers()[HOST], "local-tailscaled.sock");
+                        assert_eq!(request.uri().path(), "/localapi/v0/whois");
+                        let query = request.uri().query().unwrap();
+                        let (id, address) = match query {
+                            "addr=fd7a%3A115c%3Aa1e0%3A%3A51" => ("nFirst", format!("{LOCAL}/128")),
+                            "addr=fd7a%3A115c%3Aa1e0%3A%3A52" => ("nSecond", format!("{OTHER}/128")),
+                            _ => panic!("unexpected WhoIs query {query}"),
+                        };
+                        let body = json!({"Node": { "StableID": id, "Addresses": [address], "User": 123 }, "UserProfile": { "ID": 123 }});
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(Bytes::from(body.to_string()))))
+                    }))
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_origin = format!("http://{}", api_listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let (writes, mut written) = tokio::sync::mpsc::unbounded_channel();
+    let revoked = Arc::new(AtomicBool::new(false));
+    let token_requests = Arc::new(AtomicUsize::new(0));
+    let api_revoked = revoked.clone();
+    let api_token_requests = token_requests.clone();
+    let api_server = tokio::spawn(async move {
+        let api = Router::new()
+            .route("/api/v2/oauth/token", post(move |body: String| async move {
+                assert_eq!(body, "grant_type=client_credentials&client_id=test-client&client_secret=test-secret&scope=devices%3Aposture_attributes");
+                let sequence = api_token_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                Json(json!({ "access_token": format!("test-token-{sequence}"), "expires_in": 3600 }))
+            }))
+            .route("/api/v2/device/nFirst/attributes/custom:shomei_ssh", post(move |headers: HeaderMap, Json(body): Json<Value>| async move {
+                let token = headers[AUTHORIZATION].to_str().unwrap();
+                if token == "Bearer test-token-1" && api_revoked.load(Ordering::SeqCst) {
+                    return StatusCode::UNAUTHORIZED;
+                }
+                assert!(matches!(token, "Bearer test-token-1" | "Bearer test-token-2"));
+                writes.send(body).unwrap();
+                StatusCode::NO_CONTENT
+            }));
+        axum::serve(api_listener, api).await.unwrap();
+    });
+    let config = Config {
+        origin: "https://localhost:8443".parse().unwrap(),
+        https_bind: "100.64.0.1:8443".parse().unwrap(),
+        tls_cert: "unused".into(),
+        tls_key: "unused".into(),
+        state_dir: dir.path().into(),
+        identities_file: dir.path().join("identities.json"),
+        allow_yubikey_4: false,
+        http_upstream: None,
+        browser_action: None,
+        session_ttl_seconds: 60,
+        tcp: None,
+        tailscale_ssh: Some(TailscaleSshConfig {
+            target: TARGET.into(),
+            posture_attribute: "custom:shomei_ssh".into(),
+            oauth_client_id: "test-client".into(),
+            oauth_client_secret_file: secret,
+            socket,
+            ttl_seconds: 300,
+        }),
+        limits: crate::config::Limits {
+            pending_per_ip: 1,
+            ..Default::default()
+        },
+    };
+    let (auth, signer) = test_auth(
+        &config.origin,
+        &config.state_dir,
+        &config.identities_file,
+        &config.limits,
+        false,
+    );
+    let mut state = state_with_auth(config, None, auth).unwrap();
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .tailscale
+        .as_mut()
+        .unwrap()
+        .use_test_api(api_origin);
+    let router = routes(state);
+    let send_as = |path, body, ip: &str| {
+        let mut request = post_json(path, body);
+        request.extensions_mut().insert(Peer(ip.parse().unwrap()));
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_static(LOCAL));
+        send(&router, request)
+    };
+    let begin = || send_as(START, json!({ "target": TARGET }), LOCAL);
+
+    assert_eq!(
+        send_as(START, json!({ "target": TARGET }), "127.0.0.1")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send_as(START, json!({ "target": "other.example.ts.net" }), LOCAL)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    assert_eq!(
+        send_as(START, json!({ "target": TARGET }), OTHER)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send_as(START, json!({ "target": TARGET }), OTHER)
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let start = begin().await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let answer = signed_answer(&signer, &json_body(start).await, 1);
+    assert_eq!(
+        send_as(FINISH, answer, OTHER).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let mut invalid = signed_answer(&signer, &json_body(begin().await).await, 2);
+    invalid["credential"]["response"]["signature"] = json!("AA");
+    assert_eq!(
+        send_as(FINISH, invalid, LOCAL).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(written.try_recv().is_err());
+
+    let answer = signed_answer(&signer, &json_body(begin().await).await, 3);
+    let now = crate::tls::unix_seconds().unwrap();
+    let approved = send_as(FINISH, answer.clone(), LOCAL).await;
+    assert_eq!(approved.status(), StatusCode::OK);
+    assert!(!approved.headers().contains_key(SET_COOKIE));
+    let expiry = json_body(approved).await["expires_at"].as_u64().unwrap();
+    assert!((now + 300..=now + 305).contains(&expiry));
+    let update = written.try_recv().unwrap();
+    assert_eq!(update["value"], true);
+    let expected = time::OffsetDateTime::from_unix_timestamp(expiry.try_into().unwrap())
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    assert!(
+        update["expiry"]
+            .as_str()
+            .unwrap()
+            .starts_with(&expected[..19])
+    );
+    assert_eq!(
+        send_as(FINISH, answer, LOCAL).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(written.try_recv().is_err());
+    assert_eq!(token_requests.load(Ordering::SeqCst), 1);
+
+    revoked.store(true, Ordering::SeqCst);
+    let answer = signed_answer(&signer, &json_body(begin().await).await, 4);
+    assert_eq!(
+        send_as(FINISH, answer, LOCAL).await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(written.try_recv().is_err());
+    assert_eq!(token_requests.load(Ordering::SeqCst), 1);
+
+    let answer = signed_answer(&signer, &json_body(begin().await).await, 5);
+    assert_eq!(
+        send_as(FINISH, answer, LOCAL).await.status(),
+        StatusCode::OK
+    );
+    assert!(written.try_recv().is_ok());
+    assert_eq!(token_requests.load(Ordering::SeqCst), 2);
+    api_server.abort();
+    local_server.abort();
 }
 
 async fn approves_one_deploy(u2f: bool) {
@@ -49,6 +250,7 @@ async fn approves_one_deploy(u2f: bool) {
             public_port: Some(9553),
             cert_ttl_seconds: 120,
         }),
+        tailscale_ssh: None,
         limits: Default::default(),
     };
     let (auth, signer) = test_auth(

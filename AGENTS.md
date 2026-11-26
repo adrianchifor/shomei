@@ -1,12 +1,12 @@
 # Shomei integration guide for agents
 
-Use Shomei as the public entry point for an HTTP application, a fixed SSH upstream, or both. Keep upstream listeners reachable only from the gateway. All enrolled YubiKeys authenticate as `shomei`. Ask the operator to complete PIN and touch prompts on the machine with the key.
+Use Shomei for HTTP authentication, an SSH relay, or direct Tailscale SSH approval. Keep relayed upstreams reachable only from the gateway. All enrolled YubiKeys authenticate as `shomei`. Ask the operator to complete PIN and touch prompts on the machine with the key.
 
 ## Set up the gateway
 
 1. Use `ghcr.io/adrianchifor/shomei:latest` for the gateway on Linux amd64 or arm64. Set `SHOMEI_IMAGE` to pin a release tag or digest. Run `curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh` on the machine with the YubiKey. The installer places the verified CLI at `~/.local/bin/shomei`. Use that path if `shomei` is outside `PATH`. On Linux the CLI requires `libudev.so.1`. [GitHub Packages](https://github.com/adrianchifor/shomei/pkgs/container/shomei) · [Binary releases](https://github.com/adrianchifor/shomei/releases)
 2. Pick the HTTPS origin clients will use, including any nondefault port. It must use a DNS name. Install a certificate and private key for that hostname. Use the same value for the config’s `origin` and the client’s `SHOMEI_PROXY`. For local TLS and sample stacks, follow the [quickstart](README.md#quickstart).
-3. Copy `shomei.example.toml` to `local/config/shomei.toml` and configure at least one upstream using the sections below. Use addresses the gateway can reach from its own network. For HTTP-only, remove `[tcp]`. For SSH-only, remove `http_upstream`. [Example configuration](shomei.example.toml)
+3. Copy `shomei.example.toml` to `local/config/shomei.toml` and configure an upstream or direct Tailscale SSH approval using the sections below. For HTTP-only, remove `[tcp]`. For SSH-only, remove `http_upstream`. [Example configuration](shomei.example.toml)
 4. On the gateway host, place the TLS files and the public allowlist from enrollment under `local/config`, and create `local/state`. Set `SHOMEI_UID` and `SHOMEI_GID` to a user that can read the config and write state. Run `docker compose up -d` after the files are in place. The supplied Compose file publishes listeners on loopback. For a native deployment, set the file paths and run `shomei serve path/to/shomei.toml`.
 
 ### Enroll a key
@@ -115,6 +115,49 @@ shomei ssh --proxy "$SHOMEI_PROXY" \
 ```
 
 `shomei ssh` gets a short-lived client certificate after approval and starts OpenSSH through the relay. Omit the remote command for an interactive shell. To use `--proxy tls://gateway.example.com:9443` instead, pass `--auth-url "$SHOMEI_PROXY"` if the HTTPS port differs from 8443. The mTLS relay closes active connections at certificate expiry.
+
+## Approve direct Tailscale SSH
+
+Use a Premium or Enterprise tailnet. Run `shomei serve /etc/shomei/shomei.toml` on the gateway node with access to its `tailscaled` Unix socket. Bind `https_bind` to the node’s Tailscale IP, allow ingress to that port only via Tailscale, and use a TLS certificate for the gateway’s MagicDNS name. Run the service with permission to read the LocalAPI socket and the OAuth secret file. [Tailscale just-in-time access](https://tailscale.com/docs/features/tailscale-accessbot-jit)
+
+Create a Tailscale OAuth client with the `devices:posture_attributes` write scope. Put the client secret in a file readable only by the service user. Set the following alongside the normal origin, TLS, state, and allowlist settings. For an approval-only gateway, omit `http_upstream` and `[tcp]`. Enroll keys for this gateway’s HTTPS origin.
+
+```toml
+[tailscale_ssh]
+target = "deploy.example.ts.net"
+posture_attribute = "custom:shomei_ssh_deploy"
+oauth_client_id = "your-oauth-client-id"
+oauth_client_secret_file = "/etc/shomei/tailscale-oauth-secret"
+socket = "/var/run/tailscale/tailscaled.sock"
+ttl_seconds = 300
+```
+
+Enable Tailscale SSH on `deploy`. In the tailnet policy, allow your users to reach the approval endpoint and require the approval attribute on every grant that gives them TCP port 22 on `deploy`. Include your existing device checks in the same posture definition as the approval assertion. Entries in `srcPosture` are alternatives. Keep the SSH `check` rule for the caller’s existing login and re-authentication policy. [Tailscale posture rules](https://tailscale.com/docs/features/device-posture/postures-in-access-rules) · [Tailscale SSH policy](https://tailscale.com/docs/reference/syntax/policy-file#tailscale-ssh)
+
+This policy fragment uses `tag:shomei` for the gateway, `tag:deploy` for the target, and `group:ops` for eligible callers. Assign `tag:deploy` only to the configured target. Replace the example auto-update check with your existing posture assertions.
+
+```json
+{
+  "postures": {
+    "posture:approvedDeploy": ["node:tsAutoUpdate == true", "custom:shomei_ssh_deploy == true"]
+  },
+  "grants": [
+    { "src": ["group:ops"], "dst": ["tag:shomei"], "ip": ["tcp:8443"] },
+    { "src": ["group:ops"], "dst": ["tag:deploy"], "ip": ["tcp:22"], "srcPosture": ["posture:approvedDeploy"] }
+  ],
+  "ssh": [
+    { "action": "check", "src": ["group:ops"], "dst": ["tag:deploy"], "users": ["ubuntu"], "checkPeriod": "always" }
+  ]
+}
+```
+
+From the caller’s Tailscale device, use the configured target’s full MagicDNS name. Verify its SSH host key through your usual trusted channel.
+
+```sh
+shomei ssh --tailscale --proxy https://shomei.example.ts.net:8443 ubuntu@deploy.example.ts.net
+```
+
+The window applies to the device and can permit multiple connections. Tailscale enforces expiry. Removing a YubiKey from the Shomei allowlist blocks new approvals. To revoke an approval early, remove the device’s approval attribute in Tailscale.
 
 ## Verify the integration
 

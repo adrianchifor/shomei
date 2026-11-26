@@ -126,6 +126,7 @@ enum Login {
 pub enum Grant {
     Http,
     Tcp(SubjectPublicKeyInfo),
+    Tailscale(crate::tailscale::Device),
 }
 
 #[derive(Serialize)]

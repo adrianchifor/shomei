@@ -60,7 +60,7 @@ enum Command {
     Clear(IdentityFile),
     /// Print a one-use Shomei authorization assertion.
     Sign(Access),
-    /// Connect to an allowlisted SSH host through Shomei.
+    /// Connect to an allowlisted SSH host after YubiKey approval.
     Ssh(ssh::SshArgs),
     #[command(hide = true)]
     SshStdio { socket: PathBuf },
@@ -366,7 +366,11 @@ impl Gateway {
             body["tcp_target"] = target.into();
             body["client_csr_pem"] = csr.into();
         }
-        let started: Started = self.post("start", &body).await?;
+        self.sign_challenge("start", &body).await
+    }
+
+    async fn sign_challenge(&self, step: &str, body: &impl Serialize) -> Result<Signed> {
+        let started: Started = self.post(step, body).await?;
         ensure!(
             self.origin.domain() == Some(started.options.public_key.rp_id.as_str()),
             "gateway returned a different WebAuthn relying party"

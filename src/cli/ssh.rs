@@ -34,13 +34,16 @@ pub(super) struct SshArgs {
     /// The HTTPS authorization origin for tls:// proxies. Defaults to port 8443.
     #[arg(long, value_parser = https_origin)]
     auth_url: Option<Url>,
+    /// Approve SSH over Tailscale and connect directly from this device.
+    #[arg(long, conflicts_with = "auth_url")]
+    tailscale: bool,
     /// PEM trust roots. Localhost can use ~/.shomei/localhost-ca.pem.
     #[arg(long, env = "SHOMEI_CA_FILE")]
     ca_file: Option<PathBuf>,
     /// Pass one option or value to OpenSSH. Repeat with --ssh-arg=<value>.
     #[arg(long, allow_hyphen_values = true)]
     ssh_arg: Vec<OsString>,
-    /// A username and the gateway's allowlisted SSH host alias.
+    /// SSH username and the allowlisted host alias or full MagicDNS name.
     #[arg(value_name = "USER@HOST")]
     destination: String,
     /// Optional remote command and arguments after --.
@@ -55,8 +58,70 @@ struct ClientCertificate {
     tcp_endpoint: String,
 }
 
+#[derive(Deserialize)]
+struct TailscaleApproval {
+    expires_at: u64,
+}
+
 pub(super) async fn run(args: SshArgs) -> Result<()> {
     let host = ssh_host(&args.destination)?;
+    let status = if args.tailscale {
+        open_tailscale(&args, host).await?
+    } else {
+        open_relay(&args, host).await?
+    };
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+async fn open_tailscale(args: &SshArgs, host: &str) -> Result<ExitStatus> {
+    ensure!(
+        crate::config::is_magic_dns_name(host),
+        "expected a full MagicDNS SSH hostname"
+    );
+    let origin = https_origin(args.proxy.as_str())?;
+    let roots = trust_roots(&origin, args.ca_file.as_deref())?;
+    let gateway = Gateway::new(origin, roots)?;
+    let request = serde_json::json!({ "target": host });
+    let signed = gateway.sign_challenge("tailscale/start", &request).await?;
+    let approval: TailscaleApproval = gateway.post("tailscale/finish", &signed).await?;
+    ensure!(
+        approval.expires_at > crate::tls::unix_seconds()?,
+        "the Tailscale approval has expired"
+    );
+    tailscale_openssh(args, host)
+        .status()
+        .await
+        .context("run OpenSSH over Tailscale")
+}
+
+fn tailscale_openssh(args: &SshArgs, host: &str) -> Command {
+    let mut ssh = openssh_command();
+    ssh.arg("-o")
+        .arg(format!("HostName={host}"))
+        .args([
+            "-p",
+            "22",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "PreferredAuthentications=none",
+            "-o",
+            "IdentityAgent=none",
+            "-o",
+            "ForwardAgent=no",
+        ])
+        .args(&args.ssh_arg)
+        .args(["-o", "ConnectionAttempts=5", "-o", "ConnectTimeout=5"])
+        .arg("--")
+        .arg(&args.destination)
+        .args(&args.command);
+    ssh
+}
+
+async fn open_relay(args: &SshArgs, host: &str) -> Result<ExitStatus> {
     let (origin, expected_port) = proxy_origins(&args.proxy, args.auth_url.clone())?;
     let tls_host = origin
         .domain()
@@ -94,11 +159,7 @@ pub(super) async fn run(args: SshArgs) -> Result<()> {
     })
     .await
     .context("TCP gateway connection timed out")??;
-    let status = openssh(&args, host, stream).await?;
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
+    openssh(args, host, stream).await
 }
 
 fn ssh_host(destination: &str) -> Result<&str> {
@@ -192,16 +253,11 @@ async fn openssh(
     let listener = UnixListener::bind(&socket_path).context("open local SSH bridge")?;
     let executable = shell_arg(std::env::current_exe()?.as_os_str())?;
     let socket = shell_arg(socket_path.as_os_str())?;
-    let mut ssh = Command::new("ssh");
-    ssh.kill_on_drop(true)
-        .arg("-o")
+    let mut ssh = openssh_command();
+    ssh.arg("-o")
         .arg(format!("ProxyCommand={executable} ssh-stdio {socket}"))
         .arg("-o")
         .arg(format!("HostKeyAlias={host}"))
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg("-o")
-        .arg("ControlPath=none")
         .arg("-o")
         .arg("ProxyUseFdpass=no")
         .args(&args.ssh_arg)
@@ -230,6 +286,13 @@ async fn openssh(
         }
     };
     status.context("wait for OpenSSH")
+}
+
+fn openssh_command() -> Command {
+    let mut ssh = Command::new("ssh");
+    ssh.kill_on_drop(true)
+        .args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
+    ssh
 }
 
 fn shell_arg(value: &OsStr) -> Result<String> {
@@ -264,6 +327,38 @@ pub(super) fn stdio(socket: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tailscale_connects_directly_without_ssh_credentials() {
+        let host = "deploy.example.ts.net";
+        let args = SshArgs {
+            proxy: Url::parse("https://shomei.example.ts.net:8443").unwrap(),
+            auth_url: None,
+            tailscale: true,
+            ca_file: None,
+            ssh_arg: vec!["-v".into()],
+            destination: format!("ubuntu@{host}"),
+            command: vec!["id".into()],
+        };
+        let command = tailscale_openssh(&args, host);
+        let options = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        let custom = options.iter().position(|arg| *arg == "-v").unwrap();
+        for pair in [
+            ["-p", "22"],
+            ["-o", "HostName=deploy.example.ts.net"],
+            ["-o", "ProxyCommand=none"],
+            ["-o", "PreferredAuthentications=none"],
+            ["-o", "IdentityAgent=none"],
+            ["-o", "ForwardAgent=no"],
+        ] {
+            assert!(options[..custom].windows(2).any(|args| args == pair));
+        }
+        assert!(options.ends_with(&["--", args.destination.as_str(), "id"]));
+    }
 
     #[test]
     fn verifies_ssh_destination_and_gateway_endpoint() {

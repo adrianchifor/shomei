@@ -1,6 +1,6 @@
 use std::{
     fs,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -25,6 +25,7 @@ pub struct Config {
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
     pub tcp: Option<TcpConfig>,
+    pub tailscale_ssh: Option<TailscaleSshConfig>,
     #[serde(default)]
     pub limits: Limits,
 }
@@ -74,6 +75,19 @@ pub struct TcpConfig {
     pub cert_ttl_seconds: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TailscaleSshConfig {
+    pub target: String,
+    pub posture_attribute: String,
+    pub oauth_client_id: String,
+    pub oauth_client_secret_file: PathBuf,
+    #[serde(default = "tailscale_socket")]
+    pub socket: PathBuf,
+    #[serde(default = "tcp_ttl")]
+    pub ttl_seconds: u64,
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path).context("read config")?;
@@ -84,8 +98,10 @@ impl Config {
             "YubiKey 4 support requires a localhost HTTPS origin"
         );
         ensure!(
-            config.http_upstream.is_some() || config.tcp.is_some(),
-            "configure an upstream"
+            config.http_upstream.is_some()
+                || config.tcp.is_some()
+                || config.tailscale_ssh.is_some(),
+            "configure an upstream or Tailscale SSH"
         );
         ensure!(
             (1..=3600).contains(&config.session_ttl_seconds),
@@ -169,8 +185,59 @@ impl Config {
                 );
             }
         }
+        if let Some(tailscale) = &config.tailscale_ssh {
+            ensure!(
+                is_tailnet_ip(config.https_bind.ip())
+                    && config.origin.domain() != Some("localhost"),
+                "Tailscale SSH requires HTTPS to bind directly to a Tailscale IP"
+            );
+            ensure!(
+                is_magic_dns_name(&tailscale.target),
+                "Tailscale SSH target must be a full MagicDNS hostname"
+            );
+            ensure!(
+                tailscale.posture_attribute.len() <= 128
+                    && tailscale
+                        .posture_attribute
+                        .strip_prefix("custom:")
+                        .is_some_and(|name| {
+                            !name.is_empty()
+                                && name.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':')
+                                })
+                        }),
+                "invalid Tailscale custom posture attribute"
+            );
+            ensure!(
+                (1..=3600).contains(&tailscale.ttl_seconds),
+                "Tailscale approval TTL must be 1 to 3600 seconds"
+            );
+        }
         Ok(config)
     }
+}
+
+pub fn is_tailnet_ip(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 0x40,
+        IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
+pub fn is_magic_dns_name(host: &str) -> bool {
+    let Some(prefix) = host.strip_suffix(".ts.net") else {
+        return false;
+    };
+    host.len() <= 253
+        && prefix.contains('.')
+        && prefix.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 pub fn validate_origin(origin: &Url) -> Result<()> {
@@ -201,4 +268,44 @@ fn session_ttl() -> u64 {
 
 fn tcp_ttl() -> u64 {
     300
+}
+
+fn tailscale_socket() -> PathBuf {
+    "/var/run/tailscale/tailscaled.sock".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tailscale_approval_can_run_without_a_relay_and_requires_a_tailnet_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shomei.toml");
+        let config = r#"
+origin = "https://shomei.example.ts.net:8443"
+https_bind = "100.90.0.1:8443"
+tls_cert = "tls.pem"
+tls_key = "tls-key.pem"
+state_dir = "state"
+identities_file = "identities"
+
+[tailscale_ssh]
+target = "deploy.example.ts.net"
+posture_attribute = "custom:shomei_ssh_deploy"
+oauth_client_id = "test-client"
+oauth_client_secret_file = "secret"
+"#;
+        fs::write(&file, config).unwrap();
+        let loaded = Config::load(&file).unwrap();
+        assert_eq!(loaded.tailscale_ssh.unwrap().ttl_seconds, 300);
+        for invalid in [
+            config.replace("100.90.0.1:8443", "0.0.0.0:8443"),
+            config.replace("deploy.example.ts.net", "ssh.example.com"),
+            config.replace("custom:shomei_ssh_deploy", "node:os"),
+        ] {
+            fs::write(&file, invalid).unwrap();
+            assert!(Config::load(&file).is_err());
+        }
+    }
 }

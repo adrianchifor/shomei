@@ -46,6 +46,7 @@ use crate::{
     auth::{ApiError, Auth, Grant, SignedChallenge},
     config::{BrowserAction, Config},
     session::{Sessions, session_value},
+    tailscale::TailscaleSsh,
     tls::{Issuer, csr_key},
 };
 
@@ -60,6 +61,7 @@ pub struct App {
     upstream: Option<HttpUpstream>,
     browser_action: Option<BrowserAction>,
     tcp: Option<TcpAccess>,
+    tailscale: Option<TailscaleSsh>,
     auth_workers: Arc<Semaphore>,
     http_requests: Arc<Semaphore>,
 }
@@ -73,6 +75,15 @@ struct TcpAccess {
 
 #[derive(Clone, Copy)]
 struct Peer(IpAddr);
+
+impl Peer {
+    fn challenge_key(self) -> IpAddr {
+        match self.0 {
+            IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))),
+            ip => ip,
+        }
+    }
+}
 
 struct HttpUpstream {
     origin: Uri,
@@ -139,6 +150,10 @@ fn state_with_auth(config: Config, issuer: Option<Issuer>, auth: Auth) -> Result
         upstream,
         browser_action: config.browser_action,
         tcp,
+        tailscale: config
+            .tailscale_ssh
+            .map(|tailscale| TailscaleSsh::new(tailscale, config.limits.auth_workers))
+            .transpose()?,
         auth_workers: Arc::new(Semaphore::new(config.limits.auth_workers)),
         http_requests: Arc::new(Semaphore::new(config.limits.http_requests)),
     }))
@@ -154,6 +169,8 @@ fn routes(state: Arc<App>) -> Router {
         .route("/geist.woff2", get(font))
         .route("/api/auth/start", post(login_start))
         .route("/api/auth/finish", post(login_finish))
+        .route("/api/auth/tailscale/start", post(tailscale_start))
+        .route("/api/auth/tailscale/finish", post(tailscale_finish))
         .route("/api/action", get(action_details))
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(DefaultBodyLimit::max(32 * 1024))
@@ -176,10 +193,7 @@ pub async fn serve(
         return;
     };
     let app = TowerToHyperService::new(app);
-    let peer = match peer.ip().to_canonical() {
-        IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))),
-        ip => ip,
-    };
+    let peer = peer.ip().to_canonical();
     let service = service_fn(move |mut request: hyper::Request<Incoming>| {
         request.extensions_mut().insert(Peer(peer));
         app.call(request)
@@ -341,10 +355,11 @@ struct LoginStart {
 
 async fn login_start(
     State(app): State<Arc<App>>,
-    Extension(Peer(peer)): Extension<Peer>,
+    Extension(peer): Extension<Peer>,
     Json(body): Json<LoginStart>,
 ) -> Result<impl IntoResponse, ApiError> {
     auth_work(app, move |app| {
+        let peer = peer.challenge_key();
         app.auth.check_challenge_capacity(peer)?;
         let grant =
             match body.client_csr_pem {
@@ -417,10 +432,95 @@ async fn login_finish(
                 }))
                 .into_response())
             }
+            Grant::Tailscale(_) => Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "wrong approval endpoint",
+            )),
         }
     })
     .await
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TailscaleStart {
+    target: String,
+}
+
+async fn tailscale_start(
+    State(app): State<Arc<App>>,
+    Extension(peer): Extension<Peer>,
+    Json(body): Json<TailscaleStart>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tailscale = app.tailscale.as_ref().ok_or(TAILSCALE_DISABLED)?;
+    if !tailscale.target.eq_ignore_ascii_case(&body.target) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "Tailscale SSH target is not allowed",
+        ));
+    }
+    let _permit = tailscale
+        .requests
+        .try_acquire()
+        .map_err(|_| TAILSCALE_BUSY)?;
+    let device = tailscale
+        .device(peer.0)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or(TAILSCALE_PEER_REQUIRED)?;
+    let challenge = auth_work(app.clone(), move |app| {
+        app.auth.check_challenge_capacity(peer.0)?;
+        app.auth.start_login(Grant::Tailscale(device), peer.0)
+    })
+    .await?;
+    Ok(Json(challenge))
+}
+
+async fn tailscale_finish(
+    State(app): State<Arc<App>>,
+    Extension(peer): Extension<Peer>,
+    Json(signed): Json<SignedChallenge<PublicKeyCredential>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tailscale = app.tailscale.as_ref().ok_or(TAILSCALE_DISABLED)?;
+    let _permit = tailscale
+        .requests
+        .try_acquire()
+        .map_err(|_| TAILSCALE_BUSY)?;
+    let device = tailscale
+        .device(peer.0)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or(TAILSCALE_PEER_REQUIRED)?;
+    let (generation, device) = auth_work(app.clone(), move |app| {
+        let (grant, generation) = app.auth.finish_login(signed)?;
+        if !matches!(grant, Grant::Tailscale(approved) if approved == device) {
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "approval must match the requesting Tailscale device",
+            ));
+        }
+        Ok((generation, device))
+    })
+    .await?;
+    let authorization = tailscale
+        .authorization()
+        .await
+        .map_err(ApiError::internal)?;
+    check_generation(&app, generation)?;
+    let expires_at = tailscale
+        .approve(&device, authorization)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(serde_json::json!({ "expires_at": expires_at })))
+}
+
+const TAILSCALE_DISABLED: ApiError = ApiError(StatusCode::NOT_FOUND, "Tailscale SSH is disabled");
+const TAILSCALE_BUSY: ApiError =
+    ApiError(StatusCode::SERVICE_UNAVAILABLE, "Tailscale approvals busy");
+const TAILSCALE_PEER_REQUIRED: ApiError = ApiError(
+    StatusCode::FORBIDDEN,
+    "a user-owned Tailscale device is required",
+);
 
 fn check_generation(app: &App, generation: u64) -> Result<(), ApiError> {
     if app.auth.generation() == generation {

@@ -4,6 +4,7 @@ Shomei (署名, Japanese for “signature”) is a Rust authentication proxy for
 
 - **HTTP** supports browser WebAuthn and one-use CLI assertions, with encrypted session cookies for follow-up requests.
 - **TCP** uses short-lived mTLS certificates. `shomei ssh` uses a certificate to tunnel OpenSSH to a fixed upstream.
+- **Tailscale SSH** can require YubiKey approval before a direct connection from the caller’s device.
 
 All enrolled keys authenticate as `shomei`. The default policy requires a supported YubiKey 5 Series key with firmware 5.7.4 or later, PIN, and touch.
 
@@ -69,10 +70,18 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 
 Put one `shomei get-id` token per line in the identity file. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. All keys use the `shomei` account. Shomei decodes the compressed records in memory and verifies their hardware attestation. Existing JSON arrays also work. Use `shomei get-id --json` for JSON-based tooling. [Convert an existing allowlist](AGENTS.md#enroll-a-key)
 
-Replace the identity file atomically to reload the allowlist. Adding a key preserves existing grants. Removing or replacing a key revokes them. Restarting the proxy invalidates its session cookies.
+Replace the identity file atomically to reload the allowlist. Removing or replacing a key revokes existing HTTP sessions and TCP relay access. Restarting the proxy invalidates its session cookies.
 
 ### Share a gateway across services
 
 One Shomei gateway serves one public HTTPS origin and forwards HTTP to one upstream. Point `http_upstream` at a private router to serve multiple sites and APIs under that origin. For example, the router can send `/dashboard` and `/api/deploy` to different services.
 
 One enrollment covers those routes and an SSH upstream configured on the same gateway. For separate public HTTPS origins, use a separate gateway configuration and enroll a credential for each origin. You can use the same physical YubiKey for each enrollment.
+
+## Tailscale SSH
+
+Shomei verifies a YubiKey and grants the calling device a short access window to a fixed target. OpenSSH connects directly from that device, so Tailscale evaluates the caller’s posture and SSH re-authentication. This mode requires Tailscale Premium or Enterprise. [Setup and policy example](AGENTS.md#approve-direct-tailscale-ssh)
+
+```sh
+shomei ssh --tailscale --proxy https://shomei.example.ts.net:8443 ubuntu@deploy.example.ts.net
+```

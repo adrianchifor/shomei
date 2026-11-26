@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod http;
 mod session;
+mod tailscale;
 mod tls;
 
 use std::{future, io, net::SocketAddr, sync::Arc, time::Duration};
