@@ -64,6 +64,7 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 | `tls_cert`, `tls_key` | Gateway TLS certificate and private key. |
 | `identities_file` | Allowlist of enrolled keys. Reloaded when it changes. |
 | `state_dir` | Writable directory for signature counters. One gateway per directory. |
+| `session_ttl_seconds` | Lifetime of HTTP sessions, reverse and forward. Defaults to 600 seconds. |
 | `http_upstream` | HTTP or HTTPS origin to forward to. |
 | `hostnames` | Additional reverse hostnames or IPs for the default upstream. |
 | `[[http_upstreams]]` | Reverse sites with a public `hostname` and a private `upstream`. |
@@ -71,19 +72,20 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 | `protected_session_ttl_seconds` | Default session lifetime for protected paths. Defaults to `0` for one approval per request. |
 | `tcp.upstream` | Fixed TCP host and port. Set `tcp.ssh_host` to the alias used by `shomei ssh`. |
 | `[tcp_upstreams]` | Named reverse TCP targets keyed by client-facing host and port. |
-| `[scopes.NAME]` | Destination and port rules for forward HTTP, HTTPS, and TCP. |
-| `forwarding` | Enable forwarding to unlisted destinations. Defaults to `false`. |
-| `http_forwarding` | Allow HTTP/HTTPS when forwarding is enabled. Defaults to `true`. |
-| `session_ttl_seconds` | HTTP session lifetime. Defaults to 600 seconds. |
 | `tcp.bind`, `tcp.public_port` | Shared mTLS listener and advertised port. Default to port 9443. |
 | `tcp.cert_ttl_seconds` | mTLS certificate lifetime. Defaults to 300 seconds. Active relays close at expiry. |
+| `forwarding` | Enable forwarding to unlisted destinations. Defaults to `false`. |
+| `http_forwarding` | Allow HTTP/HTTPS when forwarding is enabled. Defaults to `true`. |
+| `[scopes.NAME]` | Destination and port rules for forward HTTP, HTTPS, and TCP. |
+| `[tailscale_ssh]` | Approval for direct Tailscale SSH. [Setup](AGENTS.md#approve-direct-tailscale-ssh) |
+| `allow_yubikey_4` | Accept YubiKey 4 keys on a `localhost` origin. Defaults to `false`. |
 | `[limits]` | Connection, request, and challenge limits. |
 
 ### Manage the allowlist
 
-Put one `shomei get-id` token per line in the `identities` allowlist. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. All keys use the `shomei` account. Shomei decodes the compressed records in memory and verifies their hardware attestation. [Create the file](AGENTS.md#enroll-a-key)
+Put one `shomei get-id` token per line in the `identities` allowlist. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. Shomei decodes the compressed records in memory and verifies their hardware attestation. [Create the file](AGENTS.md#enroll-a-key)
 
-Replace the identity file atomically to reload the allowlist. Removing or replacing a key revokes existing HTTP sessions and TCP relay access. Restarting the proxy invalidates its session cookies.
+Replace the file atomically and the gateway reloads it. Removing or replacing a key revokes existing HTTP sessions and TCP relay access. Restarting the gateway invalidates its session cookies.
 
 ### Protect selected endpoints
 
@@ -181,7 +183,7 @@ shomei connect --credentials ./fleet-cert --listen 127.0.0.1:15432 db.internal.e
 # While connect is running, point your TCP client at 127.0.0.1:15432.
 ```
 
-Omit `--credentials` to approve an in-memory certificate for `connect` or `ssh`. Forward TCP certificates default to five minutes. Sessions and certificates expire on allowlist revocation or gateway restart. Active tunnels close when access expires.
+Omit `--credentials` to approve an in-memory certificate for `connect` or `ssh`. Certificates last `tcp.cert_ttl_seconds`, 300 by default. Sessions and certificates expire on allowlist revocation or gateway restart. Active tunnels close when access expires.
 
 ## Tailscale SSH
 
