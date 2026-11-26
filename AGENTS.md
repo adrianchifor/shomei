@@ -29,24 +29,25 @@ The gateway accepts one `shomei-id-v1:` token per line from `shomei get-id`. Use
 ```sh
 umask 077
 mkdir -p local/config
-if [ ! -e local/config/identities.json ]; then
+if [ ! -e local/config/identities ]; then
   shomei get-id > local/config/identities.next \
-    && mv local/config/identities.next local/config/identities.json
+    && mv local/config/identities.next local/config/identities
 fi
 ```
 
 Replace the file atomically to add or remove tokens. The gateway reloads it automatically. Removing or replacing a key revokes existing grants. For a JSON array allowlist, `shomei get-id --json` prints a compatible record.
 
-After upgrading the gateway, convert a legacy JSON allowlist in Bash or Zsh with `jq` installed:
+To migrate a legacy JSON allowlist to `identities`, set `old_allowlist` to its path and run this in Bash or Zsh with `jq` installed. Update `identities_file` in the gateway config if its path changed.
 
 ```sh
+old_allowlist=local/config/identities.json
 (
   set -o pipefail
-  jq -c 'if type == "array" then .[] else error("expected a JSON array") end' local/config/identities.json |
+  jq -c 'if type == "array" then .[] else error("expected a JSON array") end' "$old_allowlist" |
     while IFS= read -r identity; do
       printf '%s\n' "$identity" | shomei get-id --identity-file /dev/stdin || exit 1
     done > local/config/identities.next
-) && mv local/config/identities.next local/config/identities.json
+) && mv local/config/identities.next local/config/identities
 ```
 
 ## Share a gateway across services

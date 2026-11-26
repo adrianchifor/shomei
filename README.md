@@ -25,8 +25,8 @@ ca=fixtures/localhost/ca.pem
 deploy=https://localhost:8443/api/deploy
 mkdir -m 0755 -p local/config
 "$shomei" init
-"$shomei" get-id > local/config/identities.json
-chmod 0644 local/config/identities.json
+"$shomei" get-id > local/config/identities
+chmod 0644 local/config/identities
 docker compose -f compose.deploy.yaml up --wait
 
 curl -si --cacert "$ca" -X POST "$deploy" # 401 Unauthorized
@@ -37,7 +37,7 @@ approval="$("$shomei" sign --ca-file "$ca")" && curl -fsS --cacert "$ca" \
 
 ## SSH demo
 
-Run this demo in a repository checkout. Stop the deploy demo with `docker compose -f compose.deploy.yaml down`, then copy its `local/config/identities.json` into the checkout at the same path. Use the public key that matches your OpenSSH identity.
+Run this demo in a repository checkout. Stop the deploy demo with `docker compose -f compose.deploy.yaml down`, then copy its `local/config/identities` into the checkout at the same path. Use the public key that matches your OpenSSH identity.
 
 ```sh
 sh fixtures/ssh/setup.sh "$HOME/.ssh/id_ed25519.pub"
@@ -78,7 +78,7 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 
 When upgrading a gateway with `[forward]`, move its destination rules to `[scopes.NAME]` and set `forwarding = true` if the gateway should forward to unlisted destinations. Move the mTLS bind, public port, and certificate TTL to `[tcp]`. Update the published TCP port to 9443, or set `tcp.bind` and `tcp.public_port` to keep a custom port. Use `http_forwarding = false` in place of `http_enabled = false`. Remove `http_bind` and point HTTP proxy clients at the main HTTPS origin.
 
-Put one `shomei get-id` token per line in the identity file. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. All keys use the `shomei` account. Shomei decodes the compressed records in memory and verifies their hardware attestation. Existing JSON arrays also work. Use `shomei get-id --json` for JSON-based tooling. [Convert an existing allowlist](AGENTS.md#enroll-a-key)
+Put one `shomei get-id` token per line in the `identities` allowlist. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. All keys use the `shomei` account. Shomei decodes the compressed records in memory and verifies their hardware attestation. Existing JSON arrays also work. Use `shomei get-id --json` for JSON-based tooling. [Convert an existing allowlist](AGENTS.md#enroll-a-key)
 
 Replace the identity file atomically to reload the allowlist. Removing or replacing a key revokes existing HTTP sessions and TCP relay access. Restarting the proxy invalidates its session cookies.
 

@@ -1,7 +1,7 @@
 origin = "https://localhost:8443"
 tls_cert = "/run/shomei-tls/localhost.pem"
 tls_key = "/run/shomei-tls/localhost-key.pem"
-identities_file = "/run/shomei/identities.json"
+identities_file = "/run/shomei/identities"
 allow_yubikey_4 = true
 state_dir = "/var/lib/shomei"
 http_upstream = "http://127.0.0.1:8080"
