@@ -62,7 +62,7 @@ enum Command {
     /// Create a credential on a USB YubiKey and save its public identity.
     Init(InitArgs),
     /// Print the saved public identity as a compact allowlist token.
-    GetId(GetIdArgs),
+    GetId(IdentityFile),
     /// Delete the local public identity after confirmation.
     Clear(IdentityFile),
     /// Approve HTTP access and print an assertion or forward session.
@@ -84,25 +84,12 @@ struct IdentityFile {
     identity_file: Option<PathBuf>,
 }
 
-#[derive(Args)]
-struct GetIdArgs {
-    /// Print the public identity as JSON for legacy allowlists.
-    #[arg(long)]
-    json: bool,
-    #[command(flatten)]
-    identity: IdentityFile,
-}
-
 impl IdentityFile {
     fn resolve(self) -> Result<PathBuf> {
         if let Some(path) = self.identity_file {
             return Ok(path);
         }
-        let home = home_directory();
-        let config = env::var_os("XDG_CONFIG_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-        default_identity_path(home.as_deref(), config.as_deref())
+        default_identity_path(home_directory().as_deref())
     }
 }
 
@@ -112,22 +99,9 @@ fn home_directory() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn default_identity_path(home: Option<&Path>, config: Option<&Path>) -> Result<PathBuf> {
-    let path = home.map(|home| home.join(".shomei/identity.json"));
-    if let Some(path) = &path
-        && path.try_exists()?
-    {
-        return Ok(path.clone());
-    }
-    let legacy = config
-        .map(|config| config.join("shomei/identity.json"))
-        .or_else(|| home.map(|home| home.join(".config/shomei/identity.json")));
-    if let Some(legacy) = legacy
-        && legacy.try_exists()?
-    {
-        return Ok(legacy);
-    }
-    path.context("set --identity-file when the home directory is unavailable")
+fn default_identity_path(home: Option<&Path>) -> Result<PathBuf> {
+    home.map(|home| home.join(".shomei/identity.json"))
+        .context("set --identity-file when the home directory is unavailable")
 }
 
 #[derive(Args)]
@@ -272,14 +246,8 @@ async fn init(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
-fn get_id(args: GetIdArgs) -> Result<()> {
-    let identity = read_identity(args.identity)?;
-    let output = if args.json {
-        serde_json::to_string(&identity)?
-    } else {
-        encode_identity(&identity)?
-    };
-    println!("{output}");
+fn get_id(args: IdentityFile) -> Result<()> {
+    println!("{}", encode_identity(&read_identity(args)?)?);
     Ok(())
 }
 
@@ -548,20 +516,13 @@ mod tests {
     }
 
     #[test]
-    fn prefers_the_home_store_and_falls_back_to_the_previous_default() {
+    fn the_default_identity_lives_in_the_home_store() {
         let home = tempfile::tempdir().unwrap();
-        let config = tempfile::tempdir().unwrap();
-        let path = home.path().join(".shomei/identity.json");
-        let legacy = config.path().join("shomei/identity.json");
-        let resolve = || default_identity_path(Some(home.path()), Some(config.path())).unwrap();
-
-        assert_eq!(resolve(), path);
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, "").unwrap();
-        assert_eq!(resolve(), legacy);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "").unwrap();
-        assert_eq!(resolve(), path);
+        assert_eq!(
+            default_identity_path(Some(home.path())).unwrap(),
+            home.path().join(".shomei/identity.json")
+        );
+        assert!(default_identity_path(None).is_err());
     }
 
     #[test]

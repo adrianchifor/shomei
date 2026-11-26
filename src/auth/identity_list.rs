@@ -123,19 +123,6 @@ pub(super) fn visit_identities(
     mut reject: impl FnMut(anyhow::Error) -> Result<()>,
 ) -> Result<()> {
     let text = std::str::from_utf8(contents).context("identities file must be UTF-8")?;
-    if text.trim_start().starts_with('[') {
-        let records: Vec<StaticIdentity> =
-            serde_json::from_str(text).context("parse identities JSON array")?;
-        for (index, record) in records.into_iter().enumerate() {
-            if let Err(error) =
-                visit(record).with_context(|| format!("identity entry {}", index + 1))
-            {
-                reject(error)?;
-            }
-        }
-        return Ok(());
-    }
-
     let mut buffer = vec![0; MAX_RECORD_BYTES];
     let mut remaining = MAX_IDENTITIES_BYTES as usize;
     for (index, line) in text.lines().enumerate() {
