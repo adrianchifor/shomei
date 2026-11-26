@@ -136,7 +136,10 @@ async fn open_tailscale(args: &SshArgs, host: &str) -> Result<ExitStatus> {
     let roots = trust_roots(&origin, args.ca_file.as_deref())?;
     let gateway = Gateway::new(origin, roots)?;
     let request = serde_json::json!({ "target": host });
-    let signed = gateway.sign_challenge("tailscale/start", &request).await?;
+    let purpose = format!("Tailscale SSH from this device, requested for {host}");
+    let signed = gateway
+        .sign_challenge("tailscale/start", &request, &purpose)
+        .await?;
     let approval: TailscaleApproval = gateway.post("tailscale/finish", &signed).await?;
     ensure!(
         approval.expires_at > crate::tls::unix_seconds()?,

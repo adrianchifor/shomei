@@ -91,7 +91,7 @@ http_upstream = "http://app:8080"
 protected_paths = ["/api/deploy"]
 ```
 
-CLI clients can run `shomei sign` and send the result in `Authorization: Shomei <assertion>`.
+CLI clients can run `shomei sign` and send the result in `Authorization: Shomei <assertion>`. Add `-X METHOD` with the full URL, as in `shomei sign -X POST https://app.example.com/api/deploy?env=prod`, to approve only that method, path, and query. A bound assertion issues no session.
 
 Set `protected_session_ttl_seconds` on the gateway or HTTP upstream. Override it on a path with `session_ttl_seconds`. The most specific rule wins. The default of `0` requires a fresh approval each time. A positive TTL allows reuse for the same host, method, and protected rule, up to 3600 seconds. The browser overlay keeps its approval in the tab. With curl, save the session cookie with `-c cookies.txt` on the signed request and send it with `-b cookies.txt` on subsequent requests.
 

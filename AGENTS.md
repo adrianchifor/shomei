@@ -87,7 +87,7 @@ Set `protected_session_ttl_seconds` on the gateway or HTTP upstream. Override it
 
 For a custom WebAuthn client, `POST {}` as JSON to `/_shomei/api/auth/start`. Pass the returned `publicKey` options to `navigator.credentials.get` after decoding the challenge and credential IDs. Serialize the result as WebAuthn JSON. Submit `{challenge_id, credential}` to `/_shomei/api/auth/finish` to create a session, or send that JSON as base64url without padding in `Authorization: Shomei <assertion>` on the intended upstream request. Each challenge can be used once. [WebAuthn helper](assets/webauthn.js)
 
-Agents can obtain a one-use assertion with `shomei sign`. The following example calls a read endpoint and saves the returned cookie for later requests to the same gateway.
+Agents can obtain a one-use assertion with `shomei sign`. It approves any path on that host unless you pass `-X METHOD` and the full URL, which binds it to that one request and issues no session. The CLI prints what the touch approves. The following example calls a read endpoint and saves the returned cookie for later requests to the same gateway.
 
 ```sh
 assertion="$(shomei sign)" && curl --fail-with-body \

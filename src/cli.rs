@@ -161,6 +161,10 @@ struct SignArgs {
     /// Exchange the assertion for a reusable HTTP forward session.
     #[arg(long, requires = "destination")]
     session: bool,
+    /// Bind the assertion to one reverse request with this method and the
+    /// destination's exact path and query.
+    #[arg(short = 'X', long, requires = "destination", conflicts_with_all = ["scope", "session"])]
+    method: Option<String>,
     #[command(flatten)]
     access: Access,
 }
@@ -180,15 +184,20 @@ pub async fn run() -> Result<Option<PathBuf>> {
             let roots = trust_roots(&origin, args.access.ca_file.as_deref())?;
             let gateway = Gateway::new(origin, roots)?;
             let signed = if let Some(url) = args.destination {
-                gateway
-                    .sign_challenge(
-                        "start",
-                        &serde_json::json!({
-                            "http_destination": url,
-                            "forward_scope": args.scope,
-                        }),
-                    )
-                    .await?
+                let mut body = serde_json::json!({
+                    "http_destination": url,
+                    "forward_scope": args.scope,
+                });
+                let site = url.origin().ascii_serialization();
+                let purpose = if let Some(method) = &args.method {
+                    body["http_method"] = method.as_str().into();
+                    format!("only {method} {url}")
+                } else if args.session {
+                    format!("a reusable HTTP forward session, requested for {site}")
+                } else {
+                    format!("HTTP access to any path at {site}, or to its whole forward scope")
+                };
+                gateway.sign_challenge("start", &body, &purpose).await?
             } else {
                 gateway.sign(None).await?
             };
@@ -404,11 +413,14 @@ impl Gateway {
 
     async fn sign(&self, tcp: Option<(&str, &str)>) -> Result<Signed> {
         let mut body = serde_json::json!({});
-        if let Some((target, csr)) = tcp {
+        let purpose = if let Some((target, csr)) = tcp {
             body["tcp_target"] = target.into();
             body["client_csr_pem"] = csr.into();
-        }
-        self.sign_challenge("start", &body).await
+            format!("SSH to {target} through the gateway's TCP relay")
+        } else {
+            "HTTP access to any path at this gateway".to_owned()
+        };
+        self.sign_challenge("start", &body, &purpose).await
     }
 
     async fn sign_forward(&self, scope: Option<&str>, csr: Option<&str>) -> Result<Signed> {
@@ -419,17 +431,27 @@ impl Gateway {
         if let Some(csr) = csr {
             body["client_csr_pem"] = csr.into();
         }
-        self.sign_challenge("start", &body).await
+        let purpose = match scope {
+            Some(name) => format!("a TCP certificate for every destination in scope {name}"),
+            None => "a TCP certificate for every destination in the forward scope".to_owned(),
+        };
+        self.sign_challenge("start", &body, &purpose).await
     }
 
-    async fn sign_challenge(&self, step: &str, body: &impl Serialize) -> Result<Signed> {
+    /// Asks for the YubiKey after telling the operator what the touch grants.
+    async fn sign_challenge(
+        &self,
+        step: &str,
+        body: &impl Serialize,
+        purpose: &str,
+    ) -> Result<Signed> {
         let started: Started = self.post(step, body).await?;
         ensure!(
             self.origin.domain() == Some(started.options.public_key.rp_id.as_str()),
             "gateway returned a different WebAuthn relying party"
         );
         eprintln!(
-            "Authenticating {ACCOUNT} at {}.",
+            "Authenticating {ACCOUNT} at {}.\nApproving {purpose}.",
             self.origin.origin().ascii_serialization()
         );
         let credential = hardware::authenticate(self.origin.clone(), started.options).await?;
