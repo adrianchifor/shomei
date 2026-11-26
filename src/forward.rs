@@ -376,7 +376,10 @@ pub async fn serve(
     handshakes: Arc<Semaphore>,
     allowed: watch::Receiver<u64>,
 ) {
-    let Some(mut stream) = accept_tls(socket, tls, &handshakes).await else {
+    if socket.set_nodelay(true).is_err() {
+        return;
+    }
+    let Some(mut stream) = accept_tls(socket, &tls, &handshakes).await else {
         return;
     };
     let Some(leaf) = stream

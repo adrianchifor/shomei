@@ -1806,3 +1806,60 @@ fn signed_answer(signer: &TestSigner, start: &Value, counter: u32) -> Value {
         .unwrap();
     json!({ "challenge_id": start["challenge_id"], "credential": signer.sign(&challenge, counter) })
 }
+
+#[tokio::test]
+async fn idle_connections_release_handshake_and_http2_slots() {
+    let (identity, roots) = server_fixture();
+    let tls = identity.server(None).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handshakes = Arc::new(Semaphore::new(1));
+    let server = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (tls, handshakes) = (tls.clone(), handshakes.clone());
+            tokio::spawn(async move {
+                let Some(stream) = accept_tls(socket, &tls, &handshakes).await else {
+                    return;
+                };
+                let requests = AtomicU64::new(0);
+                let builder = http2();
+                let service = service_fn(|_: hyper::Request<Incoming>| async {
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Empty::<Bytes>::new()))
+                });
+                let connection = builder.serve_connection(TokioIo::new(stream), service);
+                until_idle(connection, &requests, |connection| {
+                    connection.graceful_shutdown()
+                })
+                .await;
+            });
+        }
+    });
+
+    let _silent = TcpStream::connect(addr).await.unwrap();
+    sleep(Duration::from_millis(100)).await;
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let socket = TcpStream::connect(addr).await.unwrap();
+    let stream = timeout(
+        Duration::from_secs(2),
+        TlsConnector::from(Arc::new(config))
+            .connect(ServerName::try_from("localhost").unwrap(), socket),
+    )
+    .await
+    .expect("a silent socket held the only handshake slot")
+    .unwrap();
+
+    let (_sender, connection) = hyper::client::conn::http2::handshake::<_, _, Empty<Bytes>>(
+        TokioExecutor::new(),
+        TokioIo::new(stream),
+    )
+    .await
+    .unwrap();
+    let _ = timeout(Duration::from_secs(5), connection)
+        .await
+        .expect("an idle HTTP/2 connection kept its slot");
+    server.abort();
+}
