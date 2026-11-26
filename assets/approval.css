@@ -34,7 +34,7 @@ dialog {
 dialog::backdrop { background: rgb(15 14 15 / .65); }
 h1, h2 { margin: .65rem 0 .5rem; font-size: 1.35rem; }
 p { margin: .55rem 0; overflow-wrap: anywhere; }
-[data-shomei-request] { color: #c0b9b5; }
+[data-shomei-request] { color: #c0b9b5; max-height: 40vh; overflow-y: auto; }
 .controls { display: flex; justify-content: center; gap: .5rem; }
 
 button {

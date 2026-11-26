@@ -1458,6 +1458,17 @@ async fn reverse(
     if request.method() == Method::CONNECT || request.headers().contains_key(UPGRADE) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
+    // A service worker installed from the upstream would control every page
+    // on this origin, the sign-in and approval pages included, for all apps
+    // and long after the content that installed it is gone. Browsers mark the
+    // request for a worker script with this header, and a page cannot drop it.
+    if host == app.canonical && request.headers().contains_key("service-worker") {
+        return ApiError(
+            StatusCode::FORBIDDEN,
+            "service workers are not allowed on the gateway origin",
+        )
+        .into_response();
+    }
     let signed = match signed_header(request.headers()) {
         Ok(signed) => signed,
         Err(error) => return error.into_response(),
