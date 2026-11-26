@@ -126,6 +126,10 @@ enum Login {
 pub enum Grant {
     Http,
     Tcp(SubjectPublicKeyInfo),
+    Forward {
+        key: SubjectPublicKeyInfo,
+        scope: usize,
+    },
     Tailscale(crate::tailscale::Device),
 }
 

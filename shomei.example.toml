@@ -21,6 +21,17 @@ upstream = "host.docker.internal:9000"
 public_port = 9443
 cert_ttl_seconds = 300
 
+# Explicit HTTPS forward proxy. Replace the example DNS and IP ranges with your own.
+# [forward]
+# bind = "0.0.0.0:9444"
+# public_port = 9444
+# cert_ttl_seconds = 300
+
+# [forward.scopes.fleet]
+# dns_suffixes = ["internal.example.com"]
+# cidrs = ["10.42.0.0/16", "fd00:42::/48"]
+# ports = [22, 80, 443, 5432]
+
 # Use the gateway's MagicDNS origin and TLS certificate, and bind https_bind to its Tailscale IP.
 # [tailscale_ssh]
 # target = "deploy.example.ts.net"

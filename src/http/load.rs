@@ -65,12 +65,13 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
         browser_action: None,
         session_ttl_seconds: 600,
         tcp: None,
+        forward: None,
         tailscale_ssh: None,
         limits: Default::default(),
     };
     let limit = config.limits.https_connections;
     let handshakes = Arc::new(Semaphore::new(config.limits.tls_handshakes));
-    let state = super::state(config, None).unwrap();
+    let state = super::state(config, None, None).unwrap();
     let router = routes(state.clone());
     let tls = identity.server(None).unwrap();
     let gateway = tokio::spawn(crate::serve(listener, limit, move |socket, peer| {
@@ -185,7 +186,7 @@ async fn tcp_load(identity: &Identity, roots: RootCertStore) {
 
     let client_key = KeyPair::generate().unwrap();
     let public = SubjectPublicKeyInfo::from_der(&client_key.subject_public_key_info()).unwrap();
-    let cert = issuer.issue(&public, 300, 0).unwrap();
+    let cert = issuer.issue(&public, 300, 0, 0).unwrap();
     let cert = CertificateDer::from_pem_slice(cert.certificate_pem.as_bytes()).unwrap();
     let private = PrivatePkcs8KeyDer::from(client_key.serialize_der()).into();
     let config = ClientConfig::builder()

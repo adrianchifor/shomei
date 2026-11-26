@@ -16,15 +16,15 @@ use rcgen::{CertificateParams, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, pem::PemObject};
 use serde::Deserialize;
 use tokio::{
-    io::copy_bidirectional,
+    io::{AsyncRead, AsyncWrite, copy_bidirectional},
     net::{TcpStream, UnixListener},
     process::Command,
     time::timeout,
 };
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio_rustls::TlsConnector;
 use url::Url;
 
-use super::{Gateway, https_origin, tls_client, trust_roots};
+use super::{Access, Gateway, IdentityFile, forward, https_origin, tls_client, trust_roots};
 
 #[derive(Args)]
 pub(super) struct SshArgs {
@@ -35,15 +35,17 @@ pub(super) struct SshArgs {
     #[arg(long, value_parser = https_origin)]
     auth_url: Option<Url>,
     /// Approve SSH over Tailscale and connect directly from this device.
-    #[arg(long, conflicts_with = "auth_url")]
+    #[arg(long, conflicts_with_all = ["auth_url", "scope", "credentials"])]
     tailscale: bool,
     /// PEM trust roots. Localhost can use ~/.shomei/localhost-ca.pem.
     #[arg(long, env = "SHOMEI_CA_FILE")]
     ca_file: Option<PathBuf>,
+    #[command(flatten)]
+    forward: forward::CredentialsArgs,
     /// Pass one option or value to OpenSSH. Repeat with --ssh-arg=<value>.
     #[arg(long, allow_hyphen_values = true)]
     ssh_arg: Vec<OsString>,
-    /// SSH username and the allowlisted host alias or full MagicDNS name.
+    /// SSH username and an allowed destination host or reverse relay alias.
     #[arg(value_name = "USER@HOST")]
     destination: String,
     /// Optional remote command and arguments after --.
@@ -63,10 +65,36 @@ struct TailscaleApproval {
     expires_at: u64,
 }
 
-pub(super) async fn run(args: SshArgs) -> Result<()> {
+pub(super) async fn run(mut args: SshArgs) -> Result<()> {
     let host = ssh_host(&args.destination)?;
     let status = if args.tailscale {
         open_tailscale(&args, host).await?
+    } else if args.forward.enabled() {
+        ensure!(
+            args.auth_url.is_none(),
+            "--auth-url is only used with tls:// proxies"
+        );
+        let origin = https_origin(args.proxy.as_str())?;
+        let address = if host.contains(':') {
+            format!("[{host}]:22")
+        } else {
+            format!("{host}:22")
+        };
+        let tunnel = std::mem::take(&mut args.forward)
+            .tunnel(Access {
+                proxy: Some(origin),
+                ca_file: args.ca_file.clone(),
+                identity: IdentityFile {
+                    identity_file: None,
+                },
+            })
+            .await?;
+        openssh(
+            &args,
+            host,
+            tunnel.open(forward::destination(&address)?).await?,
+        )
+        .await?
     } else {
         open_relay(&args, host).await?
     };
@@ -222,7 +250,7 @@ fn proxy_origins(proxy: &Url, auth_url: Option<Url>) -> Result<(Url, Option<u16>
     Ok((origin, proxy.port()))
 }
 
-fn endpoint_port(endpoint: &str, host: &str, expected_port: Option<u16>) -> Result<u16> {
+pub(super) fn endpoint_port(endpoint: &str, host: &str, expected_port: Option<u16>) -> Result<u16> {
     let authority: Authority = endpoint
         .parse()
         .context("invalid TCP endpoint from the gateway")?;
@@ -244,7 +272,7 @@ fn endpoint_port(endpoint: &str, host: &str, expected_port: Option<u16>) -> Resu
 async fn openssh(
     args: &SshArgs,
     host: &str,
-    mut stream: TlsStream<TcpStream>,
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
 ) -> Result<ExitStatus> {
     let dir = tempfile::Builder::new()
         .prefix("shomei-")
@@ -336,6 +364,7 @@ mod tests {
             auth_url: None,
             tailscale: true,
             ca_file: None,
+            forward: Default::default(),
             ssh_arg: vec!["-v".into()],
             destination: format!("ubuntu@{host}"),
             command: vec!["id".into()],

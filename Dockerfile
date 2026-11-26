@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libudev1 \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -m 0700 -o 10001 -g 10001 /var/lib/shomei
 USER 10001:10001
-EXPOSE 8443 9443
+EXPOSE 8443 9443 9444
 ENTRYPOINT ["/usr/local/bin/shomei"]
 CMD ["/etc/shomei/shomei.toml"]
 

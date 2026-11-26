@@ -25,6 +25,7 @@ pub struct Config {
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
     pub tcp: Option<TcpConfig>,
+    pub forward: Option<crate::forward::Config>,
     pub tailscale_ssh: Option<TailscaleSshConfig>,
     #[serde(default)]
     pub limits: Limits,
@@ -100,8 +101,9 @@ impl Config {
         ensure!(
             config.http_upstream.is_some()
                 || config.tcp.is_some()
+                || config.forward.is_some()
                 || config.tailscale_ssh.is_some(),
-            "configure an upstream or Tailscale SSH"
+            "configure an upstream, a forward proxy, or Tailscale SSH"
         );
         ensure!(
             (1..=3600).contains(&config.session_ttl_seconds),
@@ -184,6 +186,9 @@ impl Config {
                     "invalid TCP SSH host alias"
                 );
             }
+        }
+        if let Some(forward) = &config.forward {
+            forward.validate()?;
         }
         if let Some(tailscale) = &config.tailscale_ssh {
             ensure!(
@@ -277,6 +282,41 @@ fn tailscale_socket() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forward_only_requires_a_nonempty_destination_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shomei.toml");
+        let config = r#"
+origin = "https://gateway.example.com:8443"
+tls_cert = "tls.pem"
+tls_key = "tls-key.pem"
+state_dir = "state"
+identities_file = "identities"
+
+[forward]
+cert_ttl_seconds = 300
+
+[forward.scopes.fleet]
+dns_suffixes = ["internal.example.com"]
+cidrs = ["10.42.0.0/16", "fd00:42::/48"]
+ports = [22, 443]
+"#;
+        fs::write(&file, config).unwrap();
+        assert_eq!(
+            Config::load(&file).unwrap().forward.unwrap().bind.port(),
+            9444
+        );
+        for invalid in [
+            config.replace("300", "3601"),
+            config.replace("\"10.42.0.0/16\", \"fd00:42::/48\"", ""),
+            config.replace("22, 443", "0, 443"),
+            config.replace("internal.example.com", "*.example.com"),
+        ] {
+            fs::write(&file, invalid).unwrap();
+            assert!(Config::load(&file).is_err());
+        }
+    }
 
     #[test]
     fn tailscale_approval_can_run_without_a_relay_and_requires_a_tailnet_bind() {

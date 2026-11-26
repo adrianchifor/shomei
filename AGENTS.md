@@ -1,12 +1,12 @@
 # Shomei integration guide for agents
 
-Use Shomei for HTTP authentication, an SSH relay, or direct Tailscale SSH approval. Keep relayed upstreams reachable only from the gateway. All enrolled YubiKeys authenticate as `shomei`. Ask the operator to complete PIN and touch prompts on the machine with the key.
+Use Shomei for HTTP authentication, forward HTTP/TCP access, an SSH relay, or direct Tailscale SSH approval. Keep reverse upstreams private. All enrolled YubiKeys authenticate as `shomei`. Ask the operator to complete PIN and touch prompts on the machine with the key.
 
 ## Set up the gateway
 
 1. Use `ghcr.io/adrianchifor/shomei:latest` for the gateway on Linux amd64 or arm64. Set `SHOMEI_IMAGE` to pin a release tag or digest. Run `curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh` on the machine with the YubiKey. The installer places the verified CLI at `~/.local/bin/shomei`. Use that path if `shomei` is outside `PATH`. On Linux the CLI requires `libudev.so.1`. [GitHub Packages](https://github.com/adrianchifor/shomei/pkgs/container/shomei) · [Binary releases](https://github.com/adrianchifor/shomei/releases)
 2. Pick the HTTPS origin clients will use, including any nondefault port. It must use a DNS name. Install a certificate and private key for that hostname. Use the same value for the config’s `origin` and the client’s `SHOMEI_PROXY`. For local TLS and sample stacks, follow the [quickstart](README.md#quickstart).
-3. Copy `shomei.example.toml` to `local/config/shomei.toml` and configure an upstream or direct Tailscale SSH approval using the sections below. For HTTP-only, remove `[tcp]`. For SSH-only, remove `http_upstream`. [Example configuration](shomei.example.toml)
+3. Copy `shomei.example.toml` to `local/config/shomei.toml` and configure a reverse upstream, forward scope, or direct Tailscale SSH approval. For forward-only, keep the HTTPS authorization listener and remove the reverse upstream settings. [Example configuration](shomei.example.toml)
 4. On the gateway host, place the TLS files and the public allowlist from enrollment under `local/config`, and create `local/state`. Set `SHOMEI_UID` and `SHOMEI_GID` to a user that can read the config and write state. Run `docker compose up -d` after the files are in place. The supplied Compose file publishes listeners on loopback. For a native deployment, set the file paths and run `shomei serve path/to/shomei.toml`.
 
 ### Enroll a key
@@ -92,6 +92,20 @@ assertion="$(shomei sign)" && curl --fail-with-body \
 ```
 
 Pass `--cacert "$SHOMEI_CA_FILE"` to curl for a private CA. Session cookies belong to the issuing gateway process and expire on restart.
+
+## Forward HTTP, HTTPS, and TCP
+
+Expose `forward.public_port` (9444 by default) as raw TCP on the authorization hostname so Shomei can terminate TLS and verify client certificates. Configure `cidrs` and `ports` in each `[forward.scopes.NAME]`. Optional `dns_suffixes` require a matching DNS name and a resolved IP in a configured CIDR. The port rule applies to the destination, and CONNECT can carry any TCP protocol to an allowed address and port. All enrolled keys can approve all scopes. Keep upstreams that require individual deployment approvals out of these scopes. [Example configuration](shomei.example.toml)
+
+```sh
+shomei mtls --proxy "$SHOMEI_PROXY" --scope fleet --out ./fleet-cert
+curl --proxy https://shomei.example.com:9444 \
+  --proxy-cert ./fleet-cert/client.pem --proxy-key ./fleet-cert/client-key.pem \
+  https://status.internal.example.com/
+shomei connect --credentials ./fleet-cert --listen 127.0.0.1:15432 db.internal.example.com:5432
+```
+
+For a private proxy CA, pass `--proxy-cacert "$SHOMEI_CA_FILE"` to curl. For SSH, run `shomei ssh --proxy "$SHOMEI_PROXY" --credentials ./fleet-cert ubuntu@host.internal.example.com`. Existing SSH host-key checks and user authentication apply. Use `--scope fleet` on `connect` or `ssh` to approve a new in-memory certificate. `connect` listens on loopback, where any local process can use the port. Treat the exported directory as private, reuse it across destinations in the scope, and mint credentials to a new directory when they expire. Active connections close on expiry or allowlist revocation. Reverse proxy cookies and signed assertions are used on the reverse HTTPS listener.
 
 ## Proxy SSH
 

@@ -70,7 +70,7 @@ async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
         .serialize_request(&wrong_curve)
         .unwrap();
     assert!(csr_key(&wrong_csr.pem().unwrap()).is_err());
-    let granted = issuer.issue(&key, 3, 0).unwrap();
+    let granted = issuer.issue(&key, 3, 0, 0).unwrap();
     let cert = CertificateDer::from_pem_slice(granted.certificate_pem.as_bytes()).unwrap();
     let (_, parsed) = parse_x509_certificate(cert.as_ref()).unwrap();
     assert_eq!(
@@ -103,7 +103,7 @@ async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
     assert!(matches!(eof, Ok(0) | Err(_)));
     assert!(unix_seconds().unwrap() >= granted.expires_at);
 
-    let granted = issuer.issue(&key, 30, 0).unwrap();
+    let granted = issuer.issue(&key, 30, 0, 0).unwrap();
     let cert = CertificateDer::from_pem_slice(granted.certificate_pem.as_bytes()).unwrap();
     let mut verified = connect(
         builder()
@@ -127,12 +127,19 @@ async fn tcp_requires_the_issued_client_key_and_closes_at_expiry() {
     gateway.abort();
 }
 
-pub(crate) fn server_identity() -> Identity {
+fn server_identity() -> Identity {
     let signed = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     Identity {
         certs: vec![signed.cert.der().clone()],
         key: private_key(&signed.signing_key),
     }
+}
+
+pub(crate) fn server_fixture() -> (Identity, RootCertStore) {
+    let identity = server_identity();
+    let mut roots = RootCertStore::empty();
+    roots.add(identity.certs[0].clone()).unwrap();
+    (identity, roots)
 }
 
 fn private_key(key: &KeyPair) -> PrivateKeyDer<'static> {

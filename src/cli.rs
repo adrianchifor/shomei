@@ -1,3 +1,4 @@
+mod forward;
 mod hardware;
 mod ssh;
 
@@ -60,6 +61,10 @@ enum Command {
     Clear(IdentityFile),
     /// Print a one-use Shomei authorization assertion.
     Sign(Access),
+    /// Export a reusable, short-lived mTLS credential for a forward proxy scope.
+    Mtls(forward::MtlsArgs),
+    /// Open a local TCP bridge through the forward proxy.
+    Connect(forward::ConnectArgs),
     /// Connect to an allowlisted SSH host after YubiKey approval.
     Ssh(ssh::SshArgs),
     #[command(hide = true)]
@@ -164,6 +169,8 @@ pub async fn run() -> Result<Option<PathBuf>> {
             println!("{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&signed)?));
         }
         Some(Command::Ssh(args)) => ssh::run(args).await?,
+        Some(Command::Mtls(args)) => forward::export(args).await?,
+        Some(Command::Connect(args)) => forward::connect(args).await?,
         Some(Command::SshStdio { socket }) => ssh::stdio(&socket)?,
     }
     Ok(None)

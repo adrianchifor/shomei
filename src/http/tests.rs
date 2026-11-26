@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use axum::http;
 use rcgen::{CertificateParams, KeyPair};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, UnixListener};
 use tower::ServiceExt;
@@ -97,6 +98,7 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         browser_action: None,
         session_ttl_seconds: 60,
         tcp: None,
+        forward: None,
         tailscale_ssh: Some(TailscaleSshConfig {
             target: TARGET.into(),
             posture_attribute: "custom:shomei_ssh".into(),
@@ -117,7 +119,7 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         &config.limits,
         false,
     );
-    let mut state = state_with_auth(config, None, auth).unwrap();
+    let mut state = state_with_auth(config, None, auth, None).unwrap();
     Arc::get_mut(&mut state)
         .unwrap()
         .tailscale
@@ -250,6 +252,7 @@ async fn approves_one_deploy(u2f: bool) {
             public_port: Some(9553),
             cert_ttl_seconds: 120,
         }),
+        forward: None,
         tailscale_ssh: None,
         limits: Default::default(),
     };
@@ -260,7 +263,25 @@ async fn approves_one_deploy(u2f: bool) {
         &config.limits,
         u2f,
     );
-    let state = state_with_auth(config, Some(Issuer::new().unwrap()), auth).unwrap();
+    let forward = Arc::new(
+        crate::forward::Gateway::new(
+            toml::from_str(
+                r#"
+            public_port = 9777
+            [scopes.api]
+            cidrs = ["10.1.0.0/16"]
+            ports = [443]
+            [scopes.fleet]
+            cidrs = ["10.2.0.0/16"]
+            ports = [22]
+        "#,
+            )
+            .unwrap(),
+            16,
+        )
+        .unwrap(),
+    );
+    let state = state_with_auth(config, Some(Issuer::new().unwrap()), auth, Some(forward)).unwrap();
     let router = routes(state.clone());
     let server = tokio::spawn(async move {
         let upstream_app = Router::new().fallback(|request: Request| async move {
@@ -474,6 +495,34 @@ async fn approves_one_deploy(u2f: bool) {
             .unwrap()
             .starts_with("-----BEGIN CERTIFICATE-----")
     );
+
+    for (scope, expected) in [
+        ("unknown", StatusCode::FORBIDDEN),
+        ("fleet", StatusCode::OK),
+    ] {
+        let start = send(
+            &router,
+            post_json(
+                "/_shomei/api/auth/start",
+                json!({ "client_csr_pem": csr, "forward_scope": scope }),
+            ),
+        )
+        .await;
+        assert_eq!(start.status(), expected);
+        if expected == StatusCode::OK {
+            let answer = signed_answer(&signer, &json_body(start).await, 3);
+            let issued = send(&router, post_json("/_shomei/api/auth/finish", answer)).await;
+            assert_eq!(issued.status(), StatusCode::OK);
+            assert!(!issued.headers().contains_key(SET_COOKIE));
+            let certificate = json_body(issued).await;
+            assert_eq!(certificate["forward_endpoint"], "localhost:9777");
+            let leaf = CertificateDer::from_pem_slice(
+                certificate["certificate_pem"].as_str().unwrap().as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(crate::tls::client_grant(&leaf).unwrap().1, 1);
+        }
+    }
 
     std::fs::write(identities_file, "[]").unwrap();
     assert!(state.auth.reload().unwrap());

@@ -104,6 +104,7 @@ impl Issuer {
         public_key: &SubjectPublicKeyInfo,
         ttl: u64,
         generation: u64,
+        target: usize,
     ) -> Result<ClientCertificate> {
         ensure!(
             public_key.algorithm() == &PKCS_ECDSA_P256_SHA256,
@@ -111,7 +112,7 @@ impl Issuer {
         );
         let now = unix_seconds()?;
         let expires_at = now + ttl;
-        let mut params = named_certificate(&format!("{CLIENT_NAME}{generation}"));
+        let mut params = named_certificate(&format!("{CLIENT_NAME}{generation}/{target}"));
         let serial = ring::rand::generate::<[u8; 16]>(&ring::rand::SystemRandom::new())
             .map_err(|_| anyhow::anyhow!("cannot generate certificate serial number"))?
             .expose();
@@ -177,7 +178,7 @@ pub async fn relay(
     else {
         return;
     };
-    let Ok((generation, lifetime)) = client_grant(cert) else {
+    let Ok((generation, 0, lifetime)) = client_grant(cert) else {
         return;
     };
     if *allowed_generation.borrow_and_update() != generation {
@@ -198,10 +199,10 @@ pub async fn relay(
     }
 }
 
-fn client_grant(cert: &CertificateDer<'_>) -> Result<(u64, Duration)> {
+pub(crate) fn client_grant(cert: &CertificateDer<'_>) -> Result<(u64, usize, Duration)> {
     let (_, cert) = parse_x509_certificate(cert.as_ref())
         .map_err(|_| anyhow::anyhow!("invalid client certificate"))?;
-    let generation = cert
+    let (generation, target) = cert
         .subject()
         .iter_common_name()
         .next()
@@ -209,11 +210,16 @@ fn client_grant(cert: &CertificateDer<'_>) -> Result<(u64, Duration)> {
         .as_str()?
         .strip_prefix(CLIENT_NAME)
         .context("invalid client grant")?
-        .parse()?;
+        .split_once('/')
+        .context("missing client grant target")?;
     let expires_at =
         UNIX_EPOCH + Duration::from_secs(cert.validity().not_after.timestamp().try_into()?);
-    Ok((generation, expires_at.duration_since(SystemTime::now())?))
+    Ok((
+        generation.parse()?,
+        target.parse()?,
+        expires_at.duration_since(SystemTime::now())?,
+    ))
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

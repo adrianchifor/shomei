@@ -61,6 +61,7 @@ pub struct App {
     upstream: Option<HttpUpstream>,
     browser_action: Option<BrowserAction>,
     tcp: Option<TcpAccess>,
+    forward: Option<ForwardAccess>,
     tailscale: Option<TailscaleSsh>,
     auth_workers: Arc<Semaphore>,
     http_requests: Arc<Semaphore>,
@@ -71,6 +72,11 @@ struct TcpAccess {
     ttl: u64,
     endpoint: String,
     ssh_host: Option<String>,
+}
+
+struct ForwardAccess {
+    gateway: Arc<crate::forward::Gateway>,
+    endpoint: String,
 }
 
 #[derive(Clone, Copy)]
@@ -90,13 +96,21 @@ struct HttpUpstream {
     client: Client<HttpsConnector<HttpConnector>, Body>,
 }
 
-pub fn app(config: Config, issuer: Option<Issuer>) -> Result<(Router, Arc<Auth>)> {
-    let state = state(config, issuer)?;
+pub fn app(
+    config: Config,
+    issuer: Option<Issuer>,
+    forward: Option<Arc<crate::forward::Gateway>>,
+) -> Result<(Router, Arc<Auth>)> {
+    let state = state(config, issuer, forward)?;
     let auth = state.auth.clone();
     Ok((routes(state), auth))
 }
 
-fn state(config: Config, issuer: Option<Issuer>) -> Result<Arc<App>> {
+fn state(
+    config: Config,
+    issuer: Option<Issuer>,
+    forward: Option<Arc<crate::forward::Gateway>>,
+) -> Result<Arc<App>> {
     let auth = Auth::new(
         &config.origin,
         &config.state_dir,
@@ -104,10 +118,15 @@ fn state(config: Config, issuer: Option<Issuer>) -> Result<Arc<App>> {
         &config.limits,
         config.allow_yubikey_4,
     )?;
-    state_with_auth(config, issuer, auth)
+    state_with_auth(config, issuer, auth, forward)
 }
 
-fn state_with_auth(config: Config, issuer: Option<Issuer>, auth: Auth) -> Result<Arc<App>> {
+fn state_with_auth(
+    config: Config,
+    issuer: Option<Issuer>,
+    auth: Auth,
+    forward: Option<Arc<crate::forward::Gateway>>,
+) -> Result<Arc<App>> {
     let upstream = config
         .http_upstream
         .map(|origin| -> Result<_> {
@@ -150,6 +169,16 @@ fn state_with_auth(config: Config, issuer: Option<Issuer>, auth: Auth) -> Result
         upstream,
         browser_action: config.browser_action,
         tcp,
+        forward: forward.map(|gateway| ForwardAccess {
+            endpoint: format!(
+                "{hostname}:{}",
+                gateway
+                    .config
+                    .public_port
+                    .unwrap_or(gateway.config.bind.port())
+            ),
+            gateway,
+        }),
         tailscale: config
             .tailscale_ssh
             .map(|tailscale| TailscaleSsh::new(tailscale, config.limits.auth_workers))
@@ -351,6 +380,7 @@ async fn auth_work<T: Send + 'static>(
 struct LoginStart {
     client_csr_pem: Option<String>,
     tcp_target: Option<String>,
+    forward_scope: Option<String>,
 }
 
 async fn login_start(
@@ -361,6 +391,29 @@ async fn login_start(
     auth_work(app, move |app| {
         let peer = peer.challenge_key();
         app.auth.check_challenge_capacity(peer)?;
+        if let Some(scope) = body.forward_scope {
+            let forward = app.forward.as_ref().ok_or(ApiError(
+                StatusCode::BAD_REQUEST,
+                "forward proxy is disabled",
+            ))?;
+            let scope = forward.gateway.scope_id(&scope).ok_or(ApiError(
+                StatusCode::FORBIDDEN,
+                "forward proxy scope is not configured",
+            ))?;
+            let csr = body
+                .client_csr_pem
+                .as_deref()
+                .filter(|_| body.tcp_target.is_none())
+                .ok_or(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "forward scope requires a client CSR and no TCP target",
+                ))?;
+            let key = csr_key(csr)
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid P-256 client CSR"))?;
+            return Ok(Json(
+                app.auth.start_login(Grant::Forward { key, scope }, peer)?,
+            ));
+        }
         let grant =
             match body.client_csr_pem {
                 Some(csr) => {
@@ -423,7 +476,7 @@ async fn login_finish(
                     .ok_or_else(|| ApiError::internal("missing TCP issuer"))?;
                 let certificate = tcp
                     .issuer
-                    .issue(&key, tcp.ttl, generation)
+                    .issue(&key, tcp.ttl, generation, 0)
                     .map_err(ApiError::internal)?;
                 Ok(Json(serde_json::json!({
                     "certificate_pem": certificate.certificate_pem,
@@ -436,6 +489,28 @@ async fn login_finish(
                 StatusCode::UNAUTHORIZED,
                 "wrong approval endpoint",
             )),
+            Grant::Forward { key, scope } => {
+                let forward = app
+                    .forward
+                    .as_ref()
+                    .ok_or_else(|| ApiError::internal("missing forward issuer"))?;
+                let certificate = forward
+                    .gateway
+                    .issuer
+                    .issue(
+                        &key,
+                        forward.gateway.config.cert_ttl_seconds,
+                        generation,
+                        scope,
+                    )
+                    .map_err(ApiError::internal)?;
+                Ok(Json(serde_json::json!({
+                    "certificate_pem": certificate.certificate_pem,
+                    "expires_at": certificate.expires_at,
+                    "forward_endpoint": forward.endpoint,
+                }))
+                .into_response())
+            }
         }
     })
     .await
@@ -696,7 +771,7 @@ fn wants_login(request: &Request) -> bool {
             })
 }
 
-fn strip_hop_headers(headers: &mut HeaderMap) -> Result<(), ()> {
+pub(crate) fn strip_hop_headers(headers: &mut HeaderMap) -> Result<(), ()> {
     let mut nominated = Vec::new();
     for value in headers.get_all(CONNECTION) {
         for token in value
@@ -759,7 +834,7 @@ fn filter_cookies(headers: &mut HeaderMap, name: HeaderName) {
     }
 }
 
-fn relay_body(body: Body, permit: Option<OwnedSemaphorePermit>) -> Body {
+pub(crate) fn relay_body(body: Body, permit: Option<OwnedSemaphorePermit>) -> Body {
     Body::new(body.map_frame(move |frame| {
         let _permit = &permit;
         if frame.is_trailers() {
