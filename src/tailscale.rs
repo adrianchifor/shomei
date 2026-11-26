@@ -27,10 +27,15 @@ use crate::config::{TailscaleSshConfig, is_tailnet_ip};
 
 const RESPONSE_LIMIT: usize = 32 * 1024;
 const SCOPE: &str = "devices:posture_attributes";
+// Each Tailscale API step is bounded so that WhoIs (2 s), assertion
+// verification, the token fetch and the posture call end well inside the
+// 10 s authentication handler budget.
+const API_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct TailscaleSsh {
     pub target: Option<String>,
     pub requests: Semaphore,
+    gateway: Option<IpAddr>,
     posture_attribute: String,
     ttl_seconds: u64,
     socket: PathBuf,
@@ -39,6 +44,7 @@ pub struct TailscaleSsh {
     oauth_id: String,
     oauth_secret: Zeroizing<String>,
     token: Mutex<Option<CachedToken>>,
+    api_timeout: Duration,
 }
 
 struct CachedToken {
@@ -86,7 +92,11 @@ struct UserProfile {
 }
 
 impl TailscaleSsh {
-    pub fn new(config: TailscaleSshConfig, workers: usize) -> Result<Self> {
+    pub fn new(
+        config: TailscaleSshConfig,
+        gateway: Option<IpAddr>,
+        workers: usize,
+    ) -> Result<Self> {
         ensure!(
             fs::metadata(&config.socket)
                 .context("inspect tailscaled LocalAPI socket")?
@@ -118,6 +128,7 @@ impl TailscaleSsh {
         Ok(Self {
             target: config.target,
             requests: Semaphore::new(workers),
+            gateway,
             posture_attribute: config.posture_attribute,
             ttl_seconds: config.ttl_seconds,
             socket: config.socket,
@@ -126,11 +137,21 @@ impl TailscaleSsh {
             oauth_id: config.oauth_client_id,
             oauth_secret: secret,
             token: Mutex::new(None),
+            api_timeout: API_TIMEOUT,
         })
     }
 
+    /// Rejects peers outside the tailnet and, when forwarding is enabled, the
+    /// gateway itself, which a forward user could reach through the proxy.
+    pub fn accepts_peer(&self, peer: IpAddr) -> bool {
+        is_tailnet_ip(peer)
+            && self
+                .gateway
+                .is_none_or(|gateway| peer.to_canonical() != gateway.to_canonical())
+    }
+
     pub async fn device(&self, peer: IpAddr) -> Result<Option<Device>> {
-        if !is_tailnet_ip(peer) {
+        if !self.accepts_peer(peer) {
             return Ok(None);
         }
         let response = timeout(Duration::from_secs(2), async {
@@ -161,7 +182,14 @@ impl TailscaleSsh {
         Ok(response.and_then(|response| response.device(peer)))
     }
 
+    /// Fails with a `tokio::time::error::Elapsed` error after `api_timeout`,
+    /// including time spent waiting for another refresh. Dropping the
+    /// future releases the lock and leaves the cache unchanged.
     pub async fn authorization(&self) -> Result<HeaderValue> {
+        timeout(self.api_timeout, self.refresh_authorization()).await?
+    }
+
+    async fn refresh_authorization(&self) -> Result<HeaderValue> {
         let mut cache = self.token.lock().await;
         if let Some(token) = cache
             .as_ref()
@@ -203,7 +231,13 @@ impl TailscaleSsh {
         Ok(authorization)
     }
 
+    /// Fails with a `tokio::time::error::Elapsed` error after `api_timeout`,
+    /// when the attribute may or may not have been set.
     pub async fn approve(&self, device: &Device, authorization: HeaderValue) -> Result<u64> {
+        timeout(self.api_timeout, self.set_attribute(device, authorization)).await?
+    }
+
+    async fn set_attribute(&self, device: &Device, authorization: HeaderValue) -> Result<u64> {
         let expiry = OffsetDateTime::now_utc() + time::Duration::seconds(self.ttl_seconds as i64);
         let body = json!({ "value": true, "expiry": expiry.format(&Rfc3339)? });
         let path = format!(
@@ -248,6 +282,11 @@ impl TailscaleSsh {
                 .enable_http1()
                 .build(),
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_api_timeout(&mut self, api_timeout: Duration) {
+        self.api_timeout = api_timeout;
     }
 }
 

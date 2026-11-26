@@ -1245,6 +1245,212 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
     local_server.abort();
 }
 
+#[tokio::test]
+async fn tailscale_approval_rejects_the_gateway_and_bounds_api_calls() {
+    const LOCAL: &str = "fd7a:115c:a1e0::51";
+    const GATEWAY: &str = "100.64.0.1";
+    const TARGET: &str = "deploy.example.ts.net";
+    const START: &str = "/_shomei/api/auth/tailscale/start";
+    const FINISH: &str = "/_shomei/api/auth/tailscale/finish";
+    let dir = tempfile::Builder::new()
+        .prefix("shomei-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = dir.path().join("tailscale.sock");
+    let secret = dir.path().join("secret");
+    std::fs::write(&secret, "test-secret\n").unwrap();
+    let local = UnixListener::bind(&socket).unwrap();
+    let local_server = tokio::spawn(async move {
+        while let Ok((connection, _)) = local.accept().await {
+            tokio::spawn(async move {
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(connection), service_fn(|request: hyper::Request<Incoming>| async move {
+                        // The gateway node is user-owned, so only the peer check refuses it.
+                        let (id, address) = match request.uri().query().unwrap() {
+                            "addr=fd7a%3A115c%3Aa1e0%3A%3A51" => ("nFirst", format!("{LOCAL}/128")),
+                            "addr=100.64.0.1" => ("nGateway", format!("{GATEWAY}/32")),
+                            query => panic!("unexpected WhoIs query {query}"),
+                        };
+                        let body = json!({"Node": { "StableID": id, "Addresses": [address], "User": 123 }, "UserProfile": { "ID": 123 }});
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(Bytes::from(body.to_string()))))
+                    }))
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_origin = format!("http://{}", api_listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let (writes, mut written) = tokio::sync::mpsc::unbounded_channel();
+    let stall_token = Arc::new(AtomicBool::new(false));
+    let stall_posture = Arc::new(AtomicBool::new(false));
+    let token_requests = Arc::new(AtomicUsize::new(0));
+    let (api_stall_token, api_stall_posture, api_token_requests) = (
+        stall_token.clone(),
+        stall_posture.clone(),
+        token_requests.clone(),
+    );
+    let api_server = tokio::spawn(async move {
+        let api = Router::new()
+            .route(
+                "/api/v2/oauth/token",
+                post(move || async move {
+                    if api_stall_token.load(Ordering::SeqCst) {
+                        std::future::pending::<()>().await;
+                    }
+                    let sequence = api_token_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                    Json(json!({ "access_token": format!("test-token-{sequence}"), "expires_in": 3600 }))
+                }),
+            )
+            .route(
+                "/api/v2/device/nFirst/attributes/custom:shomei_ssh",
+                post(move |Json(body): Json<Value>| async move {
+                    if api_stall_posture.load(Ordering::SeqCst) {
+                        std::future::pending::<()>().await;
+                    }
+                    writes.send(body).unwrap();
+                    StatusCode::NO_CONTENT
+                }),
+            );
+        axum::serve(api_listener, api).await.unwrap();
+    });
+    let config = Config {
+        origin: "https://localhost:8443".parse().unwrap(),
+        https_bind: format!("{GATEWAY}:8443").parse().unwrap(),
+        tls_cert: "unused".into(),
+        tls_key: "unused".into(),
+        state_dir: dir.path().into(),
+        identities_file: dir.path().join("identities.json"),
+        allow_yubikey_4: false,
+        http_upstream: None,
+        forwarding: true,
+        http_forwarding: true,
+        scopes: Default::default(),
+        hostnames: Default::default(),
+        http_upstreams: Default::default(),
+        tcp_upstreams: Default::default(),
+        protected_paths: None,
+        protected_session_ttl_seconds: 0,
+        session_ttl_seconds: 60,
+        tcp: TcpConfig::default(),
+        tailscale_ssh: Some(TailscaleSshConfig {
+            target: Some(TARGET.into()),
+            posture_attribute: "custom:shomei_ssh".into(),
+            oauth_client_id: "test-client".into(),
+            oauth_client_secret_file: secret,
+            socket,
+            ttl_seconds: 300,
+        }),
+        limits: Default::default(),
+    };
+    let (auth, signer) = test_auth(
+        &config.origin,
+        &config.state_dir,
+        &config.identities_file,
+        &config.limits,
+        false,
+    );
+    let mut state = state_with_auth(config, auth, None).unwrap();
+    let tailscale = Arc::get_mut(&mut state)
+        .unwrap()
+        .tailscale
+        .as_mut()
+        .unwrap();
+    tailscale.use_test_api(api_origin);
+    tailscale.set_api_timeout(Duration::from_millis(200));
+    let router = routes(state.clone());
+    let send_as = |path, body, ip: &str| {
+        let mut request = post_json(path, body);
+        request.extensions_mut().insert(Peer(ip.parse().unwrap()));
+        send(&router, request)
+    };
+    let begin = || send_as(START, json!({ "target": TARGET }), LOCAL);
+
+    // Ineligible peers are refused before they can take an approval slot.
+    let requests = &state.tailscale.as_ref().unwrap().requests;
+    let slots = requests
+        .try_acquire_many(requests.available_permits().try_into().unwrap())
+        .unwrap();
+    for peer in ["127.0.0.1", GATEWAY] {
+        assert_eq!(
+            send_as(START, json!({ "target": TARGET }), peer)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(begin().await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(slots);
+
+    // The gateway cannot approve itself, for example through the forward proxy.
+    assert_eq!(
+        send_as(START, json!({ "target": TARGET }), GATEWAY)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let answer = signed_answer(&signer, &json_body(begin().await).await, 1);
+    assert_eq!(
+        send_as(FINISH, answer, GATEWAY).await.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // A fully qualified target with a trailing dot matches the configured name.
+    for target in ["deploy.example.ts.net.", "Deploy.Example.ts.net"] {
+        assert_eq!(
+            send_as(START, json!({ "target": target }), LOCAL)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        send_as(START, json!({ "target": "other.example.ts.net." }), LOCAL)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // A stalled token refresh times out with a distinct error, and releases
+    // the token lock without caching anything.
+    stall_token.store(true, Ordering::SeqCst);
+    for counter in [2, 3] {
+        let answer = signed_answer(&signer, &json_body(begin().await).await, counter);
+        let response = send_as(FINISH, answer, LOCAL).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            json_body(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("may or may not have taken effect")
+        );
+    }
+    stall_token.store(false, Ordering::SeqCst);
+
+    // A stalled posture call times out the same way.
+    stall_posture.store(true, Ordering::SeqCst);
+    let answer = signed_answer(&signer, &json_body(begin().await).await, 4);
+    assert_eq!(
+        send_as(FINISH, answer, LOCAL).await.status(),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+    assert_eq!(token_requests.load(Ordering::SeqCst), 1);
+    stall_posture.store(false, Ordering::SeqCst);
+
+    let answer = signed_answer(&signer, &json_body(begin().await).await, 5);
+    assert_eq!(
+        send_as(FINISH, answer, LOCAL).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(written.try_recv().unwrap()["value"], true);
+    assert!(written.try_recv().is_err());
+    assert_eq!(token_requests.load(Ordering::SeqCst), 1);
+    api_server.abort();
+    local_server.abort();
+}
+
 async fn approves_one_request(u2f: bool) {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = tempfile::tempdir().unwrap();
