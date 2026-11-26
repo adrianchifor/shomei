@@ -43,6 +43,7 @@ const CHALLENGE_TTL: Duration = Duration::from_secs(120);
 pub const ACCOUNT: &str = "shomei";
 const ES256: i64 = -7;
 const MAX_IDENTITIES_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REJECTED_LOGS: usize = 16;
 const UNAUTHORIZED: ApiError = ApiError(StatusCode::UNAUTHORIZED, "YubiKey verification failed");
 const NOT_ALLOWED: ApiError = ApiError(StatusCode::FORBIDDEN, "No YubiKey is enrolled");
 
@@ -206,7 +207,7 @@ impl Auth {
             _lock: lock,
         };
         let bytes = read_identities(identities_file)?;
-        let verified = auth.verify_identities(&bytes)?;
+        let verified = auth.verify_identities(&bytes, Err)?;
         auth.devices = RwLock::new(auth.load_devices(verified, &HashMap::new())?);
         auth.last_digest = Mutex::new(sha256(&bytes));
         Ok(auth)
@@ -220,7 +221,24 @@ impl Auth {
         self.changes.subscribe()
     }
 
+    /// Applies the identities file if it changed. Records that fail
+    /// verification are skipped so they cannot hold back a removal elsewhere
+    /// in the file. A file that cannot be read as a list keeps the last one.
     pub fn reload(&self) -> Result<bool> {
+        let (changed, rejected) = self.reload_identities()?;
+        for error in rejected.iter().take(MAX_REJECTED_LOGS) {
+            eprintln!("Ignored an invalid YubiKey identity: {error:#}");
+        }
+        if rejected.len() > MAX_REJECTED_LOGS {
+            eprintln!(
+                "Ignored {} more invalid YubiKey identities",
+                rejected.len() - MAX_REJECTED_LOGS
+            );
+        }
+        Ok(changed)
+    }
+
+    fn reload_identities(&self) -> Result<(bool, Vec<anyhow::Error>)> {
         let mut last = self
             .last_digest
             .lock()
@@ -228,10 +246,14 @@ impl Auth {
         let bytes = read_identities(&self.identities_file)?;
         let checksum = sha256(&bytes);
         if checksum == *last {
-            return Ok(false);
+            return Ok((false, Vec::new()));
         }
+        let mut rejected = Vec::new();
         let verified = self
-            .verify_identities(&bytes)
+            .verify_identities(&bytes, |error| {
+                rejected.push(error);
+                Ok(())
+            })
             .inspect_err(|_| *last = checksum)?;
         let previous = self
             .devices
@@ -256,25 +278,33 @@ impl Auth {
             }
         }
         *last = checksum;
-        Ok(changed)
+        Ok((changed, rejected))
     }
 
-    fn verify_identities(&self, contents: &[u8]) -> Result<Vec<VerifiedIdentity>> {
+    fn verify_identities(
+        &self,
+        contents: &[u8],
+        reject: impl FnMut(anyhow::Error) -> Result<()>,
+    ) -> Result<Vec<VerifiedIdentity>> {
         let mut credential_ids = HashSet::new();
         let mut verified = Vec::new();
-        identity_list::visit_identities(contents, |record| {
-            let key = record
-                .verify_for(&self.origin, &self.webauthn, &self.yubikeys)
-                .context("verify YubiKey identity")?;
-            ensure!(
-                credential_ids.insert(key.cred_id().clone()),
-                "duplicate YubiKey credential ID"
-            );
-            let public_key = key.credential().cred;
-            let fingerprint = sha256(&serde_json::to_vec(&(key.cred_id(), public_key))?);
-            verified.push(VerifiedIdentity { key, fingerprint });
-            Ok(())
-        })?;
+        identity_list::visit_identities(
+            contents,
+            |record| {
+                let key = record
+                    .verify_for(&self.origin, &self.webauthn, &self.yubikeys)
+                    .context("verify YubiKey identity")?;
+                ensure!(
+                    credential_ids.insert(key.cred_id().clone()),
+                    "duplicate YubiKey credential ID"
+                );
+                let public_key = key.credential().cred;
+                let fingerprint = sha256(&serde_json::to_vec(&(key.cred_id(), public_key))?);
+                verified.push(VerifiedIdentity { key, fingerprint });
+                Ok(())
+            },
+            reject,
+        )?;
         Ok(verified)
     }
 
