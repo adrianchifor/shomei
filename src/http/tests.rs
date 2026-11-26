@@ -12,6 +12,15 @@ use crate::{
 
 #[tokio::test]
 async fn approves_one_deploy_and_allows_only_reads_with_its_cookie() {
+    approves_one_deploy(false).await;
+}
+
+#[tokio::test]
+async fn attested_yubikey_4_approves_deploy_and_tcp_grants() {
+    approves_one_deploy(true).await;
+}
+
+async fn approves_one_deploy(u2f: bool) {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let identities_file = dir.path().join("identities.json");
@@ -22,6 +31,7 @@ async fn approves_one_deploy_and_allows_only_reads_with_its_cookie() {
         tls_key: "unused".into(),
         state_dir: dir.path().into(),
         identities_file: identities_file.clone(),
+        allow_yubikey_4: u2f,
         http_upstream: Some(
             format!("http://{}", upstream.local_addr().unwrap())
                 .parse()
@@ -46,6 +56,7 @@ async fn approves_one_deploy_and_allows_only_reads_with_its_cookie() {
         &config.state_dir,
         &identities_file,
         &config.limits,
+        u2f,
     );
     let state = state_with_auth(config, Some(Issuer::new().unwrap()), auth).unwrap();
     let router = routes(state.clone());

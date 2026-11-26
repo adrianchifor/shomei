@@ -1,3 +1,5 @@
+mod u2f;
+
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -18,6 +20,7 @@ use webauthn_rs::prelude::{
     CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
     RequestChallengeResponse,
 };
+use webauthn_rs_proto::UserVerificationPolicy;
 use zeroize::Zeroizing;
 
 use crate::auth::provisioning_model;
@@ -79,7 +82,11 @@ pub async fn register(
     origin: Url,
     options: CreationChallengeResponse,
     set_pin: bool,
+    u2f: bool,
 ) -> Result<RegisterPublicKeyCredential> {
+    if u2f {
+        return block_in_place(|| u2f::register(origin, options));
+    }
     let ui = Terminal::default();
     let mut key = usb_key(&ui).await?;
     if key.get_info().get_option("clientPin") == Some(false) {
@@ -108,6 +115,17 @@ pub async fn authenticate(
     origin: Url,
     options: RequestChallengeResponse,
 ) -> Result<PublicKeyCredential> {
+    if options.public_key.user_verification == UserVerificationPolicy::Discouraged_DO_NOT_USE {
+        ensure!(
+            origin.domain() == Some("localhost"),
+            "YubiKey 4 support requires localhost HTTPS"
+        );
+        return block_in_place(|| u2f::authenticate(origin, options));
+    }
+    ensure!(
+        options.public_key.user_verification == UserVerificationPolicy::Required,
+        "unexpected WebAuthn user verification policy"
+    );
     let ui = Terminal::default();
     let mut key = usb_key(&ui).await?;
     let response = block_in_place(|| key.do_authentication(origin, options))

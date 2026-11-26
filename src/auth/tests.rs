@@ -1,6 +1,6 @@
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DnType, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, PublicKeyData, SigningKey, SubjectPublicKeyInfo,
+    BasicConstraints, Certificate, CertificateParams, CustomExtension, DnType, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose, PublicKeyData, SigningKey, SubjectPublicKeyInfo,
 };
 use serde_cbor_2::Value::{self, Array, Bytes, Integer, Map, Text};
 use serde_json::json;
@@ -17,14 +17,21 @@ fn requires_genuine_attestation_and_binds_the_identity_to_account_and_origin() {
     let origin = Url::parse(ORIGIN).unwrap();
     let key = p256();
     let (options, setup) =
-        IdentitySetup::prepare(&origin, "operator", YubikeyPolicy::new().unwrap()).unwrap();
+        IdentitySetup::prepare(&origin, "operator", YubikeyPolicy::new(false).unwrap()).unwrap();
     let untrusted = fixture.registration(&origin, &options, &key);
     assert!(setup.finish(untrusted).is_err());
 
     let (options, setup) = IdentitySetup::prepare(&origin, "operator", fixture.policy()).unwrap();
     assert!(
         setup
-            .finish(registration(&origin, &options, &key, fixture.model, None))
+            .finish(registration(
+                &origin,
+                &options,
+                &key,
+                fixture.model,
+                None,
+                false
+            ))
             .is_err()
     );
 
@@ -35,6 +42,7 @@ fn requires_genuine_attestation_and_binds_the_identity_to_account_and_origin() {
         &key,
         Uuid::nil(),
         Some((&fixture.leaf, &fixture.attestation_key)),
+        false,
     );
     assert!(setup.finish(wrong_model).is_err());
 
@@ -56,6 +64,79 @@ fn requires_genuine_attestation_and_binds_the_identity_to_account_and_origin() {
             .verify_for(&alternate, &alternate_webauthn, &policy)
             .is_err()
     );
+}
+
+#[test]
+fn u2f_requires_localhost_a_trusted_yubikey_4_and_a_fresh_touch() {
+    let fixture = Fixture::new();
+    let (root, leaf, attestation_key) = u2f_fixture(true);
+    let (other_root, other_leaf, other_key) = u2f_fixture(false);
+    let origin = Url::parse("https://localhost:8443").unwrap();
+    let remote = Url::parse(ORIGIN).unwrap();
+    assert!(IdentitySetup::prepare(&remote, "operator", u2f_policy(&fixture, &root)).is_err());
+
+    let key = p256();
+    for policy in [
+        u2f_policy(&fixture, &root),
+        u2f_policy(&fixture, &other_root),
+    ] {
+        let (options, setup) = IdentitySetup::prepare(&origin, "operator", policy).unwrap();
+        let response = registration(
+            &origin,
+            &options,
+            &key,
+            Uuid::nil(),
+            Some((&other_leaf, &other_key)),
+            true,
+        );
+        assert!(setup.finish(response).is_err());
+    }
+    let (options, setup) =
+        IdentitySetup::prepare(&origin, "operator", u2f_policy(&fixture, &root)).unwrap();
+    let response = registration(
+        &origin,
+        &options,
+        &key,
+        Uuid::nil(),
+        Some((&leaf, &attestation_key)),
+        true,
+    );
+    let record = setup.finish(response).unwrap();
+    assert!(
+        record
+            .verify_for(
+                &origin,
+                &build_webauthn(&origin).unwrap(),
+                &fixture.policy()
+            )
+            .is_err()
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let identities_file = dir.path().join("identities.json");
+    write_records(&identities_file, &[&record]);
+    let auth = Auth::load(
+        &origin,
+        dir.path(),
+        &identities_file,
+        &Limits::default(),
+        u2f_policy(&fixture, &root),
+    )
+    .unwrap();
+    let peer = "127.0.0.1".parse().unwrap();
+    let challenge = auth.start_login(None, Grant::Http, peer).unwrap();
+    let response = |flags| SignedChallenge {
+        challenge_id: challenge.challenge_id,
+        credential: assertion_at(
+            &origin,
+            &challenge.options.public_key.challenge,
+            &key,
+            flags,
+            1,
+        ),
+    };
+    assert!(auth.finish_login(response(0)).is_err());
+    assert!(auth.finish_login(response(1)).is_err());
 }
 
 #[test]
@@ -230,6 +311,7 @@ impl Fixture {
                 issuer: self.intermediate.der().clone(),
                 intermediates: vec![self.intermediate.der().clone()],
             }],
+            u2f: None,
         }
     }
 
@@ -245,6 +327,7 @@ impl Fixture {
             key,
             self.model,
             Some((&self.leaf, &self.attestation_key)),
+            false,
         )
     }
 
@@ -266,6 +349,7 @@ fn registration(
     key: &KeyPair,
     model: Uuid,
     attestation: Option<(&Certificate, &KeyPair)>,
+    u2f: bool,
 ) -> RegisterPublicKeyCredential {
     let client = client_data(origin, &challenge.public_key.challenge, "webauthn.create");
     let public_key = key.der_bytes();
@@ -278,12 +362,21 @@ fn registration(
         (Integer(-3), Bytes(public_key[33..].to_vec())),
     ]
     .into());
-    let mut data = auth_data(origin.domain().unwrap(), 0x45, 0);
+    let mut data = auth_data(origin.domain().unwrap(), if u2f { 0x41 } else { 0x45 }, 0);
     data.extend_from_slice(model.as_bytes());
     data.extend_from_slice(&(id.len() as u16).to_be_bytes());
     data.extend_from_slice(&id);
     data.extend(serde_cbor_2::to_vec(&cose).unwrap());
-    let (format, statement) = if let Some((cert, attestation_key)) = attestation {
+    let (format, statement) = if let Some((cert, attestation_key)) = attestation.filter(|_| u2f) {
+        let message = [&[0], &data[..32], &hash(&client)[..], &id, public_key].concat();
+        (
+            "fido-u2f",
+            object([
+                ("sig", Bytes(attestation_key.sign(&message).unwrap())),
+                ("x5c", Array(vec![Bytes(cert.der().to_vec())])),
+            ]),
+        )
+    } else if let Some((cert, attestation_key)) = attestation {
         (
             "packed",
             object([
@@ -313,11 +406,12 @@ fn registration(
 pub(crate) struct TestSigner {
     origin: Url,
     key: KeyPair,
+    flags: u8,
 }
 
 impl TestSigner {
     pub(crate) fn sign(&self, challenge: &[u8], counter: u32) -> PublicKeyCredential {
-        assertion_at(&self.origin, challenge, &self.key, 0x05, counter)
+        assertion_at(&self.origin, challenge, &self.key, self.flags, counter)
     }
 }
 
@@ -326,19 +420,71 @@ pub(crate) fn test_auth(
     state_dir: &Path,
     identities_file: &Path,
     limits: &Limits,
+    u2f: bool,
 ) -> (Auth, TestSigner) {
     let fixture = Fixture::new();
     let key = p256();
-    let record = fixture.provision(origin, "operator", &key);
+    let (record, policy, flags) = if u2f {
+        let (root, leaf, signing_key) = u2f_fixture(true);
+        let (options, setup) =
+            IdentitySetup::prepare(origin, "operator", u2f_policy(&fixture, &root)).unwrap();
+        let record = setup
+            .finish(registration(
+                origin,
+                &options,
+                &key,
+                Uuid::nil(),
+                Some((&leaf, &signing_key)),
+                true,
+            ))
+            .unwrap();
+        (record, u2f_policy(&fixture, &root), 0x01)
+    } else {
+        (
+            fixture.provision(origin, "operator", &key),
+            fixture.policy(),
+            0x05,
+        )
+    };
     write_records(identities_file, &[&record]);
-    let auth = Auth::load(origin, state_dir, identities_file, limits, fixture.policy()).unwrap();
+    let auth = Auth::load(origin, state_dir, identities_file, limits, policy).unwrap();
     (
         auth,
         TestSigner {
             origin: origin.clone(),
             key,
+            flags,
         },
     )
+}
+
+fn u2f_fixture(yubikey_4: bool) -> (Certificate, Certificate, KeyPair) {
+    let root_key = p256();
+    let mut root = certificate("Fixture U2F CA");
+    root.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    root.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let cert = root.self_signed(&root_key).unwrap();
+    let issuer = Issuer::new(root, root_key);
+    let signing_key = p256();
+    let mut leaf = certificate("Fixture U2F key");
+    if yubikey_4 {
+        leaf.custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 41482, 2],
+                b"1.3.6.1.4.1.41482.1.5".to_vec(),
+            ));
+    }
+    (
+        cert,
+        leaf.signed_by(&signing_key, &issuer).unwrap(),
+        signing_key,
+    )
+}
+
+fn u2f_policy(fixture: &Fixture, root: &Certificate) -> YubikeyPolicy {
+    let mut policy = fixture.policy();
+    policy.u2f = Some(U2fPolicy::from_pem(root.pem().as_bytes()).unwrap());
+    policy
 }
 
 fn assertion(

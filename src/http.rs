@@ -91,6 +91,7 @@ fn state(config: Config, issuer: Option<Issuer>) -> Result<Arc<App>> {
         &config.state_dir,
         &config.identities_file,
         &config.limits,
+        config.allow_yubikey_4,
     )?;
     state_with_auth(config, issuer, auth)
 }

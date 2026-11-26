@@ -2,6 +2,7 @@ origin = "https://localhost:8443"
 tls_cert = "/run/shomei/tls.pem"
 tls_key = "/run/shomei/tls-key.pem"
 identities_file = "/run/shomei/identities.json"
+allow_yubikey_4 = true
 state_dir = "/var/lib/shomei"
 
 [tcp]

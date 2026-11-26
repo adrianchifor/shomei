@@ -1,5 +1,6 @@
 use super::*;
 use ring::rand::{SystemRandom, generate};
+use serde::de::DeserializeOwned;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,8 +22,9 @@ pub struct IdentitySetup {
 pub fn prepare_identity(
     origin: &Url,
     account: &str,
+    u2f: bool,
 ) -> Result<(CreationChallengeResponse, IdentitySetup)> {
-    IdentitySetup::prepare(origin, account, YubikeyPolicy::new()?)
+    IdentitySetup::prepare(origin, account, YubikeyPolicy::new(u2f)?)
 }
 
 impl IdentitySetup {
@@ -36,7 +38,11 @@ impl IdentitySetup {
         let nonce = generate::<[u8; 32]>(&SystemRandom::new())
             .map_err(|_| anyhow::anyhow!("generate identity nonce"))?
             .expose();
-        let (options, _) = registration(&webauthn, &policy, origin, account, &nonce)?;
+        let options = if let Some(u2f) = &policy.u2f {
+            u2f_registration(&webauthn, u2f, origin, account, &nonce)?.0
+        } else {
+            registration(&webauthn, &policy, origin, account, &nonce)?.0
+        };
         let setup = Self {
             origin: origin.clone(),
             account: account.into(),
@@ -48,6 +54,10 @@ impl IdentitySetup {
     }
 
     pub fn finish(self, attestation: RegisterPublicKeyCredential) -> Result<StaticIdentity> {
+        ensure!(
+            u2f::is_u2f(&attestation)? == self.policy.u2f.is_some(),
+            "unexpected YubiKey attestation format"
+        );
         let mut identity = StaticIdentity {
             account: self.account,
             origin: self.origin,
@@ -65,7 +75,8 @@ impl IdentitySetup {
 impl StaticIdentity {
     pub fn verify(&self) -> Result<()> {
         let webauthn = build_webauthn(&self.origin)?;
-        self.verify_for(&self.origin, &webauthn, &YubikeyPolicy::new()?)?;
+        let policy = YubikeyPolicy::new(u2f::is_u2f(&self.attestation)?)?;
+        self.verify_for(&self.origin, &webauthn, &policy)?;
         Ok(())
     }
 
@@ -74,7 +85,7 @@ impl StaticIdentity {
         origin: &Url,
         webauthn: &Webauthn,
         policy: &YubikeyPolicy,
-    ) -> Result<AttestedPasskey> {
+    ) -> Result<DeviceKey> {
         let key = self.attested_key(origin, webauthn, policy)?;
         ensure!(
             self.attestation.id == B64.encode(key.cred_id())
@@ -90,7 +101,7 @@ impl StaticIdentity {
         origin: &Url,
         webauthn: &Webauthn,
         policy: &YubikeyPolicy,
-    ) -> Result<AttestedPasskey> {
+    ) -> Result<DeviceKey> {
         ensure!(
             self.origin == *origin,
             "identity belongs to a different HTTPS origin"
@@ -100,6 +111,18 @@ impl StaticIdentity {
             .decode(&self.nonce)?
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid identity nonce"))?;
+        if u2f::is_u2f(&self.attestation)? {
+            let u2f = policy
+                .u2f
+                .as_ref()
+                .context("YubiKey 4 support is disabled")?;
+            let (_, registration) = u2f_registration(webauthn, u2f, origin, &self.account, &nonce)?;
+            let key = webauthn
+                .finish_securitykey_registration(&self.attestation, &registration)
+                .context("verify signed FIDO U2F registration")?;
+            u2f.verify(&key)?;
+            return Ok(DeviceKey::U2f(key));
+        }
         let (_, registration) = registration(webauthn, policy, origin, &self.account, &nonce)?;
         let mut proof = self.attestation.clone();
         policy.complete_chain(&mut proof)?;
@@ -107,7 +130,7 @@ impl StaticIdentity {
             .finish_attested_passkey_registration(&proof, &registration)
             .context("verify signed WebAuthn registration")?;
         policy.verify(&key)?;
-        Ok(key)
+        Ok(DeviceKey::Fido2(key))
     }
 }
 
@@ -118,7 +141,7 @@ fn registration(
     account: &str,
     nonce: &[u8; 32],
 ) -> Result<(CreationChallengeResponse, AttestedPasskeyRegistration)> {
-    let (mut options, state) = webauthn.start_attested_passkey_registration(
+    let (options, state) = webauthn.start_attested_passkey_registration(
         Uuid::new_v4(),
         account,
         account,
@@ -126,6 +149,38 @@ fn registration(
         policy.roots.clone(),
         Some(AuthenticatorAttachment::CrossPlatform),
     )?;
+    scope_registration(options, state, origin, account, nonce)
+}
+
+fn u2f_registration(
+    webauthn: &Webauthn,
+    policy: &U2fPolicy,
+    origin: &Url,
+    account: &str,
+    nonce: &[u8; 32],
+) -> Result<(CreationChallengeResponse, SecurityKeyRegistration)> {
+    ensure!(
+        origin.domain() == Some("localhost"),
+        "YubiKey 4 support requires localhost HTTPS"
+    );
+    let (options, state) = webauthn.start_securitykey_registration(
+        Uuid::new_v4(),
+        account,
+        account,
+        None,
+        Some(policy.roots.clone()),
+        Some(AuthenticatorAttachment::CrossPlatform),
+    )?;
+    scope_registration(options, state, origin, account, nonce)
+}
+
+fn scope_registration<T: Serialize + DeserializeOwned>(
+    mut options: CreationChallengeResponse,
+    state: T,
+    origin: &Url,
+    account: &str,
+    nonce: &[u8; 32],
+) -> Result<(CreationChallengeResponse, T)> {
     let scope = origin.origin().ascii_serialization();
     let challenge = sha256(
         &[

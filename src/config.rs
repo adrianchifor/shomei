@@ -18,6 +18,8 @@ pub struct Config {
     pub tls_key: PathBuf,
     pub state_dir: PathBuf,
     pub identities_file: PathBuf,
+    #[serde(default)]
+    pub allow_yubikey_4: bool,
     pub http_upstream: Option<Url>,
     pub browser_action: Option<BrowserAction>,
     #[serde(default = "session_ttl")]
@@ -77,6 +79,10 @@ impl Config {
         let contents = fs::read_to_string(path).context("read config")?;
         let config: Self = toml::from_str(&contents).context("parse config")?;
         validate_origin(&config.origin)?;
+        ensure!(
+            !config.allow_yubikey_4 || config.origin.domain() == Some("localhost"),
+            "YubiKey 4 support requires a localhost HTTPS origin"
+        );
         ensure!(
             config.http_upstream.is_some() || config.tcp.is_some(),
             "configure an upstream"

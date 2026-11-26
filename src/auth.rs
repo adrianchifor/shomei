@@ -1,4 +1,5 @@
 mod identity;
+mod u2f;
 
 pub use identity::{StaticIdentity, prepare_identity};
 
@@ -33,6 +34,7 @@ use webauthn_rs::prelude::*;
 use x509_parser::{oid_registry::*, parse_x509_certificate};
 
 use crate::config::{Limits, validate_origin};
+use u2f::U2fPolicy;
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_ACCOUNT: &str = "operator";
@@ -75,7 +77,7 @@ pub struct Auth {
 }
 
 struct Account {
-    key: AttestedPasskey,
+    key: DeviceKey,
     digest: [u8; 32],
     counter_file: PathBuf,
     counter: Mutex<u32>,
@@ -83,15 +85,41 @@ struct Account {
 
 struct VerifiedIdentity {
     name: String,
-    key: AttestedPasskey,
+    key: DeviceKey,
     fingerprint: [u8; 32],
 }
 
 struct Pending {
     account: Arc<Account>,
-    authentication: AttestedPasskeyAuthentication,
+    authentication: Login,
     grant: Grant,
     generation: u64,
+}
+
+enum DeviceKey {
+    Fido2(AttestedPasskey),
+    U2f(SecurityKey),
+}
+
+impl DeviceKey {
+    fn cred_id(&self) -> &CredentialID {
+        match self {
+            Self::Fido2(key) => key.cred_id(),
+            Self::U2f(key) => key.cred_id(),
+        }
+    }
+
+    fn credential(&self) -> Credential {
+        match self {
+            Self::Fido2(key) => key.clone().into(),
+            Self::U2f(key) => key.clone().into(),
+        }
+    }
+}
+
+enum Login {
+    Fido2(AttestedPasskeyAuthentication),
+    U2f(SecurityKeyAuthentication),
 }
 
 pub enum Grant {
@@ -119,13 +147,14 @@ impl Auth {
         state_dir: &Path,
         identities_file: &Path,
         limits: &Limits,
+        allow_yubikey_4: bool,
     ) -> Result<Self> {
         Self::load(
             origin,
             state_dir,
             identities_file,
             limits,
-            YubikeyPolicy::new()?,
+            YubikeyPolicy::new(allow_yubikey_4)?,
         )
     }
 
@@ -233,7 +262,7 @@ impl Auth {
                 credential_ids.insert(key.cred_id().clone()),
                 "duplicate YubiKey credential ID"
             );
-            let public_key = Credential::from(key.clone()).cred;
+            let public_key = key.credential().cred;
             let fingerprint = sha256(&serde_json::to_vec(&(key.cred_id(), public_key))?);
             verified.push(VerifiedIdentity {
                 name: record.account,
@@ -292,10 +321,17 @@ impl Auth {
                 self.generation(),
             )
         };
-        let (options, authentication) = self
-            .webauthn
-            .start_attested_passkey_authentication(std::slice::from_ref(&account.key))
-            .map_err(ApiError::internal)?;
+        let (options, authentication) = match &account.key {
+            DeviceKey::Fido2(key) => self
+                .webauthn
+                .start_attested_passkey_authentication(std::slice::from_ref(key))
+                .map(|(options, login)| (options, Login::Fido2(login))),
+            DeviceKey::U2f(key) => self
+                .webauthn
+                .start_securitykey_authentication(std::slice::from_ref(key))
+                .map(|(options, login)| (options, Login::U2f(login))),
+        }
+        .map_err(ApiError::internal)?;
         let challenge_id = lock(&self.challenges)?.insert(
             peer,
             Pending {
@@ -330,11 +366,21 @@ impl Auth {
         if context.cross_origin || context.top_origin.is_some() {
             return Err(UNAUTHORIZED);
         }
-        let result = self
-            .webauthn
-            .finish_attested_passkey_authentication(&signed.credential, &authentication)
-            .map_err(|_| UNAUTHORIZED)?;
-        if !result.user_verified() || result.backup_eligible() || result.backup_state() {
+        let result = match &authentication {
+            Login::Fido2(login) => self
+                .webauthn
+                .finish_attested_passkey_authentication(&signed.credential, login),
+            Login::U2f(login) => self
+                .webauthn
+                .finish_securitykey_authentication(&signed.credential, login),
+        }
+        .map_err(|_| UNAUTHORIZED)?;
+        let flags = signed.credential.response.authenticator_data.get(32);
+        if !flags.is_some_and(|flags| flags & 0x01 == 0x01)
+            || (matches!(authentication, Login::Fido2(_)) && !result.user_verified())
+            || result.backup_eligible()
+            || result.backup_state()
+        {
             return Err(UNAUTHORIZED);
         }
         let _accounts = self
@@ -358,9 +404,9 @@ struct ClientContext {
 }
 
 impl Account {
-    fn load(directory: &Path, key: AttestedPasskey, digest: [u8; 32]) -> Result<Self> {
+    fn load(directory: &Path, key: DeviceKey, digest: [u8; 32]) -> Result<Self> {
         let counter_file = directory.join(B64.encode(digest));
-        let initial = Credential::from(key.clone()).counter;
+        let initial = key.credential().counter;
         let counter = match fs::read_to_string(&counter_file) {
             Ok(stored) => stored
                 .trim()
@@ -410,6 +456,7 @@ fn build_webauthn(origin: &Url) -> Result<Webauthn> {
         WebauthnBuilder::new(origin.domain().context("missing WebAuthn RP ID")?, origin)?
             .rp_name("Shomei")
             .timeout(CHALLENGE_TTL)
+            .danger_set_user_presence_only_security_keys(true)
             .build()?,
     )
 }
@@ -527,6 +574,7 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, ApiError> {
 struct YubikeyPolicy {
     roots: AttestationCaList,
     paths: Vec<AttestationPath>,
+    u2f: Option<U2fPolicy>,
 }
 
 struct AttestationPath {
@@ -535,7 +583,7 @@ struct AttestationPath {
 }
 
 impl YubikeyPolicy {
-    fn new() -> Result<Self> {
+    fn new(allow_yubikey_4: bool) -> Result<Self> {
         let pem = include_bytes!("../assets/yubico/root-1.pem");
         let root = CertificateDer::from_pem_slice(pem)?;
         let mut roots = AttestationCaListBuilder::new();
@@ -575,6 +623,7 @@ impl YubikeyPolicy {
         Ok(Self {
             roots: roots.build(),
             paths,
+            u2f: allow_yubikey_4.then(U2fPolicy::new).transpose()?,
         })
     }
 

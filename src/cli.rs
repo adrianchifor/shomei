@@ -95,6 +95,9 @@ struct InitArgs {
     /// Set a FIDO2 PIN on a YubiKey that has never had one.
     #[arg(long)]
     set_pin: bool,
+    /// Create an attested YubiKey 4 credential for a localhost demo.
+    #[arg(long, conflicts_with = "set_pin")]
+    u2f: bool,
     #[command(flatten)]
     identity: IdentityFile,
 }
@@ -156,13 +159,13 @@ async fn init(args: InitArgs) -> Result<()> {
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(dir).context("create the local identity directory")?;
-    let (options, setup) = prepare_identity(&args.proxy, &args.account)?;
+    let (options, setup) = prepare_identity(&args.proxy, &args.account, args.u2f)?;
     eprintln!(
         "Creating a YubiKey identity for {} at {}.",
         args.account,
         args.proxy.origin().ascii_serialization()
     );
-    let registration = hardware::register(args.proxy, options, args.set_pin).await?;
+    let registration = hardware::register(args.proxy, options, args.set_pin, args.u2f).await?;
     let identity = setup.finish(registration)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     serde_json::to_writer(file.as_file_mut(), &identity)?;

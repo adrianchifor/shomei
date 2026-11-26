@@ -1,6 +1,6 @@
 # Shomei
 
-Rust authentication proxy and CLI for supported YubiKey 5 Series keys with firmware 5.7.4 or later. A YubiKey PIN and touch unlock HTTP requests or short-lived mTLS access to a fixed TCP upstream. [Yubico attestation guidance](https://developers.yubico.com/U2F/Attestation_and_Metadata/)
+Rust authentication proxy and CLI for hardware-attested YubiKeys. The default policy requires a supported YubiKey 5 Series key with firmware 5.7.4 or later, PIN, and touch. [Yubico attestation guidance](https://developers.yubico.com/U2F/Attestation_and_Metadata/)
 
 ## Local setup
 
@@ -29,6 +29,18 @@ shomei get-id --identity-file local/operator.json | jq -es 'select(length > 0)' 
 ```
 
 Use `shomei init --set-pin` when the key has no FIDO2 PIN. Both examples use the same HTTPS origin and identity file. Run one stack at a time.
+
+### YubiKey 4 on localhost
+
+Both Compose examples enable `allow_yubikey_4` for localhost. YubiKey 4 enrollment verifies Yubico’s U2F attestation. The browser and CLI require a touch for approval. [YubiKey U2F PIN support](https://docs.yubico.com/yesdk/users-manual/application-u2f/u2f-pin.html)
+
+For a fresh demo allowlist, use this enrollment command after building the CLI.
+
+```sh
+shomei init --u2f --account operator --identity-file local/yubikey4-operator.json
+shomei get-id --identity-file local/yubikey4-operator.json | jq -es 'select(length > 0)' > local/config/identities.next \
+  && mv local/config/identities.next local/config/identities.json
+```
 
 ## Click to deploy
 

@@ -60,6 +60,7 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
         tls_key: dir.join("key.pem"),
         state_dir: dir.into(),
         identities_file,
+        allow_yubikey_4: false,
         http_upstream: Some(upstream_name.parse().unwrap()),
         browser_action: None,
         session_ttl_seconds: 600,
