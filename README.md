@@ -94,3 +94,9 @@ Copy `shomei.example.toml` to `local/config/shomei.toml`, set your origin and up
 | `[limits]` | Connection, request, and challenge limits. |
 
 The identity file is a JSON array of public records from `shomei get-id`. Replace it atomically to reload the allowlist. Adding a key preserves existing grants. Removing or replacing a key revokes them. Restarting the proxy invalidates its session cookies.
+
+### Share a gateway across services
+
+One Shomei gateway serves one public HTTPS origin and forwards HTTP to one upstream. Point `http_upstream` at a private router to serve multiple sites and APIs under that origin. For example, the router can send `/dashboard` and `/api/deploy` to different services.
+
+One enrollment covers those routes and an SSH upstream configured on the same gateway. For separate public HTTPS origins, use a separate gateway configuration and enroll a credential for each origin. You can use the same physical YubiKey for each enrollment.
