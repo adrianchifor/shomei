@@ -41,6 +41,7 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
         identities_file: identities_file.clone(),
         allow_yubikey_4: false,
         http_upstream: None,
+        protected_paths: None,
         browser_action: None,
         session_ttl_seconds: 60,
         tcp: None,
@@ -272,6 +273,116 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
 }
 
 #[tokio::test]
+async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        origin: "https://localhost:8443".parse().unwrap(),
+        https_bind: "127.0.0.1:0".parse().unwrap(),
+        tls_cert: "unused".into(),
+        tls_key: "unused".into(),
+        state_dir: dir.path().into(),
+        identities_file: dir.path().join("identities.json"),
+        allow_yubikey_4: false,
+        http_upstream: Some(
+            format!("http://{}", upstream.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        ),
+        protected_paths: Some(vec!["/api/deploy".into()]),
+        browser_action: None,
+        session_ttl_seconds: 60,
+        tcp: None,
+        forward: None,
+        tailscale_ssh: None,
+        limits: Default::default(),
+    };
+    let (auth, signer) = test_auth(
+        &config.origin,
+        &config.state_dir,
+        &config.identities_file,
+        &config.limits,
+        false,
+    );
+    let state = state_with_auth(config, None, auth, None).unwrap();
+    let (cookie, _) = state.sessions.issue(state.auth.generation()).unwrap();
+    let cookie = cookie.to_str().unwrap().split(';').next().unwrap();
+    let router = routes(state);
+    let server = tokio::spawn(async move {
+        let app = Router::new().fallback(|request: Request| async move {
+            assert!(!request.headers().contains_key("x-original-url"));
+            assert!(!request.headers().contains_key(AUTHORIZATION));
+            format!("{} {}", request.method(), request.uri())
+        });
+        axum::serve(upstream, app).await.unwrap();
+    });
+    for (method, path) in [
+        (Method::GET, "/"),
+        (Method::GET, "/assets/%6dain.js"),
+        (Method::POST, "/api/deployments"),
+    ] {
+        let response = send(
+            &router,
+            request(path)
+                .method(method.clone())
+                .header(ACCEPT, "text/html")
+                .header("x-original-url", "/api/deploy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            format!("{method} {path}")
+        );
+    }
+    for path in [
+        "/api/deploy",
+        "/API/DEPLOY",
+        "/api/deploy/",
+        "/api/deploy/jobs",
+        "/api/deploy.json",
+        "/api/%64eploy",
+        "/api%2Fdeploy",
+        "/api/public/../deploy",
+        "/api/deploy;v=1",
+    ] {
+        let response = send(
+            &router,
+            request(path)
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+    let start = send(&router, post_json("/_shomei/api/auth/start", json!({}))).await;
+    assert_eq!(start.status(), StatusCode::OK);
+    let signed = signed_answer(&signer, &json_body(start).await, 1);
+    let approval = format!("Shomei {}", URL_SAFE_NO_PAD.encode(signed.to_string()));
+    let deploy = || {
+        request("/api/deploy?env=staging")
+            .method(Method::POST)
+            .header(AUTHORIZATION, &approval)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let approved = send(&router, deploy()).await;
+    assert_eq!(approved.status(), StatusCode::OK);
+    assert_eq!(
+        approved.into_body().collect().await.unwrap().to_bytes(),
+        "POST /api/deploy?env=staging"
+    );
+    assert_eq!(
+        send(&router, deploy()).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
     const LOCAL: &str = "fd7a:115c:a1e0::51";
     const OTHER: &str = "fd7a:115c:a1e0::52";
@@ -343,6 +454,7 @@ async fn tailscale_approval_is_single_use_and_bound_to_the_calling_device() {
         identities_file: dir.path().join("identities.json"),
         allow_yubikey_4: false,
         http_upstream: None,
+        protected_paths: None,
         browser_action: None,
         session_ttl_seconds: 60,
         tcp: None,
@@ -488,6 +600,7 @@ async fn approves_one_deploy(u2f: bool) {
                 .parse()
                 .unwrap(),
         ),
+        protected_paths: None,
         browser_action: Some(BrowserAction {
             path: "/deploy".into(),
             label: "Deploy service".into(),

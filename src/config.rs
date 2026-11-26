@@ -21,6 +21,7 @@ pub struct Config {
     #[serde(default)]
     pub allow_yubikey_4: bool,
     pub http_upstream: Option<Url>,
+    pub protected_paths: Option<Vec<String>>,
     pub browser_action: Option<BrowserAction>,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
@@ -125,18 +126,10 @@ impl Config {
                 && limits.pending_per_ip <= limits.pending_challenges,
             "invalid capacity limits"
         );
-        if let Some(upstream) = &config.http_upstream {
-            ensure!(
-                matches!(upstream.scheme(), "http" | "https")
-                    && upstream.host().is_some()
-                    && upstream.username().is_empty()
-                    && upstream.password().is_none()
-                    && upstream.path() == "/"
-                    && upstream.query().is_none()
-                    && upstream.fragment().is_none(),
-                "HTTP upstream must be an HTTP or HTTPS origin"
-            );
-        }
+        validate_http_site(
+            config.http_upstream.as_ref(),
+            config.protected_paths.as_deref(),
+        )?;
         if let Some(action) = &config.browser_action {
             ensure!(
                 config.http_upstream.is_some(),
@@ -222,6 +215,56 @@ impl Config {
     }
 }
 
+fn validate_http_site(upstream: Option<&Url>, paths: Option<&[String]>) -> Result<()> {
+    if let Some(upstream) = upstream {
+        ensure!(
+            matches!(upstream.scheme(), "http" | "https")
+                && upstream.host().is_some()
+                && upstream.username().is_empty()
+                && upstream.password().is_none()
+                && upstream.path() == "/"
+                && upstream.query().is_none()
+                && upstream.fragment().is_none(),
+            "HTTP upstream must be an HTTP or HTTPS origin"
+        );
+    }
+    let valid_path = |path: &str| {
+        path.len() <= 1024
+            && !path.ends_with('/')
+            && http_path_is_unambiguous(path)
+            && !http_path_matches(path, "/_shomei")
+    };
+    if let Some(paths) = paths {
+        ensure!(
+            upstream.is_some(),
+            "protected_paths requires an HTTP upstream"
+        );
+        ensure!(
+            !paths.is_empty(),
+            "protected_paths must contain at least one path"
+        );
+        for path in paths {
+            ensure!(valid_path(path), "invalid protected path {path:?}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn http_path_is_unambiguous(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains("//")
+        && path.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_' | b'~')
+        })
+        && !path.split('/').any(|segment| segment.ends_with('.'))
+}
+
+pub(crate) fn http_path_matches(path: &str, prefix: &str) -> bool {
+    path.get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        && matches!(path.as_bytes().get(prefix.len()), None | Some(b'/' | b'.'))
+}
+
 pub fn is_tailnet_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(ip) => ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 0x40,
@@ -282,6 +325,32 @@ fn tailscale_socket() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selective_paths_require_an_http_upstream_and_valid_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shomei.toml");
+        let config = r#"
+origin = "https://localhost:8443"
+tls_cert = "tls.pem"
+tls_key = "tls-key.pem"
+state_dir = "state"
+identities_file = "identities"
+http_upstream = "http://app:8080"
+protected_paths = ["/api/deploy"]
+"#;
+        fs::write(&file, config).unwrap();
+        assert!(Config::load(&file).is_ok());
+        for invalid in [
+            config.replace("[\"/api/deploy\"]", "[]"),
+            config.replace("[\"/api/deploy\"]", "[\"/api//deploy\"]"),
+            config.replace("[\"/api/deploy\"]", "[\"/_SHOMEI\"]"),
+            config.replace("http_upstream = \"http://app:8080\"", ""),
+        ] {
+            fs::write(&file, invalid).unwrap();
+            assert!(Config::load(&file).is_err());
+        }
+    }
 
     #[test]
     fn forward_only_requires_a_nonempty_destination_policy() {

@@ -62,6 +62,7 @@ async fn http_load(identity: &Identity, roots: RootCertStore, dir: &std::path::P
         identities_file,
         allow_yubikey_4: false,
         http_upstream: Some(upstream_name.parse().unwrap()),
+        protected_paths: None,
         browser_action: None,
         session_ttl_seconds: 600,
         tcp: None,

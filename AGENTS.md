@@ -76,6 +76,8 @@ Open the authentication page as a top-level navigation. Shomei sets `frame-ances
 
 ### Require approval for a website action
 
+Add `protected_paths` at the top level to leave the rest of the site public. Listed paths and descendants require a fresh assertion on every request. Matching is case-insensitive, and ambiguous paths also require approval. Include any application route aliases that reach the protected handler.
+
 ```toml
 [browser_action]
 path = "/api/deploy"

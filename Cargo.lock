@@ -2878,6 +2878,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "miniz_oxide",
+ "percent-encoding",
  "rcgen",
  "ring",
  "rpassword",

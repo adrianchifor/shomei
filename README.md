@@ -66,6 +66,7 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 | `[forward]` | Forward listeners for signed HTTP traffic and mTLS TCP traffic, with named destination scopes. |
 | `session_ttl_seconds` | HTTP session lifetime. Defaults to 600 seconds. |
 | `tcp.cert_ttl_seconds` | mTLS certificate lifetime. Defaults to 300 seconds. Active relays close at expiry. |
+| `protected_paths` | Require fresh approval for selected reverse-proxy paths and leave others public. |
 | `[browser_action]` | Exposes an approval page and requires a fresh assertion for HTTP writes. |
 | `[limits]` | Connection, request, and challenge limits. |
 
@@ -74,6 +75,10 @@ Put one `shomei get-id` token per line in the identity file. Use `#` on its own 
 Replace the identity file atomically to reload the allowlist. Removing or replacing a key revokes existing HTTP sessions and TCP relay access. Restarting the proxy invalidates its session cookies.
 
 To protect only selected paths and leave the rest public, route those paths through Shomei at your ingress. Keep the protected backend private. A Shomei reverse proxy requires authentication for all paths it serves.
+
+### Protect selected endpoints
+
+Set `protected_paths = ["/api/deploy"]` alongside `http_upstream`. Listed paths and their descendants require fresh approval. Other paths are public. Omit `protected_paths` to require authentication across the site.
 
 ### Share a gateway across services
 

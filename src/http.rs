@@ -44,7 +44,7 @@ use webauthn_rs::prelude::PublicKeyCredential;
 use crate::{
     accept_tls,
     auth::{ApiError, Auth, Grant, SignedChallenge},
-    config::{BrowserAction, Config},
+    config::{BrowserAction, Config, http_path_is_unambiguous, http_path_matches},
     session::{Sessions, session_value},
     tailscale::TailscaleSsh,
     tls::{Issuer, csr_key},
@@ -59,6 +59,7 @@ pub struct App {
     host: HeaderValue,
     sessions: Sessions,
     upstream: Option<HttpUpstream>,
+    protected_paths: Option<Vec<String>>,
     browser_action: Option<BrowserAction>,
     tcp: Option<TcpAccess>,
     forward: Option<ForwardAccess>,
@@ -168,6 +169,7 @@ fn state_with_auth(
         host,
         sessions: Sessions::new(config.session_ttl_seconds)?,
         upstream,
+        protected_paths: config.protected_paths,
         browser_action: config.browser_action,
         tcp,
         forward: forward
@@ -758,13 +760,17 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
         Ok(signed) => signed,
         Err(error) => return error.into_response(),
     };
-    if app.browser_action.is_some()
-        && signed.is_none()
-        && !matches!(
-            *request.method(),
-            Method::GET | Method::HEAD | Method::OPTIONS
-        )
-    {
+    let fresh_approval = match &app.protected_paths {
+        Some(paths) => path_needs_approval(request.uri().path(), paths),
+        None => {
+            app.browser_action.is_some()
+                && !matches!(
+                    *request.method(),
+                    Method::GET | Method::HEAD | Method::OPTIONS
+                )
+        }
+    };
+    if fresh_approval && signed.is_none() {
         let mut response = ApiError(
             StatusCode::UNAUTHORIZED,
             "a fresh YubiKey approval is required",
@@ -773,7 +779,8 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
         response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
         return response;
     }
-    if signed.is_none()
+    if app.protected_paths.is_none()
+        && signed.is_none()
         && !app
             .sessions
             .verify(request.headers(), app.auth.generation())
@@ -845,6 +852,18 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
     for name in spoofed {
         headers.remove(name);
     }
+    if app.protected_paths.is_some() {
+        for name in [
+            "x-original-url",
+            "x-original-uri",
+            "x-original-path",
+            "x-rewrite-url",
+            "x-rewrite-uri",
+            "x-envoy-original-path",
+        ] {
+            headers.remove(name);
+        }
+    }
     headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     headers.insert("x-forwarded-host", app.host.clone());
     filter_cookies(headers, COOKIE);
@@ -871,6 +890,19 @@ async fn forward(State(app): State<Arc<App>>, mut request: Request) -> Response 
     }
     response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
     response
+}
+
+fn path_needs_approval(path: &str, protected: &[String]) -> bool {
+    let Ok(decoded) = percent_encoding::percent_decode_str(path).decode_utf8() else {
+        return true;
+    };
+    !http_path_is_unambiguous(&decoded)
+        || (decoded.len() != path.len()
+            && decoded.matches('/').count() != path.matches('/').count())
+        || http_path_matches(&decoded, PREFIX)
+        || protected
+            .iter()
+            .any(|prefix| http_path_matches(&decoded, prefix))
 }
 
 fn wants_login(request: &Request) -> bool {

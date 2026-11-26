@@ -8,6 +8,9 @@ allow_yubikey_4 = false  # May be enabled for localhost origins.
 http_upstream = "http://host.docker.internal:8080"
 session_ttl_seconds = 600
 
+# Require fresh approval for these paths and leave other paths public.
+# protected_paths = ["/api/deploy"]
+
 # With http_upstream above, this approves POST http://host.docker.internal:8080/api/deploy.
 # Enabling this requires fresh approval for HTTP writes.
 # [browser_action]
