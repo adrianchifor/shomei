@@ -29,7 +29,7 @@ use url::Url;
 use uuid::Uuid;
 use webauthn_rs::prelude::{PublicKeyCredential, RequestChallengeResponse};
 
-use crate::auth::{ACCOUNT, StaticIdentity, prepare_identity};
+use crate::auth::{ACCOUNT, StaticIdentity, encode_identity, prepare_identity};
 
 #[derive(Parser)]
 #[command(
@@ -53,8 +53,8 @@ enum Command {
     },
     /// Create a credential on a USB YubiKey and save its public identity.
     Init(InitArgs),
-    /// Print the saved public identity as JSON.
-    GetId(IdentityFile),
+    /// Print the saved public identity as a compact allowlist token.
+    GetId(GetIdArgs),
     /// Print a one-use Shomei authorization assertion.
     Sign(Access),
     /// Connect to an allowlisted SSH host through Shomei.
@@ -68,6 +68,15 @@ struct IdentityFile {
     /// Local public identity file. Defaults to ~/.shomei/identity.json.
     #[arg(long)]
     identity_file: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct GetIdArgs {
+    /// Print the public identity as JSON for legacy allowlists.
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    identity: IdentityFile,
 }
 
 impl IdentityFile {
@@ -195,9 +204,14 @@ async fn init(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
-fn get_id(args: IdentityFile) -> Result<()> {
-    let identity = read_identity(args)?;
-    println!("{}", serde_json::to_string(&identity)?);
+fn get_id(args: GetIdArgs) -> Result<()> {
+    let identity = read_identity(args.identity)?;
+    let output = if args.json {
+        serde_json::to_string(&identity)?
+    } else {
+        encode_identity(&identity)?
+    };
+    println!("{output}");
     Ok(())
 }
 

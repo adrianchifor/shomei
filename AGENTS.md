@@ -22,18 +22,30 @@ Use `--set-pin` for a YubiKey 5 with no FIDO2 PIN. For a localhost YubiKey 4 dem
 
 The default public identity is `~/.shomei/identity.json`. `init` defaults to `https://localhost:8443` when the proxy is unspecified. `get-id` reads the local identity and `sign` can use its recorded origin from any working directory. Use `--identity-file` to select a separate identity.
 
-The identity file is a JSON array of public records from `shomei get-id`. To create a new Compose allowlist, run:
+The gateway accepts one `shomei-id-v1:` token per line from `shomei get-id`, with optional `#` labels. To create a new Compose allowlist, run:
 
 ```sh
 umask 077
 mkdir -p local/config
 if [ ! -e local/config/identities.json ]; then
-  shomei get-id | jq -es 'select(length == 1)' > local/config/identities.next \
+  shomei get-id > local/config/identities.next \
     && mv local/config/identities.next local/config/identities.json
 fi
 ```
 
-For an existing allowlist, merge the exported record into the array and replace the file atomically. The gateway reloads it automatically. Removing or replacing a key revokes existing grants.
+Replace the file atomically to add or remove tokens. The gateway reloads it automatically. Removing or replacing a key revokes existing grants. For a JSON array allowlist, `shomei get-id --json` prints a compatible record.
+
+After upgrading the gateway, convert a legacy JSON allowlist in Bash or Zsh with `jq` installed:
+
+```sh
+(
+  set -o pipefail
+  jq -c 'if type == "array" then .[] else error("expected a JSON array") end' local/config/identities.json |
+    while IFS= read -r identity; do
+      printf '%s\n' "$identity" | shomei get-id --identity-file /dev/stdin || exit 1
+    done > local/config/identities.next
+) && mv local/config/identities.next local/config/identities.json
+```
 
 ## Share a gateway across services
 

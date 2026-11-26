@@ -6,10 +6,10 @@ use serde::de::DeserializeOwned;
 #[serde(deny_unknown_fields)]
 pub struct StaticIdentity {
     #[serde(default, alias = "account", skip_serializing_if = "Option::is_none")]
-    attested_label: Option<String>,
+    pub(super) attested_label: Option<String>,
     pub origin: Url,
-    nonce: String,
-    attestation: RegisterPublicKeyCredential,
+    pub(super) nonce: String,
+    pub(super) attestation: RegisterPublicKeyCredential,
 }
 
 pub struct IdentitySetup {

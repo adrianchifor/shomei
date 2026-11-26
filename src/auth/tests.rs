@@ -198,6 +198,16 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     assert!(auth.reload().unwrap());
     assert_eq!(auth.generation(), 0);
 
+    let operator_token = encode_identity(&operator_record).unwrap();
+    let alice_token = encode_identity(&alice_record).unwrap();
+    fs::write(
+        &allowlist,
+        format!("# Deployment keys\r\n\r\n{operator_token} # operator\r\n"),
+    )
+    .unwrap();
+    assert!(!auth.reload().unwrap());
+    assert_eq!(auth.generation(), 0);
+
     let challenge = auth.start_login(Grant::Http, peer).unwrap();
     assert!(
         auth.finish_login(assertion(&challenge, &operator, 0x01, 1))
@@ -224,7 +234,7 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     );
 
     let challenge = auth.start_login(Grant::Http, peer).unwrap();
-    write_records(&allowlist, &[&operator_record, &alice_record]);
+    fs::write(&allowlist, format!("{operator_token}\n{alice_token}\n")).unwrap();
     assert!(auth.reload().unwrap());
     assert_eq!(auth.generation(), 0);
     assert!(matches!(
@@ -233,6 +243,13 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     ));
     assert!(!epoch.has_changed().unwrap());
     assert!(!auth.reload().unwrap());
+
+    fs::write(&allowlist, format!("{operator_token}\n{operator_token}\n")).unwrap();
+    let duplicate = auth.reload().unwrap_err();
+    assert!(
+        format!("{duplicate:#}").contains("identity on line 2: duplicate YubiKey credential ID")
+    );
+    assert_eq!(auth.generation(), 0);
 
     let mut unsigned = serde_json::to_value(&alice_record).unwrap();
     unsigned["attested_label"] = json!("renamed");

@@ -20,7 +20,7 @@ export PATH="$PWD/target/release:$PATH"
 
 ## Local demos
 
-Use Docker Compose, `jq`, and a USB YubiKey. Run the commands from the repository root. Both demos use `https://localhost:8443`, so run one at a time.
+Use Docker Compose and a USB YubiKey. Run the commands from the repository root. Both demos use `https://localhost:8443`, so run one at a time.
 
 ### Set up TLS and enroll a key
 
@@ -37,8 +37,10 @@ mkcert -install
 mkcert -ecdsa -cert-file local/config/tls.pem -key-file local/config/tls-key.pem localhost
 
 shomei init
-shomei get-id | jq -es 'select(length > 0)' > local/config/identities.next \
-  && mv local/config/identities.next local/config/identities.json
+if [ ! -e local/config/identities.json ]; then
+  shomei get-id > local/config/identities.next \
+    && mv local/config/identities.next local/config/identities.json
+fi
 ```
 
 Add `--set-pin` to `shomei init` if your YubiKey 5 has no FIDO2 PIN. For a YubiKey 4, add `--u2f` instead. Both demos enable attested, touch-only U2F for localhost.
@@ -93,7 +95,9 @@ Copy `shomei.example.toml` to `local/config/shomei.toml`, set your origin and up
 | `[browser_action]` | Exposes an approval page and requires a fresh assertion for HTTP writes. |
 | `[limits]` | Connection, request, and challenge limits. |
 
-The identity file is a JSON array of public records from `shomei get-id`. Replace it atomically to reload the allowlist. Adding a key preserves existing grants. Removing or replacing a key revokes them. Restarting the proxy invalidates its session cookies.
+Put one `shomei get-id` token per line in the identity file. Blank lines and `#` comments are allowed. Shomei decodes the compressed records in memory and verifies their hardware attestation. Existing JSON arrays also work. Use `shomei get-id --json` for JSON-based tooling. [Convert an existing allowlist](AGENTS.md#enroll-a-key)
+
+Replace the identity file atomically to reload the allowlist. Adding a key preserves existing grants. Removing or replacing a key revokes them. Restarting the proxy invalidates its session cookies.
 
 ### Share a gateway across services
 

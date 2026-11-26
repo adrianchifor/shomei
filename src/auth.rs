@@ -1,7 +1,9 @@
 mod identity;
+mod identity_list;
 mod u2f;
 
 pub use identity::{StaticIdentity, prepare_identity};
+pub use identity_list::encode_identity;
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -244,14 +246,12 @@ impl Auth {
     }
 
     fn verify_identities(&self, contents: &[u8]) -> Result<Vec<VerifiedIdentity>> {
-        let records: Vec<StaticIdentity> =
-            serde_json::from_slice(contents).context("parse identities JSON array")?;
         let mut credential_ids = HashSet::new();
-        let mut verified = Vec::with_capacity(records.len());
-        for (index, record) in records.into_iter().enumerate() {
+        let mut verified = Vec::new();
+        identity_list::visit_identities(contents, |record| {
             let key = record
                 .verify_for(&self.origin, &self.webauthn, &self.yubikeys)
-                .with_context(|| format!("verify YubiKey identity {}", index + 1))?;
+                .context("verify YubiKey identity")?;
             ensure!(
                 credential_ids.insert(key.cred_id().clone()),
                 "duplicate YubiKey credential ID"
@@ -259,7 +259,8 @@ impl Auth {
             let public_key = key.credential().cred;
             let fingerprint = sha256(&serde_json::to_vec(&(key.cred_id(), public_key))?);
             verified.push(VerifiedIdentity { key, fingerprint });
-        }
+            Ok(())
+        })?;
         Ok(verified)
     }
 
