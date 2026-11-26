@@ -1,26 +1,41 @@
+# Example gateway configuration. A commented "# key = value" line is an optional setting shown
+# with an example value. Keep top-level keys above the first [table].
+
+# Public HTTPS origin, with its port unless that is 443. Keys are enrolled for this origin.
 origin = "https://localhost:8443"
+# Listener for sign-in, reverse HTTP, and forward HTTP. This is the default.
 https_bind = "0.0.0.0:8443"
+# Certificate and private key covering the origin's hostname and any other public hostnames.
 tls_cert = "/etc/shomei/tls.pem"
 tls_key = "/etc/shomei/tls-key.pem"
+# Writable directory for signature counters. Use one per gateway.
 state_dir = "/var/lib/shomei"
+# Allowlist of enrolled keys, reloaded when it changes. One `shomei get-id` token per line.
 identities_file = "/etc/shomei/identities"
-allow_yubikey_4 = false  # May be enabled for localhost origins.
+# Accept YubiKey 4 keys, which need a touch but no PIN. Only allowed with a localhost origin.
+allow_yubikey_4 = false
+
+# Reverse HTTP. Requests for the origin go to this upstream after sign-in.
 # host.docker.internal reaches a service on the Docker host. On Linux it is the Docker bridge
 # address, so bind the service to that address. Binding it to 0.0.0.0 exposes it without Shomei.
 http_upstream = "http://host.docker.internal:8080"
-forwarding = false
-# Set false to allow only TCP forwarding when forwarding is enabled.
-# http_forwarding = true
 # Other public DNS names or IPs for the default upstream. A missing port uses the origin port.
 # hostnames = ["127.0.0.1", "app.example.com"]
+# Lifetime of a signed-in session and of a forward HTTP session. 1 to 3600 seconds.
 session_ttl_seconds = 600
 
-# Require fresh approval for these paths and leave other paths public.
-# protected_paths = ["/api/deploy"]
-# Protected paths default to one approval per request.
-# protected_session_ttl_seconds = 300
-# Override the TTL for a path by using a table entry.
+# Require approval for these paths and the paths below them, and leave the rest of the site
+# public. Omit to require sign-in for the whole site. An entry is a path, or a table that sets
+# its own reuse time.
 # protected_paths = ["/api/jobs", { path = "/api/jobs/production", session_ttl_seconds = 0 }]
+# How long one approval for a protected path can be reused, 0 to 3600 seconds. The default of 0
+# asks for the key on every request.
+# protected_session_ttl_seconds = 300
+
+# Forward requests for destinations that are not reverse sites, within the [scopes] below.
+forwarding = false
+# Set false to forward TCP only.
+# http_forwarding = true
 
 # Additional reverse sites, selected by their public hostname and port.
 # [[http_upstreams]]
@@ -32,35 +47,41 @@ session_ttl_seconds = 600
 # hostname = "dashboard.example.com:8443"
 # upstream = "http://dashboard:3000"
 
-# Named TCP routes use the mTLS listener.
+# Named TCP routes on the mTLS listener: the name clients ask for, and where it goes.
 # [tcp_upstreams]
 # "ssh.example.com:22" = "sshd:2222"
 # "db.example.com:5432" = "postgres:5432"
 
-# Shared mTLS settings. Set upstream for a fixed raw mTLS relay.
+# The mTLS listener for TCP. It starts when upstream, [tcp_upstreams], or forwarding is set.
 # [tcp]
 # bind = "0.0.0.0:9443"
+# Port clients connect to, when it differs from the bind port.
 # public_port = 9443
+# Lifetime of an issued client certificate, 1 to 86400 seconds. Connections close at expiry.
 # cert_ttl_seconds = 300
+# Fixed relay. Every approved connection goes to this one destination.
 # upstream = "host.docker.internal:9000"
+# Name for the fixed relay in `shomei ssh user@deploy`. Requires upstream.
 # ssh_host = "deploy"
 
-# Set forwarding = true above to use these scopes.
-# Replace the example DNS and IP ranges with your own.
+# Destinations that forwarding may reach. Set forwarding = true above to use scopes. Every
+# enrolled key can approve every scope. Replace the example DNS and IP ranges with your own.
 # [scopes.fleet]
+# Optional. The destination must be a name under one of these suffixes and resolve inside cidrs.
 # dns_suffixes = ["internal.example.com"]
 # cidrs = ["10.42.0.0/16", "fd00:42::/48"]
 # ports = [22, 80, 443, 5432]
-# HTTP and HTTPS destinations must also match these protocol-specific lists.
+# HTTP and HTTPS destinations must also match these lists. They default to [80] and [443].
 # http_ports = [80]
 # https_ports = [443]
 
 # Alternative to the scope above. Let the gateway's network policy limit destinations.
+# HTTPS tunnels still check https_ports, which defaults to [443].
 # [scopes.unrestricted]
 # allow_all = true
-# HTTPS CONNECT still uses https_ports, which defaults to [443].
 
-# Use the gateway's MagicDNS origin and TLS certificate, and bind https_bind to its Tailscale IP.
+# Approve direct Tailscale SSH. Use the gateway's MagicDNS name in origin and its TLS
+# certificate, and bind https_bind to its Tailscale IP.
 # [tailscale_ssh]
 # Optional. Clients may only request an approval for this host. The approval itself is not
 # tied to it: tailnet policy decides which hosts the approved device can reach, so require
@@ -70,13 +91,22 @@ session_ttl_seconds = 600
 # oauth_client_id = "your-oauth-client-id"
 # oauth_client_secret_file = "/etc/shomei/tailscale-oauth-secret"
 # socket = "/var/run/tailscale/tailscaled.sock"
+# How long the attribute stays set after an approval, 1 to 3600 seconds.
 # ttl_seconds = 300
 
+# Capacity limits, with their defaults. Each is 1 to 65536, and auth_workers is 1 to 128.
 [limits]
+# Open connections on the HTTPS listener.
 https_connections = 4096
+# Open connections on the mTLS listener.
 tcp_connections = 4096
+# TLS handshakes in progress on each listener.
 tls_handshakes = 512
+# Requests being proxied, and open forward tunnels.
 http_requests = 8192
+# Key verifications running at once. Tailscale approvals share this number.
 auth_workers = 32
+# Sign-in challenges waiting for a key touch.
 pending_challenges = 8192
+# The same per client address, or per /64 for IPv6. At most pending_challenges.
 pending_per_ip = 128

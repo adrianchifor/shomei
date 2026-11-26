@@ -501,6 +501,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shipped_configs_load_and_the_example_names_only_real_settings() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for file in [
+            "shomei.example.toml",
+            "fixtures/deploy/shomei.toml",
+            "fixtures/ssh/shomei.toml",
+        ] {
+            if let Err(error) = Config::load(&root.join(file)) {
+                panic!("{file}: {error:#}");
+            }
+        }
+
+        // Every optional setting the example shows as "# key = value" must still exist.
+        let example = fs::read_to_string(root.join("shomei.example.toml")).unwrap();
+        let is_setting = |line: &str| {
+            let key = |name: &str| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            };
+            (line.starts_with('[') && line.ends_with(']'))
+                || line.starts_with('"')
+                || line.split_once(" = ").is_some_and(|(name, _)| key(name))
+        };
+        let mut optional = 0;
+        let enabled: String = example
+            .lines()
+            .map(|line| match line.strip_prefix("# ") {
+                Some(setting) if is_setting(setting) => {
+                    optional += 1;
+                    setting
+                }
+                _ => line,
+            })
+            .flat_map(|line| [line, "\n"])
+            .collect();
+        assert!(
+            optional > 30,
+            "the example's optional settings were not found"
+        );
+        if let Err(error) = toml::from_str::<Config>(&enabled) {
+            panic!("shomei.example.toml with every setting enabled: {error}");
+        }
+        for table in [
+            "http_upstreams",
+            "tcp_upstreams",
+            "tcp",
+            "scopes.fleet",
+            "tailscale_ssh",
+        ] {
+            assert!(
+                enabled.contains(&format!("\n[{table}]"))
+                    || enabled.contains(&format!("\n[[{table}]]"))
+            );
+        }
+    }
+
+    #[test]
     fn hostless_http_upstreams_need_aliases_when_forwarding_or_multi_site() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("shomei.toml");
