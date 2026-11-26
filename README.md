@@ -7,9 +7,13 @@ Shomei (署名, Japanese for “signature”) is a Rust authentication proxy for
 
 All enrolled keys authenticate as `shomei`. The default policy requires a supported YubiKey 5 Series key with firmware 5.7.4 or later, PIN, and touch.
 
+<p align="center">
+  <img src="docs/yubikey-prompt.png" width="360" alt="Browser prompting for a security key touch on the Shomei sign-in page">
+</p>
+
 ## Quickstart
 
-Start a local deploy API behind Shomei and approve a deploy with your YubiKey. Run the commands in an empty directory with Docker Compose installed. The bundled TLS key is public and for loopback demos only. Use `init --u2f` for a YubiKey 4.
+Start a local deploy API behind Shomei and approve a deploy with your YubiKey. Run the commands in an empty directory with Docker Compose installed. The bundled TLS key is public and for loopback demos only. Use `init --u2f` for a YubiKey 4. Once Compose is up, you can also approve a deploy from a browser that trusts `fixtures/localhost/ca.pem`. [Open Deploy service](https://localhost:8443/_shomei/action)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh
