@@ -832,6 +832,24 @@ struct LoginStart {
     browser_approval: Option<approval::Start>,
 }
 
+const CLI_ONLY: ApiError = ApiError(
+    StatusCode::FORBIDDEN,
+    "this approval is only available to the command line",
+);
+
+/// Whether a browser sent the request. Any page on the gateway origin can
+/// start a challenge, and the person at the key cannot see which grant it
+/// carries, so a script there could ask for a certificate or a forward
+/// session for a key of its own. Those grants are for the CLI. A browser
+/// always sends `Origin` or `Sec-Fetch-Site` with a POST and scripts cannot
+/// remove either; the CLI sends neither.
+fn from_browser(headers: &HeaderMap) -> bool {
+    headers.contains_key(ORIGIN)
+        || headers
+            .keys()
+            .any(|name| name.as_str().starts_with("sec-fetch-"))
+}
+
 async fn login_start(
     State(app): State<Arc<App>>,
     Extension(peer): Extension<Peer>,
@@ -862,6 +880,16 @@ async fn login_start(
                 StatusCode::BAD_REQUEST,
                 "invalid approval destination or client CSR",
             ));
+        }
+        if from_browser(&headers)
+            && (body.client_csr_pem.is_some()
+                || body.forward
+                || body.forward_scope.is_some()
+                || body.http_destination.is_some()
+                || body.tcp_destination.is_some()
+                || body.tcp_target.is_some())
+        {
+            return Err(CLI_ONLY);
         }
         if let Some(browser) = body.browser_approval.take() {
             if !approval::same_origin_browser(&headers, &app.canonical, true) {
@@ -1137,6 +1165,9 @@ async fn login_finish(
                 Ok(Json(serde_json::json!({ "redirect": redirect })).into_response())
             }
             Grant::Tcp(key) => {
+                if from_browser(&headers) {
+                    return Err(CLI_ONLY);
+                }
                 let forward = app
                     .forward
                     .as_ref()
@@ -1163,6 +1194,9 @@ async fn login_finish(
                 "wrong approval endpoint",
             )),
             Grant::Forward { key, scope } => {
+                if from_browser(&headers) {
+                    return Err(CLI_ONLY);
+                }
                 let forward = app
                     .forward
                     .as_ref()
@@ -1185,6 +1219,9 @@ async fn login_finish(
                 .into_response())
             }
             Grant::ForwardHttp { scope } => {
+                if from_browser(&headers) {
+                    return Err(CLI_ONLY);
+                }
                 let forward = app
                     .forward
                     .as_ref()

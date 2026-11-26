@@ -51,7 +51,7 @@ Replace the file atomically to add or remove tokens. The gateway reloads it auto
 
 Use `origin` for WebAuthn enrollment and approval. Point app names at the gateway and cover them in its TLS certificate. Set `hostnames` for aliases of the default `http_upstream`, or configure `[[http_upstreams]]` with `hostname`, `upstream`, and optional `protected_paths`. Reverse routing matches hostname and port. Names without ports inherit the port of `origin`. With one reverse upstream and `forwarding = false`, hostname rules are optional.
 
-For a named reverse API, pass its HTTPS URL to `shomei sign` and send the assertion in `Authorization`. Browser clients use the enrollment origin and return to the app with an app-specific session. [Shared gateway overview](README.md#share-a-gateway-across-services)
+For a named reverse API, pass its HTTPS URL to `shomei sign` and send the assertion in `Authorization`. Browser clients use the enrollment origin and return to the app with an app-specific session. Any page served from `origin` can start a sign-in for any app host, so use a dedicated `origin` hostname with no upstream when the apps do not fully trust each other. Certificates, forward sessions and assertions for a named URL are issued to the CLI only, never to a browser. [Shared gateway overview](README.md#share-a-gateway-across-services)
 
 ## Integrate a website
 

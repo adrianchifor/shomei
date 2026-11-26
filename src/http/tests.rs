@@ -1852,6 +1852,52 @@ async fn approves_one_request(u2f: bool) {
         }
     }
 
+    // A page on the gateway origin can start a challenge, but not for a grant
+    // that leaves the browser: a certificate, a forward session, or an
+    // assertion for another request.
+    let browser = |mut request: Request, header: usize| {
+        let (name, value) = [
+            (ORIGIN, "https://localhost:8443"),
+            (HeaderName::from_static("sec-fetch-site"), "same-origin"),
+        ][header]
+            .clone();
+        request
+            .headers_mut()
+            .insert(name, HeaderValue::from_static(value));
+        request
+    };
+    let cli_only = async |response: Response| {
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let error = json_body(response).await["error"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(error.contains("command line"), "{error}");
+    };
+    for body in [
+        json!({ "forward": true }),
+        json!({ "forward_scope": "fleet" }),
+        json!({ "client_csr_pem": csr, "forward_scope": "fleet" }),
+        json!({ "client_csr_pem": csr, "tcp_target": "deploy" }),
+        json!({ "client_csr_pem": csr }),
+        json!({ "http_destination": "https://localhost:8443/status" }),
+    ] {
+        for header in 0..2 {
+            let start = browser(post_json("/_shomei/api/auth/start", body.clone()), header);
+            cli_only(send(&router, start).await).await;
+        }
+    }
+    let site_login = browser(post_json("/_shomei/api/auth/start", json!({})), 0);
+    assert_eq!(send(&router, site_login).await.status(), StatusCode::OK);
+    let start = post_json(
+        "/_shomei/api/auth/start",
+        json!({ "client_csr_pem": csr, "forward_scope": "fleet" }),
+    );
+    let start = send(&router, start).await;
+    let answer = signed_answer(&signer, &json_body(start).await, 40);
+    let finish = browser(post_json("/_shomei/api/auth/finish", answer), 0);
+    cli_only(send(&router, finish).await).await;
+
     std::fs::write(identities_file, "").unwrap();
     assert!(state.auth.reload().unwrap());
     assert_eq!(
