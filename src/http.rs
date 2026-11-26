@@ -602,7 +602,9 @@ async fn protect_auth(State(app): State<Arc<App>>, request: Request, next: Next)
             })
     };
     let headers = response.headers_mut();
-    headers.insert(CACHE_CONTROL, NO_STORE);
+    if !headers.contains_key(CACHE_CONTROL) {
+        headers.insert(CACHE_CONTROL, NO_STORE);
+    }
     headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
         "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
     ));
@@ -696,38 +698,104 @@ async fn complete_login(
     Ok(([(SET_COOKIE, cookie)], Redirect::to(&ticket.next)).into_response())
 }
 
-async fn script() -> impl IntoResponse {
+const REVALIDATE: &str = "no-cache";
+const KEEP_FOR_A_DAY: &str = "max-age=86400";
+
+/// One tag for every bundled asset. It changes whenever any of them does.
+static ASSETS_TAG: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|| {
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    for asset in [
+        include_bytes!("../assets/auth.js").as_slice(),
+        include_bytes!("../assets/webauthn.js"),
+        include_bytes!("../assets/approval.js"),
+        include_bytes!("../assets/approval.css"),
+        include_bytes!("../assets/approval.html"),
+        include_bytes!("../assets/auth.css"),
+        include_bytes!("../assets/seal.png"),
+        include_bytes!("../assets/geist.woff2"),
+    ] {
+        hash.update(&(asset.len() as u64).to_be_bytes());
+        hash.update(asset);
+    }
+    let tag = format!(
+        "\"{}\"",
+        URL_SAFE_NO_PAD.encode(&hash.finish().as_ref()[..16])
+    );
+    HeaderValue::from_str(&tag).expect("an entity tag is a valid header value")
+});
+
+/// Serves a bundled asset that a browser may keep and check again by tag, so
+/// each sign-in or approval does not download the scripts, image and font.
+pub(crate) fn asset(
+    request: &HeaderMap,
+    content_type: &'static str,
+    cache: &'static str,
+    body: &'static [u8],
+) -> Response {
+    let tag = &*ASSETS_TAG;
+    let current = request
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|candidate| candidate.trim().trim_start_matches("W/").as_bytes() == tag.as_bytes());
+    let validators = [
+        (CACHE_CONTROL, HeaderValue::from_static(cache)),
+        (ETAG, tag.clone()),
+    ];
+    if current {
+        return (StatusCode::NOT_MODIFIED, validators).into_response();
+    }
     (
-        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../assets/auth.js"),
+        validators,
+        [(CONTENT_TYPE, HeaderValue::from_static(content_type))],
+        body,
+    )
+        .into_response()
+}
+
+async fn script(headers: HeaderMap) -> Response {
+    asset(
+        &headers,
+        "text/javascript; charset=utf-8",
+        REVALIDATE,
+        include_bytes!("../assets/auth.js"),
     )
 }
 
-async fn webauthn_script() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../assets/webauthn.js"),
+async fn webauthn_script(headers: HeaderMap) -> Response {
+    asset(
+        &headers,
+        "text/javascript; charset=utf-8",
+        REVALIDATE,
+        include_bytes!("../assets/webauthn.js"),
     )
 }
 
-async fn styles() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../assets/auth.css"),
+async fn styles(headers: HeaderMap) -> Response {
+    asset(
+        &headers,
+        "text/css; charset=utf-8",
+        REVALIDATE,
+        include_bytes!("../assets/auth.css"),
     )
 }
 
-async fn seal() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "image/png")],
-        include_bytes!("../assets/seal.png").as_slice(),
+async fn seal(headers: HeaderMap) -> Response {
+    asset(
+        &headers,
+        "image/png",
+        KEEP_FOR_A_DAY,
+        include_bytes!("../assets/seal.png"),
     )
 }
 
-async fn font() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "font/woff2")],
-        include_bytes!("../assets/geist.woff2").as_slice(),
+async fn font(headers: HeaderMap) -> Response {
+    asset(
+        &headers,
+        "font/woff2",
+        KEEP_FOR_A_DAY,
+        include_bytes!("../assets/geist.woff2"),
     )
 }
 
@@ -1519,10 +1587,15 @@ async fn reverse(
         return StatusCode::BAD_GATEWAY.into_response();
     }
     filter_cookies(response.headers_mut(), SET_COOKIE);
+    // A path the site leaves public keeps the upstream's own cache policy.
+    let public =
+        upstream.protected_paths.is_some() && approval_policy.is_none() && session.is_none();
     if let Some(session) = session {
         response.headers_mut().append(SET_COOKIE, session);
     }
-    response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
+    if !public {
+        response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
+    }
     response
 }
 
