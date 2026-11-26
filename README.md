@@ -53,7 +53,7 @@ Approve with your YubiKey. The command prints `ubuntu`. Omit `-- id -un` for an 
 
 Stop the demo with `docker compose -f compose.ssh.yaml down`.
 
-## Configure your own upstream
+## Run your own gateway
 
 Save the example configuration as `local/config/shomei.toml`, set your origin and upstreams, and create a writable `local/state`. Save the Compose file alongside `local/` and run `docker compose up -d` to start `ghcr.io/adrianchifor/shomei:latest`. Keep upstream listeners private. Use absolute paths in the configuration, because relative paths resolve against the gateway's working directory. [Compose file](compose.yaml) · [Example configuration](shomei.example.toml)
 
@@ -79,9 +79,9 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 | `tcp.cert_ttl_seconds` | mTLS certificate lifetime. Defaults to 300 seconds. Active relays close at expiry. |
 | `[limits]` | Connection, request, and challenge limits. |
 
-When upgrading a gateway with `[forward]`, move its destination rules to `[scopes.NAME]` and set `forwarding = true` if the gateway should forward to unlisted destinations. Move the mTLS bind, public port, and certificate TTL to `[tcp]`. Update the published TCP port to 9443, or set `tcp.bind` and `tcp.public_port` to keep a custom port. Use `http_forwarding = false` in place of `http_enabled = false`. Remove `http_bind` and point HTTP proxy clients at the main HTTPS origin.
+### Manage the allowlist
 
-Put one `shomei get-id` token per line in the `identities` allowlist. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. All keys use the `shomei` account. Shomei decodes the compressed records in memory and verifies their hardware attestation. Existing JSON arrays also work. Use `shomei get-id --json` for JSON-based tooling. [Convert an existing allowlist](AGENTS.md#enroll-a-key)
+Put one `shomei get-id` token per line in the `identities` allowlist. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. All keys use the `shomei` account. Shomei decodes the compressed records in memory and verifies their hardware attestation. [Create the file](AGENTS.md#enroll-a-key)
 
 Replace the identity file atomically to reload the allowlist. Removing or replacing a key revokes existing HTTP sessions and TCP relay access. Restarting the proxy invalidates its session cookies.
 
