@@ -1,0 +1,25 @@
+# The base images and actions are pinned by digest, so nothing updates them
+# unless a pull request does. Cargo dependencies are pinned on purpose and
+# are left to manual review.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directories:
+      - /
+      - /fixtures/ssh
+    schedule:
+      interval: weekly
+    groups:
+      images:
+        patterns: ["*"]
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
