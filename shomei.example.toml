@@ -5,6 +5,8 @@ tls_key = "/etc/shomei/tls-key.pem"
 state_dir = "/var/lib/shomei"
 identities_file = "/etc/shomei/identities"
 allow_yubikey_4 = false  # May be enabled for localhost origins.
+# host.docker.internal reaches a service on the Docker host. On Linux it is the Docker bridge
+# address, so bind the service to that address. Binding it to 0.0.0.0 exposes it without Shomei.
 http_upstream = "http://host.docker.internal:8080"
 forwarding = false
 # Set false to allow only TCP forwarding when forwarding is enabled.
@@ -60,7 +62,9 @@ session_ttl_seconds = 600
 
 # Use the gateway's MagicDNS origin and TLS certificate, and bind https_bind to its Tailscale IP.
 # [tailscale_ssh]
-# Optional fixed SSH destination. Omit to let tailnet policy select the permitted hosts.
+# Optional. Clients may only request an approval for this host. The approval itself is not
+# tied to it: tailnet policy decides which hosts the approved device can reach, so require
+# this posture attribute only on the grant for this host.
 # target = "deploy.example.ts.net"
 # posture_attribute = "custom:shomei_ssh_deploy"
 # oauth_client_id = "your-oauth-client-id"
