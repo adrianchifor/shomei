@@ -225,7 +225,8 @@ impl Auth {
             challenges: Mutex::new(Challenges::new(limits)),
             _lock: lock,
         };
-        let bytes = read_identities(identities_file)?;
+        let bytes = read_identities(identities_file)?
+            .with_context(|| format!("open identities file {}", identities_file.display()))?;
         let verified = auth.verify_identities(&bytes, Err)?;
         auth.devices = RwLock::new(auth.load_devices(verified, &HashMap::new())?);
         auth.last_digest = Mutex::new(sha256(&bytes));
@@ -242,11 +243,12 @@ impl Auth {
 
     /// Applies the identities file if it changed. Records that fail
     /// verification are skipped so they cannot hold back a removal elsewhere
-    /// in the file. A file that cannot be read as a list keeps the last one.
+    /// in the file, and a missing file enrolls no key. Only a file that cannot
+    /// be read at all, or is too large, keeps the last list.
     pub fn reload(&self) -> Result<bool> {
         let (changed, rejected) = self.reload_identities()?;
         for error in rejected.iter().take(MAX_REJECTED_LOGS) {
-            eprintln!("Ignored an invalid YubiKey identity: {error:#}");
+            eprintln!("Identities file: {error:#}");
         }
         if rejected.len() > MAX_REJECTED_LOGS {
             eprintln!(
@@ -262,12 +264,21 @@ impl Auth {
             .last_digest
             .lock()
             .map_err(|_| anyhow::anyhow!("identity reload lock poisoned"))?;
-        let bytes = read_identities(&self.identities_file)?;
+        // An operator who deletes the allowlist means to revoke every key.
+        let found = read_identities(&self.identities_file)?;
+        let missing = found.is_none();
+        let bytes = found.unwrap_or_default();
         let checksum = sha256(&bytes);
         if checksum == *last {
             return Ok((false, Vec::new()));
         }
         let mut rejected = Vec::new();
+        if missing {
+            rejected.push(anyhow::anyhow!(
+                "{} is missing, so no key is enrolled",
+                self.identities_file.display()
+            ));
+        }
         let verified = self
             .verify_identities(&bytes, |error| {
                 rejected.push(error);
@@ -542,18 +553,24 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
         .expect("SHA-256 has 32 bytes")
 }
 
-fn read_identities(path: &Path) -> Result<Vec<u8>> {
+/// Reads the allowlist, or `None` when the file does not exist.
+fn read_identities(path: &Path) -> Result<Option<Vec<u8>>> {
     let mut data = Vec::new();
-    File::open(path)
-        .with_context(|| format!("open identities file {}", path.display()))?
-        .take(MAX_IDENTITIES_BYTES + 1)
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open identities file {}", path.display()));
+        }
+    };
+    file.take(MAX_IDENTITIES_BYTES + 1)
         .read_to_end(&mut data)
         .context("read identities file")?;
     ensure!(
         data.len() as u64 <= MAX_IDENTITIES_BYTES,
         "identities file exceeds size limit"
     );
-    Ok(data)
+    Ok(Some(data))
 }
 
 struct Challenges<T = Pending> {

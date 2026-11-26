@@ -265,9 +265,26 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     );
     assert_eq!(auth.generation(), 0);
 
-    fs::write(&allowlist, [0xff]).unwrap();
+    // Only a file that cannot be read at all keeps the last list.
+    fs::remove_file(&allowlist).unwrap();
+    fs::create_dir(&allowlist).unwrap();
     assert!(auth.reload().is_err());
-    assert!(!auth.reload().unwrap());
+    assert!(auth.reload().is_err());
+    assert_eq!(auth.generation(), 0);
+    fs::remove_dir(&allowlist).unwrap();
+    fs::write(
+        &allowlist,
+        [
+            operator_token.as_bytes(),
+            b"\n\xff\xfe\n",
+            alice_token.as_bytes(),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let (changed, rejected) = auth.reload_identities().unwrap();
+    assert!(!changed);
+    assert!(format!("{:#}", rejected[0]).contains("identity on line 2: identity is not UTF-8"));
     assert_eq!(auth.generation(), 0);
     let challenge = auth.start_login(Grant::Http, peer).unwrap();
     assert!(matches!(
@@ -330,6 +347,16 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     );
     auth.check_challenge_capacity("127.0.0.2".parse().unwrap())
         .unwrap();
+
+    // Deleting the allowlist revokes every key.
+    let generation = auth.generation();
+    fs::remove_file(&allowlist).unwrap();
+    let (changed, rejected) = auth.reload_identities().unwrap();
+    assert!(changed);
+    assert!(format!("{:#}", rejected[0]).contains("is missing"));
+    assert_eq!(auth.generation(), generation + 1);
+    assert!(auth.devices.read().unwrap().is_empty());
+    assert!(!auth.reload().unwrap());
 }
 
 #[test]
