@@ -14,7 +14,7 @@ All enrolled keys authenticate as `shomei`. The default policy requires a suppor
 
 ## Quickstart
 
-Start a local deploy app behind Shomei and approve a deploy with your YubiKey. Run the commands in an empty directory with Docker Compose installed. The bundled TLS key is public and for loopback demos only. Use `init --u2f` for a YubiKey 4. Once Compose is up, you can also click Deploy in a browser that trusts `fixtures/localhost/ca.pem`. [Open the deploy demo](https://localhost:8443/)
+Start a local deploy app behind Shomei and approve a deploy with your YubiKey. Run the commands in an empty directory with Docker Compose installed. The bundled TLS key is public and for loopback demos only. Use `init --u2f` for a YubiKey 4. Once Compose is up, you can also click Deploy in a browser that trusts `fixtures/localhost/ca.pem`. That CA can sign for any site, so trust it in a throwaway browser profile only. [Open the deploy demo](https://localhost:8443/)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh
@@ -55,12 +55,15 @@ Stop the demo with `docker compose -f compose.ssh.yaml down`.
 
 ## Configure your own upstream
 
-Save the example configuration as `local/config/shomei.toml`, set your origin and upstreams, and create a writable `local/state`. Save the Compose file alongside `local/` and run `docker compose up -d` to start `ghcr.io/adrianchifor/shomei:latest`. Keep upstream listeners private. [Compose file](compose.yaml) · [Example configuration](shomei.example.toml)
+Save the example configuration as `local/config/shomei.toml`, set your origin and upstreams, and create a writable `local/state`. Save the Compose file alongside `local/` and run `docker compose up -d` to start `ghcr.io/adrianchifor/shomei:latest`. Keep upstream listeners private. Use absolute paths in the configuration, because relative paths resolve against the gateway's working directory. [Compose file](compose.yaml) · [Example configuration](shomei.example.toml)
 
 | Setting | Purpose |
 | --- | --- |
 | `origin` | Public HTTPS origin, including a nondefault port. Enroll keys for this origin. |
+| `https_bind` | HTTPS listener address. Defaults to `0.0.0.0:8443`. |
 | `tls_cert`, `tls_key` | Gateway TLS certificate and private key. |
+| `identities_file` | Allowlist of enrolled keys. Reloaded when it changes. |
+| `state_dir` | Writable directory for signature counters. One gateway per directory. |
 | `http_upstream` | HTTP or HTTPS origin to forward to. |
 | `hostnames` | Additional reverse hostnames or IPs for the default upstream. |
 | `[[http_upstreams]]` | Reverse sites with a public `hostname` and a private `upstream`. |

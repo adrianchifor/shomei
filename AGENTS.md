@@ -4,9 +4,9 @@ Use Shomei for HTTP authentication, forward HTTP/TCP access, an SSH relay, or di
 
 ## Set up the gateway
 
-1. Use `ghcr.io/adrianchifor/shomei:latest` for the gateway on Linux amd64 or arm64. Set `SHOMEI_IMAGE` to pin a release tag or digest. Run `curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh` on the machine with the YubiKey. The installer places the verified CLI at `~/.local/bin/shomei`. Use that path if `shomei` is outside `PATH`. On Linux the CLI requires `libudev.so.1`. [GitHub Packages](https://github.com/adrianchifor/shomei/pkgs/container/shomei) · [Binary releases](https://github.com/adrianchifor/shomei/releases)
+1. Use `ghcr.io/adrianchifor/shomei:latest` for the gateway on Linux amd64 or arm64. Set `SHOMEI_IMAGE` to pin a release tag or digest. Run `curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh` on the machine with the YubiKey. The installer checks the download against the release's `SHA256SUMS` and places the CLI at `~/.local/bin/shomei`. Use that path if `shomei` is outside `PATH`. On Linux the CLI requires `libudev.so.1`. Release binaries are built on Ubuntu 24.04. On a distribution with an older glibc, build from source with `cargo build --release`. [GitHub Packages](https://github.com/adrianchifor/shomei/pkgs/container/shomei) · [Binary releases](https://github.com/adrianchifor/shomei/releases)
 2. Pick the HTTPS origin clients will use, including any nondefault port. It must use a DNS name. Install a certificate and private key for that hostname. Use the same value for the config’s `origin` and the client’s `SHOMEI_PROXY`. For local TLS and sample stacks, follow the [quickstart](README.md#quickstart).
-3. Copy `shomei.example.toml` to `local/config/shomei.toml` and configure a reverse upstream, forward scope, or direct Tailscale SSH approval. For forward-only, keep the HTTPS authorization listener and remove the reverse upstream settings. [Example configuration](shomei.example.toml)
+3. Copy `shomei.example.toml` to `local/config/shomei.toml` and configure a reverse upstream, forward scope, or direct Tailscale SSH approval. For forward-only, keep the HTTPS authorization listener and remove the reverse upstream settings. Use absolute paths, because relative paths resolve against the gateway's working directory. On Linux, `host.docker.internal` is the Docker bridge address, so bind a host upstream to that address and not to `0.0.0.0`. [Example configuration](shomei.example.toml)
 4. On the gateway host, place the TLS files and the public allowlist from enrollment under `local/config`, and create `local/state`. Set `SHOMEI_UID` and `SHOMEI_GID` to a user that can read the config and write state. Run `docker compose up -d` after the files are in place. The supplied Compose file publishes listeners on loopback. For a native deployment, set the file paths and run `shomei serve path/to/shomei.toml`.
 
 ### Enroll a key
@@ -18,9 +18,9 @@ export SHOMEI_PROXY=https://gateway.example.com:8443
 shomei init
 ```
 
-Use `--set-pin` for a YubiKey 5 with no FIDO2 PIN. For a localhost YubiKey 4 demo, use `--u2f` and set `allow_yubikey_4 = true` in the gateway config. For the bundled demo certificates, pass `--ca-file fixtures/localhost/ca.pem` to `sign` and `ssh`. For other localhost setups the CLI can use the public CA at `~/.shomei/localhost-ca.pem`.
+Use `--set-pin` for a YubiKey 5 with no FIDO2 PIN. For a localhost YubiKey 4 demo, use `--u2f` and set `allow_yubikey_4 = true` in the gateway config. For the bundled demo certificates, pass `--ca-file fixtures/localhost/ca.pem` to `sign`, `mtls`, `connect`, and `ssh`. For other localhost setups the CLI can use the public CA at `~/.shomei/localhost-ca.pem`.
 
-The default public identity is `~/.shomei/identity.json`. `init` defaults to `https://localhost:8443` when the proxy is unspecified. `get-id` reads the local identity and `sign` can use its recorded origin from any working directory. Use `--identity-file` to select a separate identity.
+The default public identity is `~/.shomei/identity.json`. `init` defaults to `https://localhost:8443` when the proxy is unspecified. `get-id` reads the local identity and `sign` can use its recorded origin from any working directory. Use `--identity-file` to select a separate identity. `ssh` always uses the default one.
 
 Use `shomei clear` to delete a local identity after operator confirmation. Revoke gateway access by removing its entry from the allowlist.
 
@@ -100,7 +100,7 @@ Pass `--cacert "$SHOMEI_CA_FILE"` to curl for a private CA. Session cookies belo
 
 Set `forwarding = true` and configure `cidrs` and `ports` in each `[scopes.NAME]`. Optional `dns_suffixes` require a matching DNS name and resolved IP. All enrolled keys can approve all scopes. With one scope, omit `--scope`. With several, select `--scope NAME` when approving.
 
-Set `allow_all = true` in place of CIDRs, DNS suffixes, and ports to allow all reachable destinations. TCP can use any port. The main HTTPS listener routes configured app hosts to their reverse upstreams and forwards other destinations. Set `http_forwarding = false` to disable HTTP forwarding. Plain HTTP checks `http_ports` when configured and defaults to port 80 for restricted scopes. HTTPS CONNECT checks `https_ports` (default 443). Keep those ports limited to HTTPS services because the tunnel can carry any TCP protocol. Keep deployment backends that require per-request approval outside unrestricted egress. [Example configuration](shomei.example.toml)
+Set `allow_all = true` in place of CIDRs, DNS suffixes, and ports to allow all reachable destinations. TCP can use any port. The main HTTPS listener routes configured app hosts to their reverse upstreams and forwards other destinations. Set `http_forwarding = false` to disable HTTP forwarding. Plain HTTP checks `http_ports` when configured and defaults to port 80 for restricted scopes. HTTPS CONNECT checks `https_ports` (default 443). In a restricted scope, `ports` must list the port as well. Keep those ports limited to HTTPS services because the tunnel can carry any TCP protocol. Keep deployment backends that require per-request approval outside unrestricted egress. [Example configuration](shomei.example.toml)
 
 ```sh
 target=https://status.internal.example.com/
@@ -119,7 +119,7 @@ shomei mtls --proxy "$SHOMEI_PROXY" --out ./fleet-cert
 shomei connect --credentials ./fleet-cert --listen 127.0.0.1:15432 db.internal.example.com:5432
 ```
 
-For SSH, run `shomei ssh --proxy "$SHOMEI_PROXY" --credentials ./fleet-cert ubuntu@host.internal.example.com`. Existing SSH host-key checks and user authentication apply. Omit `--credentials` to approve a new in-memory certificate with `connect` or `ssh`. `connect` listens on loopback, where any local process can use the port. Treat the exported directory as private. Active tunnels close on expiry or allowlist revocation.
+For SSH, run `shomei ssh --proxy "$SHOMEI_PROXY" --credentials ./fleet-cert ubuntu@host.internal.example.com`. Existing SSH host-key checks and user authentication apply. Options that Shomei sets, such as `ProxyCommand` and `HostKeyAlias`, take precedence over `--ssh-arg`. Omit `--credentials` to approve a new in-memory certificate with `connect` or `ssh`. `connect` listens on loopback, where any local process can use the port. Treat the exported directory as private. Active tunnels close on expiry or allowlist revocation.
 
 ## Proxy SSH
 
@@ -180,7 +180,7 @@ Choose the caller group and destination tags in tailnet policy. Replace `group:o
 }
 ```
 
-From the caller's Tailscale device, pass the destination as the SSH host. Shomei accepts MagicDNS names and tailnet IPs. Omit `tailscale_ssh.target` to defer destination selection to tailnet policy. Verify the SSH host key through your usual trusted channel.
+From the caller's Tailscale device, pass the destination as the SSH host. Shomei accepts MagicDNS names and tailnet IPs. `tailscale_ssh.target` limits which host a client may request. It does not limit where the approved device can connect. Tailnet policy does, so to approve one host only, require the posture attribute on that host's grant alone. Verify the SSH host key through your usual trusted channel.
 
 ```sh
 shomei ssh --tailscale --proxy https://shomei.example.ts.net:8443 ubuntu@deploy.example.ts.net
