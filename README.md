@@ -85,7 +85,7 @@ Save the example configuration as `local/config/shomei.toml`, set your origin an
 
 Put one `shomei get-id` token per line in the `identities` allowlist. Use `#` on its own line or after a token to label a key, for example `shomei-id-v1:… # alice`. Shomei decodes the compressed records in memory and verifies their hardware attestation. [Create the file](AGENTS.md#enroll-a-key)
 
-Replace the file atomically and the gateway reloads it. Removing or replacing a key revokes existing HTTP sessions and TCP relay access. Restarting the gateway invalidates its session cookies.
+Replace the file atomically and the gateway reloads it. An entry that fails verification is skipped and logged, and deleting the file revokes every key. Removing or replacing a key revokes existing HTTP sessions and TCP relay access. Restarting the gateway invalidates its session cookies.
 
 ### Protect selected endpoints
 

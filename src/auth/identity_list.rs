@@ -114,24 +114,25 @@ fn decode_identity(token: &str, buffer: &mut [u8]) -> Result<(StaticIdentity, us
     Ok((identity, written))
 }
 
-/// Calls `visit` for each record and `reject` for each record that fails to
-/// decode or that `visit` refuses. A file that cannot be split into records
-/// fails as a whole.
+/// Calls `visit` for each record and `reject` for each line that fails to
+/// decode or that `visit` refuses.
 pub(super) fn visit_identities(
     contents: &[u8],
     mut visit: impl FnMut(StaticIdentity) -> Result<()>,
     mut reject: impl FnMut(anyhow::Error) -> Result<()>,
 ) -> Result<()> {
-    let text = std::str::from_utf8(contents).context("identities file must be UTF-8")?;
     let mut buffer = vec![0; MAX_RECORD_BYTES];
     let mut remaining = MAX_IDENTITIES_BYTES as usize;
-    for (index, line) in text.lines().enumerate() {
-        let token = line.split_once('#').map_or(line, |(entry, _)| entry).trim();
-        if token.is_empty() {
+    for (index, line) in contents.split(|byte| *byte == b'\n').enumerate() {
+        let token = std::str::from_utf8(line)
+            .map(|line| line.split_once('#').map_or(line, |(entry, _)| entry).trim());
+        if token.is_ok_and(|token| token.is_empty()) {
             continue;
         }
         let limit = remaining.min(buffer.len());
-        if let Err(error) = decode_identity(token, &mut buffer[..limit])
+        if let Err(error) = token
+            .context("identity is not UTF-8")
+            .and_then(|token| decode_identity(token, &mut buffer[..limit]))
             .and_then(|(record, bytes)| {
                 remaining -= bytes;
                 visit(record)
