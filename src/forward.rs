@@ -18,8 +18,8 @@ use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Deserialize;
 use tokio::{
-    io::{AsyncWriteExt, copy_bidirectional},
-    net::{TcpStream, lookup_host},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes},
+    net::TcpStream,
     sync::{Semaphore, watch},
     time::{Instant, sleep_until, timeout},
 };
@@ -252,9 +252,10 @@ impl Scope {
             Cow::Borrowed(host)
         };
         timeout(Duration::from_secs(5), async {
-            let addresses: Vec<_> = lookup_host((query.as_ref(), port))
+            let addresses: Vec<_> = resolve(query.into_owned(), port)
                 .await
                 .map_err(|_| StatusCode::BAD_GATEWAY)?
+                .into_iter()
                 .filter(|address| {
                     self.allow_all
                         || self
@@ -275,6 +276,26 @@ impl Scope {
         .await
         .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
     }
+}
+
+/// Resolves a destination on a blocking thread. The caller's timeout cannot
+/// stop a lookup that is already running, so the slot is held by the thread
+/// itself: a slow resolver then delays further lookups rather than taking
+/// the blocking threads that verify approvals.
+async fn resolve(host: String, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    static LOOKUPS: Semaphore = Semaphore::const_new(64);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![(ip, port).into()]);
+    }
+    let slot = LOOKUPS.acquire().await.map_err(std::io::Error::other)?;
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+    })
+    .await?
 }
 
 #[cfg(test)]
@@ -300,6 +321,41 @@ mod tests {
         ] {
             assert!(validate_scopes(&toml::from_str(invalid).unwrap()).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn dials_only_addresses_inside_the_scope() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let scope = |cidr: &str| -> Scope {
+            toml::from_str(&format!("cidrs = [\"{cidr}\"]\nports = [{port}]")).unwrap()
+        };
+        let inside = scope("127.0.0.0/8");
+        assert!(inside.dial("127.0.0.1", port).await.is_ok());
+        assert!(inside.dial("localhost", port).await.is_ok());
+        assert_eq!(
+            inside.dial("127.0.0.1", port + 1).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        // A name is judged by the addresses it resolves to, not by how it is written.
+        let outside = scope("10.0.0.0/8");
+        for host in ["127.0.0.1", "localhost"] {
+            assert_eq!(
+                outside.dial(host, port).await.unwrap_err(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            resolve("192.0.2.7".into(), 443).await.unwrap(),
+            ["192.0.2.7:443".parse().unwrap()]
+        );
+        assert!(
+            resolve("localhost".into(), port)
+                .await
+                .unwrap()
+                .iter()
+                .all(|address| address.ip().is_loopback() && address.port() == port)
+        );
     }
 
     #[test]
@@ -349,6 +405,17 @@ mod tests {
         assert_eq!(target(&http, Some(80)), Some(("localhost", 80)));
         assert!(target(&http, None).is_none());
     }
+}
+
+/// Copies both ways with buffers the size of a TLS record. The default 8 KiB
+/// splits every record in two on the way through.
+async fn copy_both<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    const RECORD: usize = 16 * 1024;
+    copy_bidirectional_with_sizes(a, b, RECORD, RECORD).await
 }
 
 #[derive(Clone)]
@@ -407,7 +474,7 @@ pub async fn serve(
             .await
             {
                 let _ = upstream.set_nodelay(true);
-                let _ = copy_bidirectional(&mut stream, &mut upstream).await;
+                let _ = copy_both(&mut stream, &mut upstream).await;
             }
         };
         if approval.until_revoked(relay).await.is_none() {
@@ -572,7 +639,7 @@ async fn proxy(
         tokio::spawn(approval.until_revoked(async move {
             let _permit = permit;
             if let Ok(stream) = upgrade.await {
-                let _ = copy_bidirectional(&mut TokioIo::new(stream), &mut socket).await;
+                let _ = copy_both(&mut TokioIo::new(stream), &mut socket).await;
             }
         }));
         return Ok(StatusCode::OK.into_response());
