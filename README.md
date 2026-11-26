@@ -1,6 +1,6 @@
-# Shomei
+# <img src="assets/seal.png" alt="" width="32" height="32"> Shomei
 
-Shomei is a Rust authentication proxy for HTTP and TCP backed by hardware-attested YubiKeys.
+Shomei (署名, Japanese for “signature”) is a Rust authentication proxy for HTTP and TCP backed by hardware-attested YubiKeys.
 
 - **HTTP** supports browser WebAuthn and one-use CLI assertions, with encrypted session cookies for follow-up requests.
 - **TCP** uses short-lived mTLS certificates. `shomei ssh` uses a certificate to tunnel OpenSSH to a fixed upstream.
