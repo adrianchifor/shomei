@@ -197,6 +197,10 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     write_records(&allowlist, &[&operator_record]);
     assert!(auth.reload().unwrap());
     assert_eq!(auth.generation(), 0);
+    assert!(auth.devices.read().unwrap().values().all(|device| matches!(
+        device.key.credential().attestation.data,
+        ParsedAttestationData::None
+    )));
 
     let operator_token = encode_identity(&operator_record).unwrap();
     let alice_token = encode_identity(&alice_record).unwrap();
