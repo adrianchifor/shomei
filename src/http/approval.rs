@@ -9,10 +9,10 @@ use axum::{
     extract::{Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
-        header::{CONTENT_TYPE, COOKIE, ORIGIN},
+        header::{COOKIE, ORIGIN},
         uri::PathAndQuery,
     },
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::digest;
@@ -364,22 +364,31 @@ pub(super) async fn check(
     })))
 }
 
-pub(super) async fn script() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../../assets/approval.js"),
+pub(super) async fn script(headers: HeaderMap) -> Response {
+    super::asset(
+        &headers,
+        "text/javascript; charset=utf-8",
+        super::REVALIDATE,
+        include_bytes!("../../assets/approval.js"),
     )
 }
 
-pub(super) async fn stylesheet() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../../assets/approval.css"),
+pub(super) async fn stylesheet(headers: HeaderMap) -> Response {
+    super::asset(
+        &headers,
+        "text/css; charset=utf-8",
+        super::REVALIDATE,
+        include_bytes!("../../assets/approval.css"),
     )
 }
 
-pub(super) async fn dialog() -> impl IntoResponse {
-    Html(include_str!("../../assets/approval.html"))
+pub(super) async fn dialog(headers: HeaderMap) -> Response {
+    super::asset(
+        &headers,
+        "text/html; charset=utf-8",
+        super::REVALIDATE,
+        include_bytes!("../../assets/approval.html"),
+    )
 }
 
 pub(super) async fn popup() -> impl IntoResponse {

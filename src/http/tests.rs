@@ -337,7 +337,10 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
         let app = Router::new().fallback(|request: Request| async move {
             assert!(!request.headers().contains_key("x-original-url"));
             assert!(!request.headers().contains_key(AUTHORIZATION));
-            format!("{} {}", request.method(), request.uri())
+            (
+                [(CACHE_CONTROL, "public, max-age=60")],
+                format!("{} {}", request.method(), request.uri()),
+            )
         });
         axum::serve(upstream, app).await.unwrap();
     });
@@ -367,11 +370,68 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CACHE_CONTROL], "public, max-age=60");
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
             format!("{method} {path}")
         );
     }
+    for (path, cache) in [
+        ("/_shomei/approval.js", "no-cache"),
+        ("/_shomei/seal.png", "max-age=86400"),
+    ] {
+        let fresh = send(&router, request(path).body(Body::empty()).unwrap()).await;
+        assert_eq!(fresh.status(), StatusCode::OK);
+        assert_eq!(fresh.headers()[CACHE_CONTROL], cache);
+        assert!(
+            fresh
+                .headers()
+                .contains_key(header::CONTENT_SECURITY_POLICY)
+        );
+        let tag = fresh.headers()[ETAG].clone();
+        assert!(
+            !fresh
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
+        for known in [
+            tag.to_str().unwrap().to_owned(),
+            format!("\"old\", W/{}", tag.to_str().unwrap()),
+        ] {
+            let cached = send(
+                &router,
+                request(path)
+                    .header(IF_NONE_MATCH, known)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(cached.headers()[ETAG], tag);
+            assert!(
+                cached
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .is_empty()
+            );
+        }
+        let stale = request(path).header(IF_NONE_MATCH, "\"old\"");
+        let stale = send(&router, stale.body(Body::empty()).unwrap()).await;
+        assert_eq!(stale.status(), StatusCode::OK);
+    }
+    let login = send(
+        &router,
+        request("/_shomei/login").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(login.headers()[CACHE_CONTROL], "private, no-store");
     for path in [
         "/api/deploy",
         "/API/DEPLOY",
@@ -406,6 +466,7 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
     };
     let approved = send(&router, deploy()).await;
     assert_eq!(approved.status(), StatusCode::OK);
+    assert_eq!(approved.headers()[CACHE_CONTROL], "private, no-store");
     assert_eq!(
         approved.into_body().collect().await.unwrap().to_bytes(),
         "POST /api/deploy?env=staging"
