@@ -12,6 +12,8 @@ All enrolled keys authenticate as `shomei`. The default policy requires a suppor
   <img src="docs/yubikey-prompt.png" width="360" alt="Browser prompting for a security key touch on the Shomei sign-in page">
 </p>
 
+Audited by Mythos. [Audit report](audits/2026-11-security-audit.pdf) · [Pentest](PENTEST.md)
+
 ## Quickstart
 
 Start a local deploy app behind Shomei and approve a deploy with your YubiKey. Run the commands in an empty directory with Docker Compose installed. The bundled TLS key is public and for loopback demos only. Use `init --u2f` for a YubiKey 4. Once Compose is up, you can also click Deploy in a browser that trusts `fixtures/localhost/ca.pem`. That CA can sign for any site, so trust it in a throwaway browser profile only. [Open the deploy demo](https://localhost:8443/)
