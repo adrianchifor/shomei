@@ -94,7 +94,8 @@ forwarding = false
 # How long the attribute stays set after an approval, 1 to 3600 seconds.
 # ttl_seconds = 300
 
-# Capacity limits, with their defaults. Each is 1 to 65536, and auth_workers is 1 to 128.
+# Capacity limits, with their defaults. Each is 1 to 65536, auth_workers is 1 to 128,
+# and per_ip_percent is 1 to 100.
 [limits]
 # Open connections on the HTTPS listener.
 https_connections = 4096
@@ -110,3 +111,6 @@ auth_workers = 32
 pending_challenges = 8192
 # The same per client address, or per /64 for IPv6. At most pending_challenges.
 pending_per_ip = 128
+# The percentage of open connections on each listener, proxied requests and tunnels
+# that one client address, or one /64 for IPv6, may hold.
+per_ip_percent = 25

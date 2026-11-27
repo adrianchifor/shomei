@@ -1,8 +1,10 @@
 pub(crate) mod approval;
+pub(crate) mod stall;
 
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    convert::Infallible,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -39,17 +41,13 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use serde::Deserialize;
-use tokio::{
-    net::TcpStream,
-    sync::{OwnedSemaphorePermit, Semaphore},
-    time::{sleep, timeout},
-};
+use tokio::{net::TcpStream, sync::Semaphore, time::timeout};
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 use webauthn_rs::prelude::PublicKeyCredential;
 
 use crate::{
-    accept_tls,
+    Capacity, Slot, accept_tls,
     auth::{ApiError, Auth, Grant, SignedChallenge},
     config::{Config, Endpoint, HttpUpstreamConfig, ProtectedPath},
     session::{Sessions, session_value},
@@ -78,8 +76,12 @@ pub struct App {
     forward: Option<ForwardAccess>,
     tailscale: Option<TailscaleSsh>,
     auth_workers: Arc<Semaphore>,
-    http_requests: Arc<Semaphore>,
-    https_tunnels: Arc<Semaphore>,
+    http_requests: Capacity,
+    /// Open connections on the HTTPS listener.
+    pub(crate) connections: Capacity,
+    /// Reverse tunnels, which count against the same client shares as the
+    /// connections, since each one serves a connection of its own.
+    https_tunnels: Capacity,
 }
 
 struct ForwardAccess {
@@ -87,6 +89,8 @@ struct ForwardAccess {
     endpoint: String,
     http_sessions: Vec<Sessions>,
     http_ttl: u64,
+    /// The gateway's forward request slots, with client shares of their own.
+    requests: Capacity,
 }
 
 #[derive(Clone, Copy)]
@@ -104,10 +108,7 @@ struct LoginTicket {
 
 impl Peer {
     fn challenge_key(self) -> IpAddr {
-        match self.0 {
-            IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))),
-            ip => ip,
-        }
+        crate::client_key(self.0)
     }
 }
 
@@ -234,6 +235,10 @@ fn state_with_auth(
         .http2_max_header_list_size(32 * 1024)
         .build(connector);
     let hostnames = hosts.iter().map(|host| host.host.clone()).collect();
+    let connections = Capacity::new(
+        config.limits.https_connections,
+        config.limits.per_ip_percent,
+    );
     Ok(Arc::new(App {
         auth: Arc::new(auth),
         origin: config.origin.origin().ascii_serialization(),
@@ -260,6 +265,9 @@ fn state_with_auth(
                     Vec::new()
                 };
                 Ok(ForwardAccess {
+                    requests: gateway
+                        .requests
+                        .with_shares(config.limits.http_requests, config.limits.per_ip_percent),
                     endpoint: format!(
                         "{hostname}:{}",
                         gateway.tcp.public_port.unwrap_or(gateway.tcp.bind.port())
@@ -283,8 +291,9 @@ fn state_with_auth(
             })
             .transpose()?,
         auth_workers: Arc::new(Semaphore::new(config.limits.auth_workers)),
-        http_requests: Arc::new(Semaphore::new(config.limits.http_requests)),
-        https_tunnels: Arc::new(Semaphore::new(config.limits.https_connections)),
+        http_requests: Capacity::new(config.limits.http_requests, config.limits.per_ip_percent),
+        https_tunnels: connections.with_slots(config.limits.https_connections),
+        connections,
     }))
 }
 
@@ -334,14 +343,18 @@ pub async fn serve(
     let peer = peer.ip().to_canonical();
     let requests = Arc::new(AtomicU64::new(0));
     let started = requests.clone();
+    let stalls = stall::Stalls::new();
+    let tracker = stalls.clone();
     let service = service_fn(move |mut request: hyper::Request<Incoming>| {
         started.fetch_add(1, Ordering::Relaxed);
+        let in_flight = tracker.begin();
         request.extensions_mut().insert(Peer(peer));
+        request.extensions_mut().insert(tracker.clone());
         let state = state.clone();
         let app = app.clone();
         let tls = tls.clone();
         let handshakes = handshakes.clone();
-        async move {
+        let handled = async move {
             let origin_form = request.uri().authority().is_none();
             let authority = if origin_form {
                 let mut hosts = request.headers().get_all(HOST).iter();
@@ -373,12 +386,13 @@ pub async fn serve(
                         if !crate::forward::valid_connect(&request) {
                             return Ok(StatusCode::BAD_REQUEST.into_response());
                         }
-                        let Ok(slot) = state.https_tunnels.clone().try_acquire_owned() else {
+                        let Some(slot) = state.https_tunnels.try_acquire(Some(peer)) else {
                             return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response());
                         };
+                        let tunnel = stall::Stalls::tunnel(&request);
                         let upgrade = hyper::upgrade::on(&mut request);
                         tokio::spawn(async move {
-                            let _slot = slot;
+                            let _held = (slot, tunnel);
                             serve_reverse_tunnel(upgrade, tls, endpoint, app, peer, handshakes)
                                 .await;
                         });
@@ -405,6 +419,8 @@ pub async fn serve(
                         }
                         return Ok(crate::forward::proxy_http(
                             request,
+                            gateway.requests.clone(),
+                            peer,
                             gateway.gateway.clone(),
                             state,
                         )
@@ -413,48 +429,24 @@ pub async fn serve(
                 }
             }
             app.call(request).await
-        }
+        };
+        async move { Ok::<_, Infallible>(in_flight.track(handled.await?)) }
     });
-    if stream.get_ref().1.alpn_protocol() == Some(b"h2") {
+    let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+    let io = TokioIo::new(stalls.watch_io(stream));
+    if h2 {
         let builder = http2();
-        let connection = builder.serve_connection(TokioIo::new(stream), service);
-        until_idle(connection, &requests, |connection| {
+        let connection = builder.serve_connection(io, service);
+        stall::watch(connection, &stalls, Some(&requests), |connection| {
             connection.graceful_shutdown()
         })
         .await;
     } else {
-        let _ = crate::forward::http1()
-            .serve_connection(TokioIo::new(stream), service)
-            .with_upgrades()
-            .await;
+        let connection = crate::forward::http1()
+            .serve_connection(io, service)
+            .with_upgrades();
+        stall::watch(connection, &stalls, None, |_| {}).await;
     }
-}
-
-/// Drives an HTTP/2 connection and starts a graceful shutdown once no request
-/// has arrived for `HTTP2_IDLE`. HTTP/2 has no idle timeout of its own, so a
-/// silent connection would otherwise hold its slot for as long as the peer
-/// answers pings. Requests already in flight finish first.
-async fn until_idle<C: Future>(
-    connection: C,
-    requests: &AtomicU64,
-    shutdown: impl Fn(std::pin::Pin<&mut C>),
-) {
-    let mut connection = std::pin::pin!(connection);
-    let mut seen = 0;
-    loop {
-        tokio::select! {
-            _ = connection.as_mut() => return,
-            () = sleep(HTTP2_IDLE) => {
-                let started = requests.load(Ordering::Relaxed);
-                if started == seen {
-                    break;
-                }
-                seen = started;
-            }
-        }
-    }
-    shutdown(connection.as_mut());
-    connection.await;
 }
 
 fn http2() -> auto::Builder<TokioExecutor> {
@@ -487,31 +479,37 @@ async fn serve_reverse_tunnel(
     };
     let requests = Arc::new(AtomicU64::new(0));
     let started = requests.clone();
+    let stalls = stall::Stalls::new();
+    let tracker = stalls.clone();
     let service = service_fn(move |mut request: hyper::Request<Incoming>| {
         started.fetch_add(1, Ordering::Relaxed);
+        let in_flight = tracker.begin();
         let expected = host.clone();
         let app = app.clone();
         async move {
-            if reverse_endpoint(&request).as_ref() != Some(&expected)
+            let response = if reverse_endpoint(&request).as_ref() != Some(&expected)
                 || request.method() == Method::CONNECT
             {
-                return Ok(StatusCode::MISDIRECTED_REQUEST.into_response());
-            }
-            request.extensions_mut().insert(Peer(peer));
-            app.call(request).await
+                StatusCode::MISDIRECTED_REQUEST.into_response()
+            } else {
+                request.extensions_mut().insert(Peer(peer));
+                app.call(request).await?
+            };
+            Ok::<_, Infallible>(in_flight.track(response))
         }
     });
-    if stream.get_ref().1.alpn_protocol() == Some(b"h2") {
+    let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+    let io = TokioIo::new(stalls.watch_io(stream));
+    if h2 {
         let builder = http2();
-        let connection = builder.serve_connection(TokioIo::new(stream), service);
-        until_idle(connection, &requests, |connection| {
+        let connection = builder.serve_connection(io, service);
+        stall::watch(connection, &stalls, Some(&requests), |connection| {
             connection.graceful_shutdown()
         })
         .await;
     } else {
-        let _ = crate::forward::http1()
-            .serve_connection(TokioIo::new(stream), service)
-            .await;
+        let connection = crate::forward::http1().serve_connection(io, service);
+        stall::watch(connection, &stalls, None, |_| {}).await;
     }
 }
 
@@ -1519,7 +1517,8 @@ async fn reverse(
     if strip_hop_headers(request.headers_mut()).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let Ok(permit) = app.http_requests.clone().try_acquire_owned() else {
+    let client = request.extensions().get::<Peer>().map(|peer| peer.0);
+    let Some(permit) = app.http_requests.try_acquire(client) else {
         return ApiError(StatusCode::SERVICE_UNAVAILABLE, "HTTP relay busy").into_response();
     };
     let session = if let Some(signed) = signed {
@@ -1780,7 +1779,7 @@ pub(crate) async fn response_head<F: Future>(
     }
 }
 
-pub(crate) fn relay_body(body: Body, permit: Option<OwnedSemaphorePermit>) -> Body {
+pub(crate) fn relay_body(body: Body, permit: Option<Slot>) -> Body {
     Body::new(body.map_frame(move |frame| {
         let _permit = &permit;
         if frame.is_trailers() {

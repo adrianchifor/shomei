@@ -5,7 +5,10 @@ use http_body_util::{Empty, Full};
 use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use serde_json::{Value, json};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::{
+    net::{TcpListener, UnixListener},
+    time::sleep,
+};
 use tokio_rustls::TlsConnector;
 use tower::ServiceExt;
 
@@ -108,11 +111,20 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
     });
     let http_server = tokio::spawn(async move {
         let app = Router::new().fallback(move |request: Request| async move {
+            if request.uri() == "/proxy" {
+                // An upstream proxy's own challenge.
+                return (
+                    StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                    [(PROXY_AUTHENTICATE, "Basic")],
+                    "upstream",
+                )
+                    .into_response();
+            }
             assert_eq!(request.uri(), "/path?q=1");
             assert_eq!(request.headers()[HOST], plain_addr.to_string());
             assert_eq!(request.headers()[AUTHORIZATION], "Bearer upstream");
             assert!(!request.headers().contains_key(PROXY_AUTHORIZATION));
-            "forwarded"
+            "forwarded".into_response()
         });
         axum::serve(plain, app).await.unwrap();
     });
@@ -213,6 +225,17 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
     assert_eq!(
         approved.into_body().collect().await.unwrap().to_bytes(),
         "forwarded"
+    );
+    let upstream_challenge = hyper::Request::get(format!("http://{plain_addr}/proxy"))
+        .header(PROXY_AUTHORIZATION, &authorization)
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let relayed = client.send_request(upstream_challenge).await.unwrap();
+    assert_eq!(relayed.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    assert!(!relayed.headers().contains_key(PROXY_AUTHENTICATE));
+    assert_eq!(
+        relayed.into_body().collect().await.unwrap().to_bytes(),
+        "upstream"
     );
 
     let csr = CertificateParams::default()
@@ -1972,7 +1995,8 @@ async fn idle_connections_release_handshake_and_http2_slots() {
                     Ok::<_, std::convert::Infallible>(hyper::Response::new(Empty::<Bytes>::new()))
                 });
                 let connection = builder.serve_connection(TokioIo::new(stream), service);
-                until_idle(connection, &requests, |connection| {
+                let stalls = stall::Stalls::new();
+                stall::watch(connection, &stalls, Some(&requests), |connection| {
                     connection.graceful_shutdown()
                 })
                 .await;

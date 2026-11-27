@@ -26,7 +26,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
-    accept_tls,
+    Capacity, accept_tls,
     config::{Endpoint, TcpConfig},
     http::{
         App, UPSTREAM_TIMEOUT, approve_forward_http, relay_body, response_head, strip_hop_headers,
@@ -139,7 +139,9 @@ pub struct Gateway {
     scope_names: Vec<String>,
     tcp_targets: HashMap<Endpoint, usize>,
     tcp_upstreams: Vec<Endpoint>,
-    requests: Arc<Semaphore>,
+    /// Forwarded requests and tunnels. Those from the HTTPS listener also count
+    /// against client shares, through `http::ForwardAccess`.
+    pub(crate) requests: Capacity,
 }
 
 impl Gateway {
@@ -152,7 +154,7 @@ impl Gateway {
             scope_names,
             tcp_targets: HashMap::new(),
             tcp_upstreams: Vec::new(),
-            requests: Arc::new(Semaphore::new(requests)),
+            requests: Capacity::new(requests, 100),
         })
     }
 
@@ -496,7 +498,7 @@ pub async fn serve(
         let gateway = gateway.clone();
         let approval = handler_approval.clone();
         async move {
-            let result = proxy(request, gateway, scope, approval, true).await;
+            let result = proxy(request, gateway, scope, approval, None).await;
             Ok::<_, Infallible>(result.unwrap_or_else(IntoResponse::into_response))
         }
     });
@@ -511,6 +513,8 @@ pub async fn serve(
 
 pub async fn proxy_http(
     request: hyper::Request<Incoming>,
+    requests: Capacity,
+    client: IpAddr,
     gateway: Arc<Gateway>,
     app: Arc<App>,
 ) -> Response<Body> {
@@ -522,21 +526,28 @@ pub async fn proxy_http(
             allowed,
             deadline: Instant::now() + lifetime,
         };
+        let client = Some((requests, client));
         approval
             .clone()
-            .until_revoked(proxy(request, gateway, scope, approval, false))
+            .until_revoked(proxy(request, gateway, scope, approval, client))
             .await
             .unwrap_or(Err(StatusCode::PROXY_AUTHENTICATION_REQUIRED))
     }
     .await;
-    let mut response = result.unwrap_or_else(IntoResponse::into_response);
-    if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-        response.headers_mut().insert(
-            header::PROXY_AUTHENTICATE,
-            header::HeaderValue::from_static("Shomei"),
-        );
+    match result {
+        // An upstream's own 407 is relayed without the gateway's challenge.
+        Ok(response) => response,
+        Err(status) => {
+            let mut response = status.into_response();
+            if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+                response.headers_mut().insert(
+                    header::PROXY_AUTHENTICATE,
+                    header::HeaderValue::from_static("Shomei"),
+                );
+            }
+            response
+        }
     }
-    response
 }
 
 pub(crate) fn http1() -> hyper::server::conn::http1::Builder {
@@ -560,13 +571,17 @@ pub(crate) fn valid_connect<B>(request: &hyper::Request<B>) -> bool {
             .all(|length| length == "0")
 }
 
+/// Proxies a request from the mTLS listener, or with `client` from the HTTPS
+/// listener, where the request counts against the client's share of
+/// `requests`.
 async fn proxy(
     mut request: hyper::Request<Incoming>,
     gateway: Arc<Gateway>,
     scope: usize,
     approval: Approval,
-    tcp_only: bool,
+    client: Option<(Capacity, IpAddr)>,
 ) -> Result<Response<Body>, StatusCode> {
+    let tcp_only = client.is_none();
     let connect = request.method() == Method::CONNECT;
     if tcp_only && !connect {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
@@ -605,11 +620,11 @@ async fn proxy(
         .build()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     strip_hop_headers(request.headers_mut()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let permit = gateway
-        .requests
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let permit = match client {
+        Some((requests, client)) => requests.try_acquire(Some(client)),
+        None => gateway.requests.try_acquire(None),
+    }
+    .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let mut socket = if tcp_only {
         match (tcp_target, gateway.tcp_upstream(scope)) {
             (Some(id), Some(upstream)) if id == scope => {
@@ -641,9 +656,10 @@ async fn proxy(
         rules.dial(&host, port).await?
     };
     if connect {
+        let tunnel = crate::http::stall::Stalls::tunnel(&request);
         let upgrade = hyper::upgrade::on(&mut request);
         tokio::spawn(approval.until_revoked(async move {
-            let _permit = permit;
+            let _held = (permit, tunnel);
             if let Ok(stream) = upgrade.await {
                 let _ = copy_both(&mut TokioIo::new(stream), &mut socket).await;
             }
