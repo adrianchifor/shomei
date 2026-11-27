@@ -11,7 +11,7 @@ Use Shomei for HTTP authentication, forward HTTP/TCP access, an SSH relay, or di
    curl -fsSL https://raw.githubusercontent.com/adrianchifor/shomei/main/install.sh | sh
    ```
 
-   The installer checks the download against the release's `SHA256SUMS` and places the CLI at `~/.local/bin/shomei`. Use that path if `shomei` is outside `PATH`. On Linux the CLI requires `libudev.so.1`. Release binaries are built on Ubuntu 24.04. On a distribution with an older glibc, build from source with `cargo build --release`.
+   The installer checks the download against the release's `SHA256SUMS`. When the GitHub CLI (`gh`) is installed and signed in, it also verifies that this repository's release workflow built the binary, and installs nothing if that fails. It places the CLI at `~/.local/bin/shomei`. Use that path if `shomei` is outside `PATH`. On Linux the CLI requires `libudev.so.1`. Release binaries are built on Ubuntu 24.04. On a distribution with an older glibc, build from source with `cargo build --release`.
 3. Pick the HTTPS origin clients will use, including any nondefault port. It must use a DNS name. Install a certificate and private key for that hostname. Use the same value for the config’s `origin` and the client’s `SHOMEI_PROXY`. For local TLS and sample stacks, follow the [quickstart](README.md#quickstart).
 4. Copy `shomei.example.toml` to `local/config/shomei.toml` and configure a reverse upstream, forward scope, or direct Tailscale SSH approval. [Example configuration](shomei.example.toml)
    - For forward-only, keep the HTTPS authorization listener and remove the reverse upstream settings.
