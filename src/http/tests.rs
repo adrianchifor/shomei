@@ -428,6 +428,11 @@ async fn selective_paths_require_fresh_approval_and_other_paths_are_public() {
         let stale = send(&router, stale.body(Body::empty()).unwrap()).await;
         assert_eq!(stale.status(), StatusCode::OK);
     }
+    let worker = request("/sw.js").header("service-worker", "script");
+    let worker = send(&router, worker.body(Body::empty()).unwrap()).await;
+    assert_eq!(worker.status(), StatusCode::FORBIDDEN);
+    let script = send(&router, request("/sw.js").body(Body::empty()).unwrap()).await;
+    assert_eq!(script.status(), StatusCode::OK);
     let login = send(
         &router,
         request("/_shomei/login").body(Body::empty()).unwrap(),
@@ -943,6 +948,10 @@ async fn routes_sites_by_authority_and_keeps_their_approvals_separate() {
         resp.into_body().collect().await.unwrap().to_bytes(),
         "public GET /status"
     );
+    // An app on its own hostname may still install a service worker.
+    let worker = hosted(public_host, "/sw.js").header("service-worker", "script");
+    let worker = send(&router, worker.body(Body::empty()).unwrap()).await;
+    assert_eq!(worker.status(), StatusCode::OK);
     let resp = send(
         &router,
         hosted(public_host, payload).body(Body::empty()).unwrap(),

@@ -147,7 +147,7 @@ upstream = "http://dashboard:3000"
 "db.example.com:5432" = "postgres:5432"
 ```
 
-Enroll once at `origin`. Browser sign-in for other app hosts opens that origin and returns with a session for the app. A page served from `origin` can therefore ask for a sign-in to any app host, and the key prompt looks the same. When apps do not fully trust each other, give `origin` a hostname of its own with no upstream. For a named reverse API, use `shomei sign https://deploy.example.com/api/deploy` and send the assertion in `Authorization`. A named TCP route uses `shomei connect host:port` or `shomei ssh user@host` and issues a certificate bound to that route.
+Enroll once at `origin`. Browser sign-in for other app hosts opens that origin and returns with a session for the app. A page served from `origin` can therefore ask for a sign-in to any app host, and the key prompt looks the same. When apps do not fully trust each other, give `origin` a hostname of its own with no upstream. Shomei refuses service worker scripts on `origin`, because a worker there would control the sign-in page for every app. An app that needs one must be served from its own hostname. For a named reverse API, use `shomei sign https://deploy.example.com/api/deploy` and send the assertion in `Authorization`. A named TCP route uses `shomei connect host:port` or `shomei ssh user@host` and issues a certificate bound to that route.
 
 ## Forward to a fleet
 

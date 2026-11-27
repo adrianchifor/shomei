@@ -17,10 +17,11 @@ function framedByAnotherSite() {
   }
 }
 
+// The whole target is shown, however long: a cut-off prompt would hide part
+// of what the touch approves.
 function describe(details, withHost) {
-  const path = details.request.path;
   const host = withHost ? String(details.host).replace(/:443$/, "") : "";
-  return details.request.method + " " + host + (path.length > 160 ? path.slice(0, 159) + "…" : path);
+  return details.request.method + " " + host + details.request.path;
 }
 
 async function authorize(details, signal) {
