@@ -112,7 +112,6 @@ async fn http_forward_requires_signed_approvals_or_scoped_sessions() {
     let http_server = tokio::spawn(async move {
         let app = Router::new().fallback(move |request: Request| async move {
             if request.uri() == "/proxy" {
-                // An upstream proxy's own challenge.
                 return (
                     StatusCode::PROXY_AUTHENTICATION_REQUIRED,
                     [(PROXY_AUTHENTICATE, "Basic")],
@@ -971,7 +970,6 @@ async fn routes_sites_by_authority_and_keeps_their_approvals_separate() {
         resp.into_body().collect().await.unwrap().to_bytes(),
         "public GET /status"
     );
-    // An app on its own hostname may still install a service worker.
     let worker = hosted(public_host, "/sw.js").header("service-worker", "script");
     let worker = send(&router, worker.body(Body::empty()).unwrap()).await;
     assert_eq!(worker.status(), StatusCode::OK);
@@ -1489,7 +1487,6 @@ async fn tailscale_approval_rejects_the_gateway_and_bounds_api_calls() {
     };
     let begin = || send_as(START, json!({ "target": TARGET }), LOCAL);
 
-    // Ineligible peers are refused before they can take an approval slot.
     let requests = &state.tailscale.as_ref().unwrap().requests;
     let slots = requests
         .try_acquire_many(requests.available_permits().try_into().unwrap())
@@ -1505,7 +1502,6 @@ async fn tailscale_approval_rejects_the_gateway_and_bounds_api_calls() {
     assert_eq!(begin().await.status(), StatusCode::SERVICE_UNAVAILABLE);
     drop(slots);
 
-    // The gateway cannot approve itself, for example through the forward proxy.
     assert_eq!(
         send_as(START, json!({ "target": TARGET }), GATEWAY)
             .await
@@ -1518,7 +1514,6 @@ async fn tailscale_approval_rejects_the_gateway_and_bounds_api_calls() {
         StatusCode::FORBIDDEN
     );
 
-    // A fully qualified target with a trailing dot matches the configured name.
     for target in ["deploy.example.ts.net.", "Deploy.Example.ts.net"] {
         assert_eq!(
             send_as(START, json!({ "target": target }), LOCAL)
@@ -1534,8 +1529,6 @@ async fn tailscale_approval_rejects_the_gateway_and_bounds_api_calls() {
         StatusCode::FORBIDDEN
     );
 
-    // A stalled token refresh times out with a distinct error, and releases
-    // the token lock without caching anything.
     stall_token.store(true, Ordering::SeqCst);
     for counter in [2, 3] {
         let answer = signed_answer(&signer, &json_body(begin().await).await, counter);
@@ -1550,7 +1543,6 @@ async fn tailscale_approval_rejects_the_gateway_and_bounds_api_calls() {
     }
     stall_token.store(false, Ordering::SeqCst);
 
-    // A stalled posture call times out the same way.
     stall_posture.store(true, Ordering::SeqCst);
     let answer = signed_answer(&signer, &json_body(begin().await).await, 4);
     assert_eq!(
@@ -1884,9 +1876,6 @@ async fn approves_one_request(u2f: bool) {
         }
     }
 
-    // A page on the gateway origin can start a challenge, but not for a grant
-    // that leaves the browser: a certificate, a forward session, or an
-    // assertion for another request.
     let browser = |mut request: Request, header: usize| {
         let (name, value) = [
             (ORIGIN, "https://localhost:8443"),

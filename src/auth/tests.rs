@@ -265,7 +265,6 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     );
     assert_eq!(auth.generation(), 0);
 
-    // Only a file that cannot be read at all keeps the last list.
     fs::remove_file(&allowlist).unwrap();
     fs::create_dir(&allowlist).unwrap();
     assert!(auth.reload().is_err());
@@ -348,7 +347,6 @@ fn reloads_identities_and_consumes_single_use_challenges() {
     auth.check_challenge_capacity("127.0.0.2".parse().unwrap())
         .unwrap();
 
-    // Deleting the allowlist revokes every key.
     let generation = auth.generation();
     fs::remove_file(&allowlist).unwrap();
     let (changed, rejected) = auth.reload_identities().unwrap();

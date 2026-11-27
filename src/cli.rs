@@ -412,7 +412,6 @@ impl Gateway {
         self.sign_challenge("start", &body, &purpose).await
     }
 
-    /// Asks for the YubiKey after telling the operator what the touch grants.
     async fn sign_challenge(
         &self,
         step: &str,

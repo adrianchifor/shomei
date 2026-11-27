@@ -514,7 +514,6 @@ mod tests {
             }
         }
 
-        // Every optional setting the example shows as "# key = value" must still exist.
         let example = fs::read_to_string(root.join("shomei.example.toml")).unwrap();
         let is_setting = |line: &str| {
             let key = |name: &str| {

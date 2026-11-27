@@ -114,8 +114,6 @@ fn decode_identity(token: &str, buffer: &mut [u8]) -> Result<(StaticIdentity, us
     Ok((identity, written))
 }
 
-/// Calls `visit` for each record and `reject` for each line that fails to
-/// decode or that `visit` refuses.
 pub(super) fn visit_identities(
     contents: &[u8],
     mut visit: impl FnMut(StaticIdentity) -> Result<()>,
