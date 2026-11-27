@@ -391,7 +391,7 @@ fn a_full_challenge_store_evicts_from_the_peer_holding_the_most() {
     assert!(challenges.peers.is_empty() && challenges.expirations.is_empty());
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
     root: Certificate,
     intermediate: Certificate,
     leaf: Certificate,
@@ -400,7 +400,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let root_key = p256();
         let mut params = certificate("Fixture CA");
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
@@ -425,6 +425,18 @@ impl Fixture {
             attestation_key,
             model,
         }
+    }
+
+    /// Loads the gateway's authenticator with this fixture's attestation root
+    /// in place of Yubico's, so software keys provisioned here can enroll.
+    pub(crate) fn load_auth(
+        &self,
+        origin: &Url,
+        state_dir: &Path,
+        identities_file: &Path,
+        limits: &Limits,
+    ) -> Result<Auth> {
+        Auth::load(origin, state_dir, identities_file, limits, self.policy())
     }
 
     fn policy(&self) -> YubikeyPolicy {
@@ -463,7 +475,7 @@ impl Fixture {
         )
     }
 
-    fn provision(&self, origin: &Url, name: &str, key: &KeyPair) -> StaticIdentity {
+    pub(crate) fn provision(&self, origin: &Url, name: &str, key: &KeyPair) -> StaticIdentity {
         let (options, setup) = IdentitySetup::prepare(origin, name, self.policy()).unwrap();
         setup
             .finish(self.registration(origin, &options, key))
