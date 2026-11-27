@@ -301,23 +301,26 @@ async fn http2_data_held_behind_a_tiny_window_closes_after_shutdown() {
 
 #[tokio::test]
 async fn an_http1_client_that_stops_reading_is_disconnected() {
+    const BUFFER: u32 = 64 * 1024;
     let dropped = Arc::new(AtomicBool::new(false));
     let gateway = gateway(upstream(dropped.clone(), None), Limits::default()).await;
     let host = format!("localhost:{}", gateway.addr.port());
-    let mut fonts = gateway.connect(b"http/1.1", None).await;
+    // Each pipeline asks for more than Linux's largest default socket buffers
+    // hold together, about 10 MiB, so the gateway's writes block on any host.
+    let mut fonts = gateway.connect(b"http/1.1", Some(BUFFER)).await;
     let font = format!("GET /_shomei/geist.woff2 HTTP/1.1\r\nHost: {host}\r\n\r\n");
-    fonts.write_all(font.repeat(64).as_bytes()).await.unwrap();
+    fonts.write_all(font.repeat(512).as_bytes()).await.unwrap();
     // Small responses end before the socket backs up, so hyper waits to flush
     // between them with no body alive.
-    let mut pages = gateway.connect(b"http/1.1", None).await;
+    let mut pages = gateway.connect(b"http/1.1", Some(BUFFER)).await;
     let page = format!("GET /_shomei/auth.css HTTP/1.1\r\nHost: {host}\r\n\r\n");
-    let pipelined = page.repeat(2048);
+    let pipelined = page.repeat(32 * 1024);
     let _ = timeout(
         Duration::from_millis(500),
         pages.write_all(pipelined.as_bytes()),
     )
     .await;
-    let mut endless = gateway.connect(b"http/1.1", None).await;
+    let mut endless = gateway.connect(b"http/1.1", Some(BUFFER)).await;
     let request = format!("GET /endless HTTP/1.1\r\nHost: {host}\r\n\r\n");
     endless.write_all(request.as_bytes()).await.unwrap();
     sleep(Duration::from_millis(200)).await;
@@ -327,7 +330,13 @@ async fn an_http1_client_that_stops_reading_is_disconnected() {
         Limits::default().http_requests - 1
     );
     gateway.released().await;
-    assert!(dropped.load(Ordering::SeqCst));
+    timeout(Duration::from_secs(2), async {
+        while !dropped.load(Ordering::SeqCst) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the upstream response outlived its stalled client");
     for mut stream in [fonts, pages, endless] {
         let mut rest = Vec::new();
         let read = timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await;
