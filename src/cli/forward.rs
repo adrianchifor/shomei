@@ -351,7 +351,7 @@ pub(super) async fn connect(args: ConnectArgs) -> Result<()> {
     println!("{}", listener.local_addr()?);
     std::io::stdout().flush()?;
     tokio::select! {
-        result = crate::serve(listener, 4096, move |mut socket, _| {
+        result = crate::serve(listener, crate::Capacity::new(4096, 100), move |mut socket, _| {
             let tunnel = tunnel.clone();
             let target = args.target.clone();
             async move {

@@ -131,6 +131,7 @@ pub struct Limits {
     pub auth_workers: usize,
     pub pending_challenges: usize,
     pub pending_per_ip: usize,
+    pub per_ip_percent: usize,
 }
 
 impl Default for Limits {
@@ -143,6 +144,7 @@ impl Default for Limits {
             auth_workers: 32,
             pending_challenges: 8192,
             pending_per_ip: 128,
+            per_ip_percent: 25,
         }
     }
 }
@@ -222,7 +224,8 @@ impl Config {
             .into_iter()
             .all(|limit| (1..=65_536).contains(&limit))
                 && (1..=128).contains(&limits.auth_workers)
-                && limits.pending_per_ip <= limits.pending_challenges,
+                && limits.pending_per_ip <= limits.pending_challenges
+                && (1..=100).contains(&limits.per_ip_percent),
             "invalid capacity limits"
         );
         validate_http_site(
@@ -593,6 +596,30 @@ ports = [443]
         assert!(Config::load(&file).is_ok());
         fs::write(&file, format!("{config}\n[[http_upstreams]]\nhostname = \"other.example.test\"\nupstream = \"http://other:8080\"\n")).unwrap();
         assert!(Config::load(&file).is_err());
+    }
+
+    #[test]
+    fn per_ip_percent_is_a_percentage() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shomei.toml");
+        let config = r#"
+origin = "https://localhost:8443"
+tls_cert = "tls.pem"
+tls_key = "tls-key.pem"
+state_dir = "state"
+identities_file = "identities"
+http_upstream = "http://app:8080"
+"#;
+        fs::write(&file, config).unwrap();
+        assert_eq!(Config::load(&file).unwrap().limits.per_ip_percent, 25);
+        for (percent, valid) in [(0, false), (1, true), (100, true), (101, false)] {
+            fs::write(
+                &file,
+                format!("{config}\n[limits]\nper_ip_percent = {percent}\n"),
+            )
+            .unwrap();
+            assert_eq!(Config::load(&file).is_ok(), valid, "{percent}");
+        }
     }
 
     #[test]
