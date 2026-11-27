@@ -77,10 +77,7 @@ pub struct App {
     tailscale: Option<TailscaleSsh>,
     auth_workers: Arc<Semaphore>,
     http_requests: Capacity,
-    /// Open connections on the HTTPS listener.
     pub(crate) connections: Capacity,
-    /// Reverse tunnels, which count against the same client shares as the
-    /// connections, since each one serves a connection of its own.
     https_tunnels: Capacity,
 }
 
@@ -89,7 +86,6 @@ struct ForwardAccess {
     endpoint: String,
     http_sessions: Vec<Sessions>,
     http_ttl: u64,
-    /// The gateway's forward request slots, with client shares of their own.
     requests: Capacity,
 }
 
@@ -699,7 +695,6 @@ async fn complete_login(
 const REVALIDATE: &str = "no-cache";
 const KEEP_FOR_A_DAY: &str = "max-age=86400";
 
-/// One tag for every bundled asset. It changes whenever any of them does.
 static ASSETS_TAG: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|| {
     let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
     for asset in [
@@ -722,8 +717,6 @@ static ASSETS_TAG: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|
     HeaderValue::from_str(&tag).expect("an entity tag is a valid header value")
 });
 
-/// Serves a bundled asset that a browser may keep and check again by tag, so
-/// each sign-in or approval does not download the scripts, image and font.
 pub(crate) fn asset(
     request: &HeaderMap,
     content_type: &'static str,
@@ -835,12 +828,9 @@ const CLI_ONLY: ApiError = ApiError(
     "this approval is only available to the command line",
 );
 
-/// Whether a browser sent the request. Any page on the gateway origin can
-/// start a challenge, and the person at the key cannot see which grant it
-/// carries, so a script there could ask for a certificate or a forward
-/// session for a key of its own. Those grants are for the CLI. A browser
-/// always sends `Origin` or `Sec-Fetch-Site` with a POST and scripts cannot
-/// remove either; the CLI sends neither.
+/// A page on the gateway origin can start a challenge, and the key prompt does
+/// not show which grant it carries, so grants that leave the browser are for
+/// the CLI only. A browser always sends one of these headers with a POST.
 fn from_browser(headers: &HeaderMap) -> bool {
     headers.contains_key(ORIGIN)
         || headers
@@ -1456,10 +1446,8 @@ async fn reverse(
     if request.method() == Method::CONNECT || request.headers().contains_key(UPGRADE) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    // A service worker installed from the upstream would control every page
-    // on this origin, the sign-in and approval pages included, for all apps
-    // and long after the content that installed it is gone. Browsers mark the
-    // request for a worker script with this header, and a page cannot drop it.
+    // A service worker from the upstream would control the sign-in and approval
+    // pages on this origin, for every app. A page cannot drop this header.
     if host == app.canonical && request.headers().contains_key("service-worker") {
         return ApiError(
             StatusCode::FORBIDDEN,
@@ -1634,7 +1622,6 @@ async fn reverse(
         return StatusCode::BAD_GATEWAY.into_response();
     }
     filter_cookies(response.headers_mut(), SET_COOKIE);
-    // A path the site leaves public keeps the upstream's own cache policy.
     let public =
         upstream.protected_paths.is_some() && approval_policy.is_none() && session.is_none();
     if let Some(session) = session {
@@ -1701,7 +1688,6 @@ pub(crate) fn strip_hop_headers(headers: &mut HeaderMap) -> Result<(), ()> {
     Ok(())
 }
 
-/// The public authority as a browser writes it, without the default port.
 fn forwarded_host(host: &Endpoint) -> String {
     approval::site_origin(host)["https://".len()..].to_owned()
 }
@@ -1747,7 +1733,6 @@ fn filter_cookies(headers: &mut HeaderMap, name: HeaderName) {
 pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_UPLOAD_PROGRESS: u64 = 1024 * 1024;
 
-/// A request body that counts the bytes the upstream has taken.
 pub(crate) fn upload_body(body: Body, sent: Arc<AtomicU64>) -> Body {
     Body::new(relay_body(body, None).map_frame(move |frame| {
         if let Some(data) = frame.data_ref() {

@@ -154,29 +154,23 @@ pub fn client_key(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// A capacity limit of which one client address may hold only a share, so a
-/// single client cannot take every slot.
 #[derive(Clone)]
 pub struct Capacity {
     slots: Arc<Semaphore>,
     clients: Arc<Clients>,
 }
 
-/// What each client address holds. An address leaves the map when it holds
-/// nothing, so the map never outgrows the capacity it counts.
 struct Clients {
     share: usize,
     held: Mutex<HashMap<IpAddr, usize>>,
 }
 
-/// One unit of a capacity, returned to it on drop.
 pub struct Slot {
     _slot: OwnedSemaphorePermit,
     client: Option<(Arc<Clients>, IpAddr)>,
 }
 
 impl Capacity {
-    /// `percent` of `limit`, rounded down and at least 1, is each client's share.
     pub fn new(limit: usize, percent: usize) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(limit)),
@@ -259,8 +253,6 @@ impl Drop for Slot {
     }
 }
 
-/// Accepts connections while `capacity` has a free slot. A connection from an
-/// address that already holds its share is closed before the TLS handshake.
 async fn serve<F>(
     listener: TcpListener,
     capacity: Capacity,
@@ -326,7 +318,6 @@ mod tests {
     fn a_client_address_holds_at_most_its_share() {
         let capacity = Capacity::new(8, 25);
         let ip = |ip: &str| Some(ip.parse::<IpAddr>().unwrap());
-        // One /64 counts as one client, and so does an IPv4-mapped address.
         let held: Vec<_> = ["2001:db8::1", "2001:db8::2"]
             .into_iter()
             .map(|client| capacity.try_acquire(ip(client)).unwrap())
@@ -336,7 +327,6 @@ mod tests {
         let v4 = capacity.try_acquire(ip("192.0.2.1")).unwrap();
         let mapped = capacity.try_acquire(ip("::ffff:192.0.2.1")).unwrap();
         assert!(capacity.try_acquire(ip("192.0.2.1")).is_none());
-        // Uncounted slots still take from the shared limit.
         let uncounted: Vec<_> = (0..3)
             .map(|_| capacity.try_acquire(None).unwrap())
             .collect();
@@ -346,11 +336,9 @@ mod tests {
         drop((held, other, v4, mapped, uncounted));
         assert_eq!(capacity.clients(), 0);
         assert_eq!(capacity.available(), 8);
-        // A share is at least one slot.
         let tiny = Capacity::new(3, 1);
         let _one = tiny.try_acquire(ip("192.0.2.1")).unwrap();
         assert!(tiny.try_acquire(ip("192.0.2.1")).is_none());
-        // Tunnels have their own limit but the connections' shares.
         let tunnels = capacity.with_slots(8);
         let _connection = capacity.try_acquire(ip("192.0.2.1")).unwrap();
         let _tunnel = tunnels.try_acquire(ip("192.0.2.1")).unwrap();

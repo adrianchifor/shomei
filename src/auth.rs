@@ -140,7 +140,6 @@ enum Login {
 pub enum Grant {
     Http,
     HttpHost(crate::config::Endpoint),
-    /// One reverse HTTP request with this method, path and query.
     HttpRequest {
         host: crate::config::Endpoint,
         method: axum::http::Method,
@@ -241,10 +240,8 @@ impl Auth {
         self.changes.subscribe()
     }
 
-    /// Applies the identities file if it changed. Records that fail
-    /// verification are skipped so they cannot hold back a removal elsewhere
-    /// in the file, and a missing file enrolls no key. Only a file that cannot
-    /// be read at all, or is too large, keeps the last list.
+    /// Invalid records are skipped so they cannot hold back a removal elsewhere
+    /// in the file. Only an unreadable or oversized file keeps the last list.
     pub fn reload(&self) -> Result<bool> {
         let (changed, rejected) = self.reload_identities()?;
         for error in rejected.iter().take(MAX_REJECTED_LOGS) {
@@ -553,7 +550,6 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
         .expect("SHA-256 has 32 bytes")
 }
 
-/// Reads the allowlist, or `None` when the file does not exist.
 fn read_identities(path: &Path) -> Result<Option<Vec<u8>>> {
     let mut data = Vec::new();
     let file = match File::open(path) {

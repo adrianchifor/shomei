@@ -26,7 +26,6 @@ use crate::{
 
 const CHUNK: usize = 16 * 1024;
 
-/// An upstream body that never ends and records when it is dropped.
 struct Endless(Arc<AtomicBool>);
 
 impl http_body::Body for Endless {
@@ -47,7 +46,6 @@ impl Drop for Endless {
     }
 }
 
-/// An upstream body of a number of chunks, produced as fast as they are taken.
 struct Chunks(usize);
 
 impl http_body::Body for Chunks {
@@ -66,7 +64,6 @@ impl http_body::Body for Chunks {
     }
 }
 
-/// An upstream body that waits for each chunk, like an event stream.
 struct Fed(mpsc::Receiver<Bytes>);
 
 impl http_body::Body for Fed {
@@ -99,8 +96,6 @@ impl Drop for Gateway {
     }
 }
 
-/// A gateway like `main()` builds, in front of `upstream`, whose paths other
-/// than /api/deploy are public.
 async fn gateway(upstream: Router, limits: Limits) -> Gateway {
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", upstream_listener.local_addr().unwrap());
@@ -191,8 +186,6 @@ impl Gateway {
         format!("https://localhost:{}{path}", self.addr.port())
     }
 
-    /// Waits until no connection, request or client share is held, apart
-    /// from the slot the accept loop takes while it waits.
     async fn released(&self) {
         let limits = Limits::default();
         let state = &self.state;
@@ -262,8 +255,6 @@ async fn an_http2_client_that_grants_no_window_is_disconnected() {
     let gateway = gateway(upstream(dropped.clone(), None), Limits::default()).await;
     let (mut client, mut connection) = h2(gateway.connect(b"h2", None).await, 0).await;
     let mut held = Vec::new();
-    // A proxied response, which holds a request slot and an upstream, and the
-    // gateway's own page.
     for path in ["/endless", "/_shomei/login"] {
         let request = hyper::Request::get(gateway.url(path))
             .body(Empty::new())
@@ -379,8 +370,6 @@ async fn an_idle_event_stream_stays_open() {
     let mut body = client.send_request(request).await.unwrap().into_body();
     let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
     assert_eq!(first, "first");
-    // Longer than the stall limit, and than the idle limit that starts a
-    // graceful shutdown.
     sleep(STALL * 3 + HTTP2_IDLE).await;
     assert!(!connection.is_finished());
     events.send(Bytes::from_static(b"last")).await.unwrap();
@@ -393,8 +382,6 @@ async fn a_slow_download_that_keeps_moving_stays_open() {
     let dropped = Arc::new(AtomicBool::new(false));
     let gateway = gateway(upstream(dropped, None), Limits::default()).await;
 
-    // HTTP/2 with a window of two chunks, taking one chunk every quarter of
-    // the stall limit.
     let (mut client, _connection) = h2(gateway.connect(b"h2", None).await, 2 * CHUNK as u32).await;
     let chunks = 16;
     let request = hyper::Request::get(gateway.url(&format!("/chunks/{chunks}")))
@@ -413,8 +400,6 @@ async fn a_slow_download_that_keeps_moving_stays_open() {
     assert_eq!(total, chunks * CHUNK);
     assert!(started.elapsed() > STALL * 3);
 
-    // HTTP/1.1 through a small receive buffer, taking 64 KiB every tenth of
-    // the stall limit.
     let mut stream = gateway.connect(b"http/1.1", Some(64 * 1024)).await;
     let chunks = 128;
     let request = format!(
@@ -479,7 +464,6 @@ async fn one_client_address_holds_at_most_its_share_of_proxied_requests() {
             )
         })
     };
-    // Two addresses in one /64 are one client.
     let held = [send("2001:db8::1", "/hold"), send("2001:db8::2", "/hold")];
     timeout(Duration::from_secs(2), async {
         while gateway.state.http_requests.available() != 2 {

@@ -182,9 +182,6 @@ impl TailscaleSsh {
         Ok(response.and_then(|response| response.device(peer)))
     }
 
-    /// Fails with a `tokio::time::error::Elapsed` error after `api_timeout`,
-    /// including time spent waiting for another refresh. Dropping the
-    /// future releases the lock and leaves the cache unchanged.
     pub async fn authorization(&self) -> Result<HeaderValue> {
         timeout(self.api_timeout, self.refresh_authorization()).await?
     }
@@ -231,8 +228,6 @@ impl TailscaleSsh {
         Ok(authorization)
     }
 
-    /// Fails with a `tokio::time::error::Elapsed` error after `api_timeout`,
-    /// when the attribute may or may not have been set.
     pub async fn approve(&self, device: &Device, authorization: HeaderValue) -> Result<u64> {
         timeout(self.api_timeout, self.set_attribute(device, authorization)).await?
     }

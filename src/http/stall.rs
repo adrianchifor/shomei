@@ -44,10 +44,8 @@ use tokio::{
 
 use super::HTTP2_IDLE;
 
-/// How long a response may wait for its client to take data.
 pub(crate) const STALL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
 
-/// The marks of one connection.
 pub(crate) struct Stalls {
     origin: Instant,
     marks: Mutex<Marks>,
@@ -74,12 +72,10 @@ impl Mark {
         self.origin.elapsed().as_millis() as u64 + 1
     }
 
-    /// Starts waiting now.
     fn wait(&self) {
         self.since.store(self.now(), Ordering::Relaxed);
     }
 
-    /// Starts waiting now unless already waiting.
     fn keep_waiting(&self) {
         let _ = self
             .since
@@ -118,16 +114,13 @@ impl Stalls {
         }
     }
 
-    /// Counts a request as in flight until its response body is dropped. A
-    /// tunnel holds one for as long as it runs: on HTTP/2 it is a stream of
+    /// A tunnel holds one for as long as it runs: on HTTP/2 it is a stream of
     /// this connection, which must stay open after the idle shutdown.
     pub(crate) fn begin(self: &Arc<Self>) -> InFlight {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         InFlight(self.clone())
     }
 
-    /// Counts a tunnel opened by `request` as in flight on the connection
-    /// that carries it, if that connection is watched.
     pub(crate) fn tunnel<B>(request: &hyper::Request<B>) -> Option<InFlight> {
         request
             .extensions()
@@ -135,7 +128,6 @@ impl Stalls {
             .map(|stalls| stalls.begin())
     }
 
-    /// Wraps a client connection so writes that cannot make progress count.
     pub(crate) fn watch_io<IO>(&self, io: IO) -> Watched<IO> {
         Watched {
             io,
@@ -143,9 +135,6 @@ impl Stalls {
         }
     }
 
-    /// The oldest time anything on the connection started waiting for the
-    /// client. After a shutdown, a connection with nothing left in flight is
-    /// waiting for the client too.
     fn waiting_since(&self, draining: bool) -> Option<Instant> {
         let at = |since: u64| self.origin + Duration::from_millis(since - 1);
         let mut oldest = None::<u64>;
@@ -168,19 +157,15 @@ impl Stalls {
         oldest.map(at)
     }
 
-    /// Starts the wait for a shut-down connection to finish, from now or from
-    /// when its last request completes.
     fn start_draining(&self) {
         let now = self.origin.elapsed().as_millis() as u64 + 1;
         self.drained.store(now, Ordering::Relaxed);
     }
 }
 
-/// A request being handled or a response body still alive.
 pub(crate) struct InFlight(Arc<Stalls>);
 
 impl InFlight {
-    /// Tracks a response from the moment it is handed to hyper.
     pub(crate) fn track(self, response: Response) -> Response {
         let mark = self.0.mark();
         mark.wait();
@@ -235,7 +220,6 @@ impl http_body::Body for Tracked {
     }
 }
 
-/// A client connection whose blocked writes count as waiting for the client.
 pub(crate) struct Watched<IO> {
     io: IO,
     mark: Mark,
@@ -295,14 +279,9 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for Watched<IO> {
     }
 }
 
-/// Drives a client connection and drops it, closing it, once anything on it
-/// has waited for the client for longer than `STALL`. With `idle`, a count of
-/// the requests started, it also starts a graceful shutdown once no request
-/// has arrived for `HTTP2_IDLE`: HTTP/2 has no idle timeout of its own, so a
-/// silent connection would otherwise hold its slot for as long as the peer
-/// answers pings. Requests already in flight finish first, under the same
-/// watch. Dropping the connection drops its response bodies and handlers,
-/// which releases their request slots and upstream connections.
+/// Drops the connection once anything on it has waited on the client for
+/// `STALL`. With `idle`, a count of requests started, it also shuts down
+/// gracefully after `HTTP2_IDLE` without one: HTTP/2 has no idle timeout.
 pub(crate) async fn watch<C: Future>(
     connection: C,
     stalls: &Stalls,

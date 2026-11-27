@@ -139,8 +139,6 @@ pub struct Gateway {
     scope_names: Vec<String>,
     tcp_targets: HashMap<Endpoint, usize>,
     tcp_upstreams: Vec<Endpoint>,
-    /// Forwarded requests and tunnels. Those from the HTTPS listener also count
-    /// against client shares, through `http::ForwardAccess`.
     pub(crate) requests: Capacity,
 }
 
@@ -342,7 +340,6 @@ mod tests {
             inside.dial("127.0.0.1", port + 1).await.unwrap_err(),
             StatusCode::FORBIDDEN
         );
-        // A name is judged by the addresses it resolves to, not by how it is written.
         let outside = scope("10.0.0.0/8");
         for host in ["127.0.0.1", "localhost"] {
             assert_eq!(
@@ -535,7 +532,6 @@ pub async fn proxy_http(
     }
     .await;
     match result {
-        // An upstream's own 407 is relayed without the gateway's challenge.
         Ok(response) => response,
         Err(status) => {
             let mut response = status.into_response();
@@ -571,9 +567,6 @@ pub(crate) fn valid_connect<B>(request: &hyper::Request<B>) -> bool {
             .all(|length| length == "0")
 }
 
-/// Proxies a request from the mTLS listener, or with `client` from the HTTPS
-/// listener, where the request counts against the client's share of
-/// `requests`.
 async fn proxy(
     mut request: hyper::Request<Incoming>,
     gateway: Arc<Gateway>,
